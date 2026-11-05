@@ -170,7 +170,7 @@ if [ "$ONION" = "1" ]; then
     KEYTMP=$(mktemp -d)
     curl -fsSL --proto '=https' --tlsv1.2 \
       "https://deb.torproject.org/torproject.org/${TOR_FPR}.asc" -o "$KEYTMP/key.asc"
-    GOT=$(gpg --show-keys --with-colons "$KEYTMP/key.asc" | awk -F: '/^fpr:/{print $10; exit}')
+    GOT=$(gpg --show-keys --with-colons "$KEYTMP/key.asc" | awk -F: '/^fpr:/ && !n {print $10; n=1}')
     if [ "$GOT" != "$TOR_FPR" ]; then
       echo "  Tor Project key fingerprint is $GOT, expected $TOR_FPR; not trusting it" >&2
       rm -rf "$KEYTMP"
@@ -190,7 +190,7 @@ if [ "$ONION" = "1" ]; then
   # keep it rather than stop to ask about the packaged version.
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
     -o Dpkg::Options::=--force-confold tor deb.torproject.org-keyring >/dev/null
-  echo "  tor $(tor --version | head -1 | sed -E 's/^Tor version ([0-9.]*[0-9]).*/\1/') from the Tor Project repository"
+  echo "  tor $(tor --version | sed -nE '1s/^Tor version ([0-9.]*[0-9]).*/\1/p') from the Tor Project repository"
   sudo install -d -o debian-tor -g debian-tor -m 700 /var/lib/tor/runa
   sudo mkdir -p /etc/tor/torrc.d
   if ! sudo grep -q '^%include /etc/tor/torrc.d' /etc/tor/torrc; then
@@ -335,19 +335,28 @@ $SSH "RUNA_HOST=$HOST bash -euo pipefail -s" <<'REMOTE'
   # so a box can sit on an old Caddy with fixed releases waiting: this one was
   # on 2.11.7 in November 2026 while 2.11.9 carried security fixes. Allow that
   # origin, but only where Caddy really comes from it.
-  if apt-cache policy caddy 2>/dev/null | grep -q 'dl.cloudsmith.io/public/caddy/stable'; then
-    echo 'Unattended-Upgrade::Origins-Pattern:: "origin=cloudsmith/caddy/stable";' \
-      | sudo tee /etc/apt/apt.conf.d/52runa-caddy >/dev/null
-  fi
+  # Captured first and matched without a pipe: under pipefail, `grep -q` stops
+  # reading at the first match, apt-cache dies of SIGPIPE on its long output,
+  # and the whole test reads as false. That is what kept this file off the box.
+  CADDY_POLICY=$(apt-cache policy caddy 2>/dev/null || true)
+  case "$CADDY_POLICY" in
+    *dl.cloudsmith.io/public/caddy/stable*)
+      echo 'Unattended-Upgrade::Origins-Pattern:: "origin=cloudsmith/caddy/stable";' \
+        | sudo tee /etc/apt/apt.conf.d/52runa-caddy >/dev/null
+      echo "  unattended-upgrades will patch Caddy from its own repository"
+      ;;
+  esac
 
   # Whether the vhost is in the *running* config, which is not the same
   # question as whether it is in the file. Caddy's reload goes through its
   # admin API and can no-op silently, leaving the packaged default loaded:
   # port 80 answers, 443 does not, and no ACME attempt is ever made — which
   # looks exactly like a certificate problem and is not one.
+  # Same pipefail trap as above, with the whole running config as input.
   vhost_is_live() {
-    curl -sf --max-time 3 http://127.0.0.1:2019/config/ 2>/dev/null \
-      | grep -q "$RUNA_HOST"
+    local live
+    live=$(curl -sf --max-time 3 http://127.0.0.1:2019/config/ 2>/dev/null || true)
+    case "$live" in *"$RUNA_HOST"*) return 0 ;; *) return 1 ;; esac
   }
 
   if sudo grep -q "^${RUNA_HOST}[[:space:]]*{" "$CADDYFILE"; then
