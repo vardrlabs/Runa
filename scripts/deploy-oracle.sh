@@ -155,11 +155,42 @@ ok "runa-server built"
 if [ "$ONION" = "1" ]; then
   bold "5b   Onion service"
   $SSH "ONION_PORT=$ONION_PORT bash -euo pipefail -s" <<'REMOTE'
-  if ! command -v tor >/dev/null; then
+  # tor comes from the Tor Project's own repository, not Ubuntu's. Ubuntu ships
+  # it in universe, which gets no routine security updates: 24.04 was still on
+  # 0.4.9.11 in November 2026, open to a remote crash (CVE-2026-87724) and
+  # missing the onion-service fixes in 0.4.9.14. The signing key is checked
+  # against the fingerprint the Tor Project publishes before apt trusts it.
+  TOR_FPR=A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89
+  KEYRING=/usr/share/keyrings/deb.torproject.org-keyring.gpg
+  if ! command -v gpg >/dev/null; then
     sudo apt-get update -qq
-    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq tor >/dev/null
-    echo "  installed tor"
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gnupg >/dev/null
   fi
+  if ! sudo test -s "$KEYRING"; then
+    KEYTMP=$(mktemp -d)
+    curl -fsSL --proto '=https' --tlsv1.2 \
+      "https://deb.torproject.org/torproject.org/${TOR_FPR}.asc" -o "$KEYTMP/key.asc"
+    GOT=$(gpg --show-keys --with-colons "$KEYTMP/key.asc" | awk -F: '/^fpr:/{print $10; exit}')
+    if [ "$GOT" != "$TOR_FPR" ]; then
+      echo "  Tor Project key fingerprint is $GOT, expected $TOR_FPR; not trusting it" >&2
+      rm -rf "$KEYTMP"
+      exit 1
+    fi
+    gpg --dearmor < "$KEYTMP/key.asc" | sudo tee "$KEYRING" >/dev/null
+    rm -rf "$KEYTMP"
+  fi
+  CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
+  printf 'Types: deb\nURIs: https://deb.torproject.org/torproject.org/\nSuites: %s\nComponents: main\nSigned-By: %s\n' \
+    "$CODENAME" "$KEYRING" | sudo tee /etc/apt/sources.list.d/tor.sources >/dev/null
+  # unattended-upgrades applies Tor's security releases the way it does Ubuntu's.
+  echo 'Unattended-Upgrade::Origins-Pattern:: "origin=TorProject";' \
+    | sudo tee /etc/apt/apt.conf.d/52runa-torproject >/dev/null
+  sudo apt-get update -qq
+  # confold: /etc/tor/torrc carries the %include line below, so an upgrade must
+  # keep it rather than stop to ask about the packaged version.
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    -o Dpkg::Options::=--force-confold tor deb.torproject.org-keyring >/dev/null
+  echo "  tor $(tor --version | head -1 | sed -E 's/^Tor version ([0-9.]*[0-9]).*/\1/') from the Tor Project repository"
   sudo install -d -o debian-tor -g debian-tor -m 700 /var/lib/tor/runa
   sudo mkdir -p /etc/tor/torrc.d
   if ! sudo grep -q '^%include /etc/tor/torrc.d' /etc/tor/torrc; then

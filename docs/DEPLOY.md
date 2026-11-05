@@ -139,9 +139,17 @@ room, that is the strongest protection RÚNA offers.
 
 What the option does, and nothing else:
 
-- Installs `tor` if it is missing and adds one file, `/etc/tor/torrc.d/runa.conf`,
-  plus an `%include` line in `/etc/tor/torrc`. Caddy, its vhosts and every
-  other service on the box are untouched.
+- Installs or upgrades `tor` from the Tor Project's own repository rather than
+  Ubuntu's, whose copy sits in universe and gets no routine security updates.
+  It fetches the repository's signing key, refuses it unless the fingerprint is
+  `A3C4F0F979CAA22CDBA8F512EE8CBC9E886DDD89`, and writes three files:
+  `/usr/share/keyrings/deb.torproject.org-keyring.gpg`,
+  `/etc/apt/sources.list.d/tor.sources`, and
+  `/etc/apt/apt.conf.d/52runa-torproject`, which lets unattended-upgrades
+  apply Tor's releases the way it applies Ubuntu's.
+- Adds one file to tor, `/etc/tor/torrc.d/runa.conf`, plus an `%include` line
+  in `/etc/tor/torrc`, which upgrades keep. Caddy, its vhosts and every other
+  service on the box are untouched.
 - `HiddenServiceExportCircuitID haproxy` makes tor open each connection with
   a line naming its circuit. RÚNA's onion listener (`RUNA_ONION_BIND`,
   loopback only) treats each circuit as its own client, so one Tor visitor
