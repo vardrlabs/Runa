@@ -8,6 +8,17 @@ section — so this file is not documentation of the release, it is part of it.
 
 ### Security
 
+- **The onion service runs a maintained Tor.** `RUNA_ONION=1` installed tor
+  from Ubuntu, which keeps it in universe without routine security updates:
+  24.04 still had 0.4.9.11, which a remote peer can crash (CVE-2026-87724) and
+  which lacks the high-severity onion-service fixes of 0.4.9.14. The deploy now
+  takes tor from the Tor Project's repository, trusting its signing key only
+  after checking the published fingerprint, and lets unattended-upgrades keep
+  it current. Run the deploy again with `RUNA_ONION=1` to move an existing box.
+- **Caddy keeps itself patched.** Caddy's official apt repository is outside
+  unattended-upgrades' default list, so the hosted box stayed on 2.11.7 while
+  2.11.8 and 2.11.9 carried security fixes. Where Caddy comes from that
+  repository, the deploy now adds it to unattended-upgrades.
 - **Five vulnerabilities fixed in 0.5.0 are now published as advisories.**
   They affected 0.2.0-rc.3 through 0.4.0: a cross-site lockout (Medium), a
   room-wide join lockout, a shredded room that could stay open, a shred vote
