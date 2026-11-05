@@ -4,7 +4,7 @@ Newest first. The release workflow reads the section matching the tag and
 publishes it as the release notes, and refuses to build a tag that has no
 section — so this file is not documentation of the release, it is part of it.
 
-## Unreleased
+## 0.5.4
 
 ### Security
 
