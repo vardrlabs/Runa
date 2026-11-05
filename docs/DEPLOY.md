@@ -90,7 +90,7 @@ that a hard error rather than a surprise in production.
 | 4 | `git archive` the commit; tar the bundle; `scp` both |
 | 5 | Build on the box with `--locked`, niced, stamping commit + digest into the binary |
 | 6 | Install binary, swap assets atomically, install unit, restart |
-| 7 | Append the Caddy vhost behind backup → validate → rollback-on-failure |
+| 7 | Append the Caddy vhost behind backup → validate → rollback-on-failure; if Caddy comes from its official apt repository, add that origin to unattended-upgrades (`/etc/apt/apt.conf.d/52runa-caddy`) |
 | 8 | Verify: loopback bind, HTTPS 200, `/version` matches, no client IPs in logs, other sites still healthy |
 
 Step 7 never edits another site's configuration. It backs the file up,

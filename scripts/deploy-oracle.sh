@@ -331,6 +331,15 @@ bold "7/8  Caddy vhost"
 $SSH "RUNA_HOST=$HOST bash -euo pipefail -s" <<'REMOTE'
   CADDYFILE=/etc/caddy/Caddyfile
 
+  # Caddy's own apt repository is outside unattended-upgrades' default list,
+  # so a box can sit on an old Caddy with fixed releases waiting: this one was
+  # on 2.11.7 in November 2026 while 2.11.9 carried security fixes. Allow that
+  # origin, but only where Caddy really comes from it.
+  if apt-cache policy caddy 2>/dev/null | grep -q 'dl.cloudsmith.io/public/caddy/stable'; then
+    echo 'Unattended-Upgrade::Origins-Pattern:: "origin=cloudsmith/caddy/stable";' \
+      | sudo tee /etc/apt/apt.conf.d/52runa-caddy >/dev/null
+  fi
+
   # Whether the vhost is in the *running* config, which is not the same
   # question as whether it is in the file. Caddy's reload goes through its
   # admin API and can no-op silently, leaving the packaged default loaded:
