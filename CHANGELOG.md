@@ -4,6 +4,19 @@ Newest first. The release workflow reads the section matching the tag and
 publishes it as the release notes, and refuses to build a tag that has no
 section — so this file is not documentation of the release, it is part of it.
 
+## Unreleased
+
+### Fixed
+
+- **The deploy never actually let unattended-upgrades patch Caddy.** 0.5.4
+  checked where Caddy comes from with `apt-cache policy caddy | grep -q`, and
+  the deploy runs under `pipefail`. `grep -q` stops at the first match,
+  `apt-cache` then dies of SIGPIPE on its long output, and the check read as
+  false, so `/etc/apt/apt.conf.d/52runa-caddy` was never written. The check
+  now captures the output and matches it without a pipe. The same shape was
+  removed from the running-config check and the Tor key check, where it had
+  not caused a failure.
+
 ## 0.5.4
 
 ### Security
