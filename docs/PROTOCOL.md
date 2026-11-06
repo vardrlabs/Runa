@@ -369,10 +369,10 @@ is a canonical CBOR map:
 and `sig` is the sender's signature over `"runa/v1/epoch-key" || header (32 B) || cbor`.
 A step's wrap holds the new `epoch_secret`. A handover's wrap holds the secrets
 from `root + 1` to `to`, concatenated in order, so the newcomer derives every
-epoch from its own link or passphrase. A handover carries at most 8192
-secrets; a room that has rotated more often than that since its root can no
-longer be joined, which at one rotation per 5 seconds takes over eleven hours of
-continuous departures. A receiver checks the signature against
+epoch from its own link or passphrase. A handover is addressed to one
+newcomer and carries exactly one wrap, of at most 8192 secrets; a room that has
+rotated more often than that since its root can no longer be joined, which at
+one rotation per 5 seconds takes over eleven hours of continuous departures. A receiver checks the signature against
 its roster, unwraps its own entry, derives, and compares `confirm`. A frame
 that fails any of these is refused, and the refusal is shown. It also compares
 the roster hash with its own: a mismatch is shown as a warning that someone may
