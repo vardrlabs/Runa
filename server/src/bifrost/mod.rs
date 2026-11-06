@@ -415,12 +415,25 @@ async fn run_connection(
     let peer_id = entry.peer_id;
 
     {
+        // One read guard, dropped before anything else is locked. These three
+        // used to be separate `room.log.read()` calls inside the literal below,
+        // and temporaries live to the end of the statement, so the first guard
+        // was still held when the second was asked for. std's RwLock (futex on
+        // Linux, the queue lock on macOS) makes a new reader wait behind a
+        // waiting writer, and that writer waits for the first guard: the two
+        // worker threads would wait on each other for good, and every later
+        // write to the room would take another worker with it. It also held
+        // the log lock while `roster_json` took the peers lock.
+        let (log_len, base_index, has_snapshot) = {
+            let log = room.log.read().unwrap();
+            (log.log_len(), log.base_index(), log.has_snapshot())
+        };
         let ack = JoinAck {
             peer_id: B64.encode(peer_id),
             epoch: room.epoch.load(std::sync::atomic::Ordering::SeqCst),
-            log_len: room.log.read().unwrap().log_len(),
-            base_index: room.log.read().unwrap().base_index(),
-            has_snapshot: room.log.read().unwrap().has_snapshot(),
+            log_len,
+            base_index,
+            has_snapshot,
             ttl: ttl_json(&room),
             elapsed_secs: crate::runar::room::unix_now().saturating_sub(room.created_unix),
             ceiling_optout: room.ceiling_optout,

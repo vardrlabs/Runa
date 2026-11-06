@@ -16,6 +16,14 @@ section — so this file is not documentation of the release, it is part of it.
   now captures the output and matches it without a pipe. The same shape was
   removed from the running-config check and the Tor key check, where it had
   not caused a failure.
+- **A join could in principle lock up the server.** The server built its reply
+  to a join while holding the room log's read lock and asking for it twice
+  more in the same statement. Rust's standard lock makes a new reader wait
+  behind a writer that is already waiting, and that writer waits for the first
+  read, so a join and an edit arriving at exactly the wrong moment would wait
+  on each other forever, and every later edit to that room would stall another
+  server thread. I could not make it happen: about 460,000 joins against a
+  steady stream of edits never hit it. The reply now reads the log once.
 
 ## 0.5.4
 
