@@ -143,6 +143,19 @@ export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
     "The server has lost track of this room's key changes, so this tab has stopped sending. Copy your work out and reload.",
 };
 
+/// Passes a key status on only when it changes. The coordinator repeats
+/// "waiting" every second, and each report re-renders the room page.
+export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "onTemper">): (s: KeyStatus) => void {
+  let last: KeyStatus | null = null;
+  return (s) => {
+    if (s === last) return;
+    last = s;
+    const alarming = s === "refused" || s === "roster-mismatch" || s === "server-behind";
+    events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
+    if (alarming) events.onTemper("WATCH");
+  };
+}
+
 /// The log index a snapshot taken now may claim to cover, or null when there
 /// is nothing new to cover.
 ///
@@ -290,6 +303,9 @@ export class Session {
   /// A JOIN_ACK arrived while this tab held no key for the room's epoch, so
   /// the sync request waits for the handover.
   private syncDeferred = false;
+  private keyStatus: (s: KeyStatus) => void;
+  /// The snapshot a rotation asks for, while it waits to run.
+  private snapshotSoonTimer: ReturnType<typeof setTimeout> | null = null;
 
   private binding: Binding | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -324,6 +340,7 @@ export class Session {
     this.socket = socket;
     this.machine = machine;
     this.internals = internals;
+    this.keyStatus = keyStatusReporter(events);
   }
 
   static async create(cfg: SessionConfig, events: SessionEvents): Promise<Session> {
@@ -687,6 +704,7 @@ export class Session {
     if (this.socket.isAwaitingKeys) {
       this.syncDeferred = true;
     } else {
+      this.syncDeferred = false;
       this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());
     }
     // Anything this client wrote that the room never stored is resent by the
@@ -703,15 +721,22 @@ export class Session {
   }
 
   reportKeyStatus(s: KeyStatus): void {
-    const alarming = s === "refused" || s === "roster-mismatch" || s === "server-behind";
-    this.events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
-    if (alarming) this.events.onTemper("WATCH");
+    this.keyStatus(s);
   }
 
   /// After a rotation the elected member snapshots straight away, so the log
   /// soon holds nothing under an older key.
   snapshotSoon(): void {
-    setTimeout(() => this.trySnapshot(true), 1_000);
+    if (this.snapshotSoonTimer) clearTimeout(this.snapshotSoonTimer);
+    this.snapshotSoonTimer = setTimeout(() => {
+      this.snapshotSoonTimer = null;
+      this.trySnapshot(true);
+    }, 1_000);
+  }
+
+  private cancelSnapshotSoon(): void {
+    if (this.snapshotSoonTimer) clearTimeout(this.snapshotSoonTimer);
+    this.snapshotSoonTimer = null;
   }
 
   private async decryptConfigBlob(
@@ -1124,6 +1149,7 @@ export class Session {
     this.socket.dropKeys();
     this.coordinator?.wipe();
     if (this.epochTimer) clearInterval(this.epochTimer);
+    this.cancelSnapshotSoon();
     this.awareness?.dispose();
     this.awareness = null;
   }
@@ -1258,6 +1284,7 @@ export class Session {
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     if (this.steadyTimer) clearInterval(this.steadyTimer);
     if (this.epochTimer) clearInterval(this.epochTimer);
+    this.cancelSnapshotSoon();
     this.coordinator?.wipe();
     this.cursorTimerRef?.();
     this.binding?.dispose();

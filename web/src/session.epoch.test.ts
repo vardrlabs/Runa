@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { departedMembers, KEY_STATUS_TEXT } from "./session";
+import { departedMembers, KEY_STATUS_TEXT, keyStatusReporter } from "./session";
 
 const entry = (peer: number, key: number | null, seq: number) => ({
   peerId: new Uint8Array(16).fill(peer),
@@ -27,5 +27,25 @@ describe("key status text", () => {
       expect(t).not.toMatch(/—/);
       expect(t).not.toMatch(/\bwe\b/i);
     }
+  });
+});
+
+describe("keyStatusReporter", () => {
+  it("passes a status on only when it changes", () => {
+    const shown: (string | null)[] = [];
+    const tempers: string[] = [];
+    const report = keyStatusReporter({
+      onKeyStatus: (m) => shown.push(m),
+      onTemper: (t) => tempers.push(t),
+    });
+    report("waiting");
+    report("waiting");
+    report("waiting");
+    report("ok");
+    report("ok");
+    report("refused");
+    report("refused");
+    expect(shown).toEqual([KEY_STATUS_TEXT.waiting, null, KEY_STATUS_TEXT.refused]);
+    expect(tempers).toEqual(["WATCH"]);
   });
 });
