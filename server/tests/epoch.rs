@@ -531,8 +531,10 @@ async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
             if a.send(frame(&hex, 0x06, 0, &payload)).await.is_err() {
                 break;
             }
-            // Paced, so B (which reads at full speed) keeps up.
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            // Paced at about 5 ms a frame: far faster than the slow reader
+            // drains (one per 20 ms), slow enough that B keeps up even on a
+            // loaded runner.
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
         a
     });
@@ -545,7 +547,11 @@ async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
             other => panic!("no PEER_LEAVE for the backlogged peer: {other:?}"),
         }
     };
-    assert_eq!(json_body(&leave)["peer_id"].as_str().unwrap(), slow_id);
+    let gone = json_body(&leave)["peer_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        gone, slow_id,
+        "the wrong peer was closed: {gone} left, but the slow reader is {slow_id}"
+    );
     flood.abort();
 
     let closed = tokio::time::timeout(Duration::from_secs(30), slow_reader).await;
@@ -555,7 +561,8 @@ async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
 /// Two members step the room to the same next epoch at the same moment, many
 /// times over. Whichever the server decides first wins, and every member must
 /// see that step first: nobody may be wrapped in the one that lost.
-#[tokio::test]
+// Multi-threaded so the server and the clients can truly race; still probabilistic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_steps_reach_every_peer_in_the_order_the_server_decided() {
     let s = spawn(cfg_with(30_000, 0)).await;
     let k = create(&s).await;
