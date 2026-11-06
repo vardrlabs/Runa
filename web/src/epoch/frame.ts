@@ -35,6 +35,8 @@ export interface DecodedEpochKey {
 export const MAX_WRAPS = 32;
 export const MAX_HANDOVER_SECRETS = 8192;
 const MAX_CT = MAX_HANDOVER_SECRETS * 32 + 16;
+/// Largest legitimate body is one handover wrap of 8192 secrets, about 262 KB, plus overhead.
+export const MAX_CBOR_LEN = 300_000;
 const SIG_LEN = 64;
 const SIG_DOMAIN = new TextEncoder().encode("runa/v1/epoch-key");
 
@@ -42,13 +44,9 @@ function signedBytes(header: Uint8Array, cbor: Uint8Array): Uint8Array {
   return concatBytes(SIG_DOMAIN, header, cbor);
 }
 
-export async function encodeEpochKey(
-  header: Uint8Array,
-  body: EpochKeyBody,
-  identity: Identity,
-): Promise<Uint8Array> {
-  if (header.length !== 32) throw new Error("header must be 32 bytes");
-  const cbor = cbor2.encode({
+/// The one object shape both directions use, so key order cannot drift.
+function canonicalShape(body: EpochKeyBody) {
+  return {
     kind: body.kind,
     from: body.from,
     to: body.to,
@@ -57,7 +55,16 @@ export async function encodeEpochKey(
     roster: body.roster,
     confirm: body.confirm,
     wraps: body.wraps.map((w) => ({ p: w.p, iv: w.iv, ct: w.ct })),
-  });
+  };
+}
+
+export async function encodeEpochKey(
+  header: Uint8Array,
+  body: EpochKeyBody,
+  identity: Identity,
+): Promise<Uint8Array> {
+  if (header.length !== 32) throw new Error("header must be 32 bytes");
+  const cbor = cbor2.encode(canonicalShape(body));
   const sig = await signPayload(identity, signedBytes(header, cbor));
   if (sig.length !== SIG_LEN) throw new Error("unexpected signature length");
   const len = new Uint8Array(4);
@@ -78,6 +85,7 @@ export function decodeEpochKey(bytes: Uint8Array): DecodedEpochKey | null {
   if (bytes.length !== 4 + len + SIG_LEN) return null;
   const cbor = bytes.slice(4, 4 + len);
   const sig = bytes.slice(4 + len);
+  if (cbor.length > MAX_CBOR_LEN || cbor[0] !== 0xa8) return null;
   let raw: unknown;
   try {
     raw = cbor2.decode(cbor);
@@ -99,20 +107,19 @@ export function decodeEpochKey(bytes: Uint8Array): DecodedEpochKey | null {
   }
   if (o.root > o.to) return null;
   if (o.kind === "step" && o.to !== o.from + 1) return null;
-  return {
-    body: {
-      kind: o.kind,
-      from: o.from,
-      to: o.to,
-      root: o.root,
-      sender: o.sender,
-      roster: o.roster,
-      confirm: o.confirm,
-      wraps,
-    },
-    cbor,
-    sig,
+  const body: EpochKeyBody = {
+    kind: o.kind,
+    from: o.from,
+    to: o.to,
+    root: o.root,
+    sender: o.sender,
+    roster: o.roster,
+    confirm: o.confirm,
+    wraps,
   };
+  const again = cbor2.encode(canonicalShape(body));
+  if (again.length !== cbor.length || again.some((b, i) => b !== cbor[i])) return null;
+  return { body, cbor, sig };
 }
 
 export function verifyEpochKey(
