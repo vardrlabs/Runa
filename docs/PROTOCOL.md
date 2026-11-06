@@ -328,6 +328,12 @@ confirm_{n+1} = HKDF(chain_{n+1}, info = "runa/v1/epoch/confirm")               
 
 Each frame is encrypted under the content key of the epoch in its header. A
 sender's nonce session and counter prefix are drawn fresh for every new key.
+A replayed log legitimately spans several epochs, so a client reads stored
+entries (DOC_UPDATE, SNAPSHOT) under whichever epoch's key it holds. It drops
+live-only frames (AWARENESS and the SHRED frames) from before the overlap
+window with the stale-epoch warning, and drops frames from an epoch it does not
+hold yet without counting them, since it will read them from the log once it
+has the key.
 
 *Key agreement.* JOIN carries `kx_pubkey`, an ECDH P-256 public key made for
 this session (65-byte uncompressed point, base64), and `kx_sig`, the session's
@@ -346,7 +352,7 @@ used with AES-256-GCM, a random 12-byte IV, and the frame's 32-byte header as
 AAD.
 
 *EPOCH_KEY body.* It is not encrypted under the content key, since a newcomer
-does not have the current one. It is `len (u16 BE) || cbor || sig`, where `cbor`
+does not have the current one. It is `len (u32 BE) || cbor || sig`, where `cbor`
 is a canonical CBOR map:
 
 ```
@@ -363,10 +369,15 @@ is a canonical CBOR map:
 and `sig` is the sender's signature over `"runa/v1/epoch-key" || header (32 B) || cbor`.
 A step's wrap holds the new `epoch_secret`. A handover's wrap holds the secrets
 from `root + 1` to `to`, concatenated in order, so the newcomer derives every
-epoch from its own link or passphrase. A receiver checks the signature against
-its roster, compares the roster hash (a mismatch shows the same warning as a
-shred vote), unwraps its own entry, derives, and compares `confirm`. A frame
-that fails any of these is refused, and the refusal is shown.
+epoch from its own link or passphrase. A handover carries at most 8192
+secrets; a room that has rotated more often than that since its root can no
+longer be joined, which at one rotation per 5 seconds takes over eleven hours of
+continuous departures. A receiver checks the signature against
+its roster, unwraps its own entry, derives, and compares `confirm`. A frame
+that fails any of these is refused, and the refusal is shown. It also compares
+the roster hash with its own: a mismatch is shown as a warning that someone may
+be hidden from the room, but does not stop the step, because two honest peers
+can briefly disagree about a departure that is still in flight.
 
 *When a room rotates.* In a Highest-security room, a peer that has been gone
 for 60 seconds starts a step, as does any peer gone ten minutes after a restart
@@ -390,16 +401,23 @@ A second handover is harmless.
 - An EPOCH_KEY whose header epoch is one above the room's advances the room,
   atomically, so the first such frame wins and a second for the same epoch is
   refused. Advances are refused for 5 seconds after the last one and at
-  `u32::MAX`. A refused frame is not relayed, and its sender gets ERROR 4006. A
-  header epoch equal to the room's is a handover and is relayed. Anything else
-  is dropped.
+  `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
+  and every peer, the sender too, moves to the new epoch when that copy
+  arrives, so the server's order is the only order. A refused step is dropped
+  without an answer; its sender applies whichever step does arrive. A header
+  epoch equal to the room's is a handover and is relayed to the other peers.
+  Anything else is dropped.
 - For 30 seconds after an advance, encrypted frames from the previous epoch
   are still accepted, so edits already in flight land. After that, an
-  encrypted frame (DOC_UPDATE, SNAPSHOT, AWARENESS, the SHRED frames,
-  EPOCH_KEY) from an earlier epoch is refused: a DOC_UPDATE is not stored, and
-  a sender that asked for acks gets `{ok: false, epoch}`, then re-encrypts and
-  resends it; any other frame is dropped, and its sender gets ERROR 4006. A
-  SNAPSHOT is accepted only at the room's epoch.
+  encrypted frame (DOC_UPDATE, SNAPSHOT, AWARENESS, the SHRED frames) from an
+  earlier epoch is refused, and so is one from a later epoch than the room's: a
+  DOC_UPDATE is not stored, and a sender that asked for acks gets
+  `{ok: false, epoch}`; any other frame is dropped, and its sender gets ERROR
+  4006. A client refused this way reconnects, which resends everything not yet
+  stored, and waits for a handover if it does not hold the room's current key.
+  Only a client more than 30 seconds behind is ever refused, and such a client
+  has no newer key to resend with. A SNAPSHOT is accepted only at the room's
+  epoch.
 - PING, TTL_EXTEND, PURGE_ACK and DOC_SYNC_REQ carry no ciphertext and are
   never refused for their epoch. Server-authored frames still carry epoch 0.
 - Restart tickets cover `epoch` and `root_epoch`. A ticket from a process that
