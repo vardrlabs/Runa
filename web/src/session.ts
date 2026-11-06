@@ -1169,7 +1169,9 @@ export class Session {
     // handles; non-extractable keys cannot be serialised out of the tab.
     // The socket and its cipher hold their own references, so clearing only
     // the session's copy left the key reachable for the tab's lifetime.
-    (this as unknown as { cfg: { contentKey: CryptoKey | null } }).cfg.contentKey = null;
+    const cfg = (this as unknown as { cfg: { contentKey: CryptoKey | null; chainKey: CryptoKey | null } }).cfg;
+    cfg.contentKey = null;
+    cfg.chainKey = null;
     this.socket.dropKeys();
     this.coordinator?.wipe();
     if (this.epochTimer) clearInterval(this.epochTimer);

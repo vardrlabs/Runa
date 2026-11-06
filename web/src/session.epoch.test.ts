@@ -141,3 +141,21 @@ describe("the snapshot a step asks for", () => {
     expect(made).toEqual([10n]);
   });
 });
+
+describe("dropKeys", () => {
+  it("drops the chain key along with the content key", () => {
+    const cfg = { contentKey: {} as CryptoKey | null, chainKey: {} as CryptoKey | null };
+    const s = Object.create(Session.prototype) as Record<string, unknown>;
+    Object.assign(s, {
+      cfg,
+      socket: { dropKeys: () => {} },
+      coordinator: { wipe: () => {} },
+      epochTimer: null,
+      snapshotSoonTimer: null,
+      awareness: null,
+    });
+    (s as unknown as { dropKeys(): void }).dropKeys();
+    expect(cfg.contentKey).toBeNull();
+    expect(cfg.chainKey).toBeNull();
+  });
+});

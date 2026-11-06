@@ -351,7 +351,7 @@ export class RunaSocket {
   adoptEpoch(epoch: number): void {
     const keys = this.opts.keyring.current;
     if (keys.epoch !== epoch || epoch === this.epoch) return;
-    // Before JOIN_ACK the sender label is our public key, so receivers refuse
+    // Before JOIN_ACK the sender label is this session's public key, so receivers refuse
     // anything sent early; JOIN_ACK relabels it with bindPeerId.
     this.cipher = new FrameCipher(keys.contentKey, this.joined ? this.peerId : this.opts.identity.publicKeyRaw);
     this.epoch = epoch;
@@ -387,7 +387,7 @@ export class RunaSocket {
   }
 
   private isStale(frameEpoch: number): boolean {
-    // Only an epoch below the one we send under can be stale. One above it is
+    // Only an epoch below the one this socket sends under can be stale. One above it is
     // live: the keyring has moved on and the adoption has not run yet.
     if (frameEpoch >= this.epoch) return false;
     const overlap = this.opts.epochOverlapMs ?? EPOCH_OVERLAP_MS;

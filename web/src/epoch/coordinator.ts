@@ -378,7 +378,7 @@ export class EpochCoordinator {
     if (this.awaitingEpoch !== null && body.to <= this.awaitingEpoch) return;
     const mine = eq(from.peerId, me);
     const pending = this.pendingStep;
-    // Our own echo is only followable with the secret it was built from: a
+    // This member's own echo is only followable with the secret it was built from: a
     // step this tab gave up on, or an earlier one for the same epoch, is not.
     const ownSecret = mine && pending?.to === body.to && confirmsEqual(pending.confirm, body.confirm);
     if (mine && !ownSecret && pending?.to === body.to) {
