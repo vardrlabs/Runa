@@ -5,7 +5,10 @@ import { FT } from "./transport/frame";
 import { RunaDoc, wrapWithLengthAndPad, mergeWrapped } from "./doc/ydoc";
 import { bindMonaco, type Binding } from "./doc/binding";
 import { AwarenessHub, handleFromPubkey } from "./doc/awareness";
-import { generateIdentity, type Identity } from "./crypto/identity";
+import { generateIdentity, signPayload, type Identity } from "./crypto/identity";
+import { generateKx, kxStatement } from "./crypto/kx";
+import { EpochCoordinator, type KeyStatus } from "./epoch/coordinator";
+import { Keyring } from "./epoch/keyring";
 import {
   ShredMachine,
   cancelApplies,
@@ -105,17 +108,40 @@ export function absoluteTtlShortened(
 /// was disconnected, so no PEER_LEAVE could be delivered.
 export function replaceRoster(
   target: Map<string, RosterEntry>,
-  authoritative: { peer_id: string; pubkey?: string; joined_at_seq: number }[],
+  authoritative: WireRoster,
 ): void {
   target.clear();
   for (const r of authoritative) {
     target.set(r.peer_id, {
       peerId: fromB64(r.peer_id),
       pubkey: r.pubkey ? fromB64(r.pubkey) : undefined,
+      kxPub: r.kx_pubkey ? fromB64(r.kx_pubkey) : undefined,
+      kxSig: r.kx_sig ? fromB64(r.kx_sig) : undefined,
       joinedAtSeq: r.joined_at_seq,
     });
   }
 }
+
+/// Who is gone from the roster, by signing key. A peer id is minted per
+/// connection, so a member that reconnected is not a departure; its signing
+/// key, which lives as long as its tab, is how it is recognised.
+export function departedMembers(before: RosterEntry[], after: RosterEntry[]): RosterEntry[] {
+  const still = new Set(after.filter((r) => r.pubkey).map((r) => toB64(r.pubkey!)));
+  return before.filter((r) => r.pubkey && !still.has(toB64(r.pubkey)));
+}
+
+export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
+  ok: null,
+  waiting: "Waiting for someone in this room to give this tab the room's current key.",
+  unreadable:
+    "This room's key changed after the last people left, so what was written since can't be opened here.",
+  refused:
+    "A key change in this room failed its checks and was refused. Someone may be interfering with the room, so copy your work out.",
+  "roster-mismatch":
+    "The latest key change was made with a different list of people than this tab sees. Someone may be hidden from this room.",
+  "server-behind":
+    "The server has lost track of this room's key changes, so this tab has stopped sending. Copy your work out and reload.",
+};
 
 /// The log index a snapshot taken now may claim to cover, or null when there
 /// is nothing new to cover.
@@ -203,6 +229,10 @@ export interface SessionEvents {
   /// How the room asks for its key to be kept, from its sealed config. Raised
   /// on every join.
   onSecurityLevel?(level: SecurityLevel): void;
+  /// Where this tab stands with the room's key (amendment J), as a sentence
+  /// to show, or null when there is nothing to say. `alarming` marks the
+  /// states that may mean tampering.
+  onKeyStatus?(message: string | null, alarming: boolean): void;
 }
 
 /// What the server said to a restart ticket: the room is back (whoever
@@ -214,6 +244,7 @@ export interface SessionConfig {
   roomIdHex: string;
   authKey: Uint8Array;
   contentKey: CryptoKey;
+  chainKey: CryptoKey;
   insecureAllowed?: boolean;
   /// Present a restart ticket to the new process. Without it, a room ends at
   /// a restart as it always did.
@@ -253,6 +284,12 @@ export class Session {
   readonly socket: RunaSocket;
   readonly identity: Identity;
   awareness: AwarenessHub | null = null;
+  coordinator!: EpochCoordinator;
+  securityLevel: SecurityLevel = "highest";
+  private epochTimer: ReturnType<typeof setInterval> | null = null;
+  /// A JOIN_ACK arrived while this tab held no key for the room's epoch, so
+  /// the sync request waits for the handover.
+  private syncDeferred = false;
 
   private binding: Binding | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -292,6 +329,9 @@ export class Session {
   static async create(cfg: SessionConfig, events: SessionEvents): Promise<Session> {
     const identity = await generateIdentity();
     const roomId = hexToBytes(cfg.roomIdHex);
+    const kx = await generateKx();
+    const kxSig = await signPayload(identity, kxStatement(roomId, kx.publicKeyRaw));
+    const keyring = await Keyring.fromRoot(0, cfg.contentKey, cfg.chainKey);
     const roster = new Map<string, RosterEntry>();
     const away = new Map<string, { handle: string; leftAt: number }>();
     const internals: SocketInternals = { roster, away, myPeerId: "", myJoinedSeq: 0, joinPerfMs: 0 };
@@ -300,6 +340,7 @@ export class Session {
     const peerJoined = (entry: RosterEntry): void => {
       const id = toB64(entry.peerId);
       roster.set(id, entry);
+      sessionRef?.coordinator?.memberJoined(entry);
       sessionRef?.noteRosterSeen(id);
       // Names come from the key the roster binds to this peer, never from
       // what the peer says its name is.
@@ -323,6 +364,7 @@ export class Session {
       const id = toB64(peerId);
       const entry = roster.get(id);
       if (roster.delete(id)) {
+        if (entry) sessionRef?.coordinator?.memberLeft(entry);
         // Remember them briefly, by name. A locked phone is
         // indistinguishable on the wire from someone closing the tab, and
         // the difference matters when a shred is about to be proposed.
@@ -346,13 +388,19 @@ export class Session {
       roomId,
       authKey: cfg.authKey,
       identity,
-      contentKey: cfg.contentKey,
+      keyring,
+      kx: { publicKeyRaw: kx.publicKeyRaw, sig: kxSig },
       insecureAllowed: cfg.insecureAllowed,
       compactUpdates: mergeWrapped,
       events: {
         onJoinAck: (ack) => sessionRef?.handleJoinAck(ack),
         onUpdatesStored: (count) => sessionRef?.noteUpdatesStored(count),
-        onRestartNotice: (inSecs, handover) => events.onServerRestart(inSecs, handover),
+        onRestartNotice: (inSecs, handover) => {
+          if (handover) sessionRef?.coordinator?.restartNotice(inSecs);
+          events.onServerRestart(inSecs, handover);
+        },
+        onEpochKey: (header, epoch, sender, body) =>
+          void sessionRef?.coordinator?.receive(header, epoch, sender, body),
         onEntriesTaken: (indexes) => {
           for (const i of indexes) sessionRef?.doc.cursor.note(i);
         },
@@ -363,6 +411,8 @@ export class Session {
             peerJoined({
               peerId: fromB64(r.peer_id),
               pubkey: r.pubkey ? fromB64(r.pubkey) : undefined,
+              kxPub: r.kx_pubkey ? fromB64(r.kx_pubkey) : undefined,
+              kxSig: r.kx_sig ? fromB64(r.kx_sig) : undefined,
               joinedAtSeq: r.joined_at_seq,
             });
           }
@@ -450,6 +500,23 @@ export class Session {
 
     const session = new Session(cfg, identity, doc, socket, machine, internals, events);
     sessionRef = session;
+    session.coordinator = new EpochCoordinator({
+      roomId,
+      identity,
+      kx,
+      keyring,
+      now: () => Date.now(),
+      me: () => (internals.myPeerId ? fromB64(internals.myPeerId) : null),
+      members: () => [...roster.values()],
+      highest: () => session.securityLevel === "highest",
+      header: (epoch) => socket.epochKeyHeader(epoch),
+      send: (header, body) => socket.sendEpochKey(header, body),
+      adopt: (epoch) => session.keysAdopted(epoch),
+      rejoin: () => socket.reconnectNow(),
+      status: (st) => session.reportKeyStatus(st),
+      snapshotSoon: () => session.snapshotSoon(),
+    });
+    session.epochTimer = setInterval(() => void session.coordinator.tick(), 1_000);
     void socket.connect().catch(() => {
       events.onTemper("COLD");
     });
@@ -550,6 +617,7 @@ export class Session {
     //
     // Peers this client held that the server no longer lists are gone: they
     // left while it was disconnected and no PEER_LEAVE could be delivered.
+    const rosterBefore = [...this.internals.roster.values()];
     replaceRoster(this.internals.roster, ack.roster);
     for (const r of ack.roster) this.noteRosterSeen(r.peer_id);
     this.events.onPeersChanged(this.internals.roster.size);
@@ -583,6 +651,13 @@ export class Session {
       }
     }
     this.events.onSecurityLevel?.(level);
+    this.securityLevel = level;
+    // Members who left while this tab was away count as departures, the same
+    // as a PEER_LEAVE it saw (amendment J).
+    for (const gone of departedMembers(rosterBefore, [...this.internals.roster.values()])) {
+      this.coordinator.memberLeft(gone);
+    }
+    await this.coordinator.joined(typeof ack.epoch === "number" ? ack.epoch : 0);
 
     switch (effectiveTtl.kind) {
       case "none":
@@ -609,9 +684,34 @@ export class Session {
     // Resume rather than replay: asking from 0 on every reconnect pulls the
     // entire room log down again each time. With indexes, resume from exactly
     // what this copy holds.
-    this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());
+    if (this.socket.isAwaitingKeys) {
+      this.syncDeferred = true;
+    } else {
+      this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());
+    }
     // Anything this client wrote that the room never stored is resent by the
     // socket itself, once it has confirmed the join.
+  }
+
+  /// A step or handover has given this tab the keys for `epoch`.
+  keysAdopted(epoch: number): void {
+    this.socket.adoptEpoch(epoch);
+    if (this.syncDeferred && !this.socket.isAwaitingKeys) {
+      this.syncDeferred = false;
+      this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());
+    }
+  }
+
+  reportKeyStatus(s: KeyStatus): void {
+    const alarming = s === "refused" || s === "roster-mismatch" || s === "server-behind";
+    this.events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
+    if (alarming) this.events.onTemper("WATCH");
+  }
+
+  /// After a rotation the elected member snapshots straight away, so the log
+  /// soon holds nothing under an older key.
+  snapshotSoon(): void {
+    setTimeout(() => this.trySnapshot(true), 1_000);
   }
 
   private async decryptConfigBlob(
@@ -762,33 +862,36 @@ export class Session {
   /// (joined_at_seq, peer_id) snapshots when thresholds fire.
   private startSnapshotLoop(): void {
     if (this.snapshotTimer) return;
-    this.snapshotTimer = setInterval(() => {
-      if (performance.now() - this.internals.joinPerfMs < 60_000) return;
-      // A snapshot claims to cover the log up to an index. Taken while this
-      // client still has updates the room has not stored, or parts of one it is
-      // still receiving, that claim would be wrong.
-      if (!this.socket.readyForSnapshot()) return;
-      const roster = [...this.internals.roster.values()];
-      if (!roster.length) return;
-      const me = toB64(hexToBytes(this.cfg.roomIdHex)) && this.internals.myPeerId;
-      const elected = [...roster].sort((a, b) =>
-        a.joinedAtSeq !== b.joinedAtSeq
-          ? a.joinedAtSeq - b.joinedAtSeq
-          : cmpBytes(a.peerId, b.peerId),
-      )[0];
-      if (toB64(elected.peerId) !== me) return;
-      const covers = snapshotCover({
-        indexed: this.indexed,
-        watermark: this.doc.cursor.watermark,
-        lastCovered: this.lastCovered,
-        baseIndex: this.doc.baseIndex,
-        storedCount: this.doc.storedCount,
-      });
-      if (covers === null || !this.doc.shouldSnapshot(BigInt(Math.max(covers, 1)))) return;
-      void this.doc.createSnapshot(BigInt(covers)).then((made) => {
-        if (made) this.lastCovered = Math.max(this.lastCovered, covers);
-      });
-    }, 30_000);
+    this.snapshotTimer = setInterval(() => this.trySnapshot(false), 30_000);
+  }
+
+  private trySnapshot(force: boolean): void {
+    if (performance.now() - this.internals.joinPerfMs < 60_000) return;
+    // A snapshot claims to cover the log up to an index. Taken while this
+    // client still has updates the room has not stored, or parts of one it is
+    // still receiving, that claim would be wrong.
+    if (!this.socket.readyForSnapshot()) return;
+    const roster = [...this.internals.roster.values()];
+    if (!roster.length) return;
+    const me = toB64(hexToBytes(this.cfg.roomIdHex)) && this.internals.myPeerId;
+    const elected = [...roster].sort((a, b) =>
+      a.joinedAtSeq !== b.joinedAtSeq
+        ? a.joinedAtSeq - b.joinedAtSeq
+        : cmpBytes(a.peerId, b.peerId),
+    )[0];
+    if (toB64(elected.peerId) !== me) return;
+    const covers = snapshotCover({
+      indexed: this.indexed,
+      watermark: this.doc.cursor.watermark,
+      lastCovered: this.lastCovered,
+      baseIndex: this.doc.baseIndex,
+      storedCount: this.doc.storedCount,
+    });
+    if (covers === null) return;
+    if (!force && !this.doc.shouldSnapshot(BigInt(Math.max(covers, 1)))) return;
+    void this.doc.createSnapshot(BigInt(covers)).then((made) => {
+      if (made) this.lastCovered = Math.max(this.lastCovered, covers);
+    });
   }
 
   setSteadyTraffic(on: boolean, intervalMs = 400): void {
@@ -1019,6 +1122,8 @@ export class Session {
     // the session's copy left the key reachable for the tab's lifetime.
     (this as unknown as { cfg: { contentKey: CryptoKey | null } }).cfg.contentKey = null;
     this.socket.dropKeys();
+    this.coordinator?.wipe();
+    if (this.epochTimer) clearInterval(this.epochTimer);
     this.awareness?.dispose();
     this.awareness = null;
   }
@@ -1152,6 +1257,8 @@ export class Session {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
     if (this.snapshotTimer) clearInterval(this.snapshotTimer);
     if (this.steadyTimer) clearInterval(this.steadyTimer);
+    if (this.epochTimer) clearInterval(this.epochTimer);
+    this.coordinator?.wipe();
     this.cursorTimerRef?.();
     this.binding?.dispose();
     this.doc.destroy();
