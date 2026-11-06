@@ -155,7 +155,8 @@ What that buys is narrow, so here it is exactly:
 - **It does not stop them coming back.** They still hold the link or the
   passphrase, so they can rejoin, appear in the peer list like anyone else, and
   be handed the current key. Rotation turns silent reading into a visible
-  return.
+  return. Removing them, described below, is what takes the link or passphrase
+  away.
 - **It gives no backward secrecy.** A departed peer keeps everything they saw
   while they were there.
 - **Everyday rooms do not rotate when someone leaves.** An everyday room
@@ -205,6 +206,74 @@ keeps trying, and nothing tells anyone that the change is overdue. As
 everywhere in this document, nothing here helps against a server that serves
 bad JavaScript, and running the server yourself is the answer to both.
 
+### Removing someone, and changing the link
+
+Rotation on a departure leaves the person who left holding the link or the
+passphrase. Removing them takes it away. The person who asks has already made
+the replacement: a new link, or for a shared-name room a passphrase they typed
+or generated, held to the same strength check as a new room's. Everyone else in
+the room has to approve, any one of them can refuse, and a vote that nobody
+settles fails after a minute. Once everyone has approved, each member receives
+the new link or passphrase sealed to them alone, the server replaces what it
+checks a JOIN against, and the room's key starts again from the new link or
+passphrase. Changing the link is the same vote with nobody removed. It is what
+an everyday room can do about someone who once had its link, since an everyday
+room does not change its key when people leave. The design is in PROTOCOL
+amendment K.
+
+What that buys, exactly:
+
+- **The removed person cannot come back with what they had.** Their old link
+  or passphrase is refused like a wrong one, and their page says they were
+  removed. Every connection holding their signing key is left out of the vote
+  and of the new link, as well as the one that was named. If someone sends
+  them the new one, they can come back, visibly.
+- **They cannot read what is written afterwards**, unless someone gives them
+  the new link or passphrase, or a dishonest server helps them (below).
+- **It gives no backward secrecy.** They keep everything they saw.
+- **Anyone not connected at that moment, or who arrived during the vote, is cut
+  off too.** Their link stops working, and they need the new one from someone
+  who was there. Each member is
+  shown the new link or passphrase once, with a reminder to send it to anyone
+  who should still be here.
+- **Someone being removed cannot dodge it by reconnecting: a new connection is
+  not given the new link.** The room changes its link whether or not they are
+  still connected, and only the people who approved receive the new one.
+- **Connections opened after a vote started are not counted.** The server
+  checks that more than half agreed among the people who were connected when
+  the request passed through it, so nobody can hold the vote down by opening
+  connections once it has begun. The person being removed could only inflate
+  the count by opening connections before anyone asked, and those show in the
+  room as extra people, who would then have to be asked too.
+- **In a room of two, either person can remove the other.** Whichever request
+  reaches the server first wins.
+- **The room's fingerprint changes.** Anyone who compared it before should
+  compare the new one.
+
+Against the server:
+
+- **It checks the votes itself**, against the signing key each voter joined
+  with, and changes nothing unless more than half of the people who were
+  connected when the request passed through it, apart from the one being
+  removed, signed. Members hold the vote to the
+  stricter rule that everyone signed. In exchange the server learns which
+  connections voted to remove which, and when.
+- **It never sees the new link or passphrase.** Each member's copy is sealed
+  under a key agreed with the person who asked, as with rotation, and the same
+  limit applies: a server working with the removed person can put its own
+  key-agreement key in place of a member's in the peer list, open that member's
+  copy and pass the new link on. Comparing the new fingerprint does not catch
+  this, because the fingerprint comes from the link itself.
+- **A server that will not enforce a removal** can keep accepting the old link,
+  or keep the removed person's connection open. They still cannot read anything
+  written under the new key without the substitution above.
+- **Nothing stops a member who stays from passing the new link on.** Removal
+  protects the room from the person removed, not from the people who keep their
+  place.
+
+As everywhere in this document, none of this holds against a server that
+serves bad JavaScript.
+
 ## Metadata the server unavoidably learns
 
 | Leak | Why | Mitigation |
@@ -218,6 +287,7 @@ bad JavaScript, and running the server yourself is the answer to both.
 | Room TTL | The server enforces it, so it must know it | None. It is a scheduling parameter, not a secret |
 | A named room's name | It is the routing address | None, by construction. This is the entire trade; it is why named rooms are a separate class with a separate promise |
 | When a room's key changes, and how many times | It relays each rotation and enforces the room's current epoch | None. It already sees every departure that causes one |
+| Who asked to remove whom, who agreed, and when a room's link changed | It checks the votes and replaces what it checks a JOIN against | None. Votes name connections, which carry no names |
 
 ## Known limits stated plainly
 
