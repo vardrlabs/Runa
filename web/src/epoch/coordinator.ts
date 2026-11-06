@@ -77,6 +77,12 @@ export class EpochCoordinator {
   private handovers = new Map<string, number>();
   /// Key-agreement keys whose signature checked out, by peer id (hex).
   private verifiedKx = new Map<string, Uint8Array>();
+  /// Signing keys (hex) of members this tab has already seen in the room, from
+  /// PEER_JOIN or an earlier roster. A reconnect hands keys only to members
+  /// not in here: the rest were either handed them by someone who was present
+  /// or were here to be, and a big room would otherwise get one handover per
+  /// member in a single tick.
+  private seen = new Set<string>();
   private awaitingEpoch: number | null = null;
   /// False when the JOIN_ACK had no `root_epoch`: that server predates
   /// amendment J, never advances a room or echoes a step, so nothing is sent
@@ -123,6 +129,7 @@ export class EpochCoordinator {
       const key = hex(m.pubkey);
       this.tracker.returned(key);
       this.departed.delete(key);
+      this.seen.add(key);
     }
     const me = this.d.me();
     if (me && !eq(m.peerId, me) && this.d.keyring.current.epoch > this.d.keyring.rootEpoch) {
@@ -172,16 +179,21 @@ export class EpochCoordinator {
       this.d.status(this.othersPresent() ? "waiting" : "unreadable");
     }
     // Newcomers that arrived while this tab was away were never announced to
-    // it, and may be waiting for a handover nobody else can send. A member
-    // that already holds the epoch ignores a redundant one.
+    // it, and may be waiting for a handover nobody else can send. Only members
+    // whose signing key this tab has not seen get one: the rest were here
+    // before, and a member that already holds the epoch ignores a redundant one.
     const me = this.d.me();
+    const members = this.d.members();
     if (me && held > this.d.keyring.rootEpoch) {
       const now = this.d.now();
-      for (const m of this.d.members()) {
+      for (const m of members) {
         const id = hex(m.peerId);
-        if (!eq(m.peerId, me) && !this.handovers.has(id)) this.handovers.set(id, now);
+        if (eq(m.peerId, me) || this.handovers.has(id)) continue;
+        if (m.pubkey && this.seen.has(hex(m.pubkey))) continue;
+        this.handovers.set(id, now);
       }
     }
+    for (const m of members) if (m.pubkey) this.seen.add(hex(m.pubkey));
   }
 
   /// Once a second.
@@ -481,5 +493,6 @@ export class EpochCoordinator {
     this.handovers.clear();
     this.tracker.clear();
     this.departed.clear();
+    this.seen.clear();
   }
 }

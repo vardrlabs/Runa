@@ -550,6 +550,22 @@ describe("EpochCoordinator", () => {
     expect(d.statuses.at(-1)).toBe("ok");
   });
 
+  it("a holder that reconnects into a roster it already knew schedules no handovers", async () => {
+    const { hub, peers } = await room(4);
+    const [a, , , d] = peers;
+    leave(hub, d);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    expect(a.keyring.current.epoch).toBe(1);
+    const queued = (): number => (a.coord as unknown as { handovers: Map<string, number> }).handovers.size;
+    // Everyone listed now was in a's roster before it dropped: b and c have
+    // keys already, and a must not send each of them a handover again.
+    await a.coord.joined(1);
+    expect(queued()).toBe(0);
+    await a.coord.joined(1);
+    expect(queued()).toBe(0);
+  });
+
   it("does not rotate when a member's new connection is announced before its old one leaves", async () => {
     const { hub, peers } = await room(3);
     const [, , c] = peers;
