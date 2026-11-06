@@ -8,7 +8,6 @@ import {
   FT,
   HEADER_LEN,
   PROTOCOL_VERSION,
-  buildFrame,
   buildJsonFrame,
   parseFrame,
   stripEnvelope,
@@ -352,7 +351,9 @@ export class RunaSocket {
   adoptEpoch(epoch: number): void {
     const keys = this.opts.keyring.current;
     if (keys.epoch !== epoch || epoch === this.epoch) return;
-    this.cipher = new FrameCipher(keys.contentKey, this.peerId);
+    // Before JOIN_ACK the sender label is our public key, so receivers refuse
+    // anything sent early; JOIN_ACK relabels it with bindPeerId.
+    this.cipher = new FrameCipher(keys.contentKey, this.joined ? this.peerId : this.opts.identity.publicKeyRaw);
     this.epoch = epoch;
     this.switchedAt = performance.now();
     if (epoch >= this.roomEpoch) {
@@ -386,7 +387,9 @@ export class RunaSocket {
   }
 
   private isStale(frameEpoch: number): boolean {
-    if (frameEpoch === this.epoch) return false;
+    // Only an epoch below the one we send under can be stale. One above it is
+    // live: the keyring has moved on and the adoption has not run yet.
+    if (frameEpoch >= this.epoch) return false;
     const overlap = this.opts.epochOverlapMs ?? EPOCH_OVERLAP_MS;
     return !(frameEpoch === this.epoch - 1 && performance.now() - this.switchedAt < overlap);
   }
@@ -648,7 +651,10 @@ export class RunaSocket {
       // server has lost track of the room's rotations, and sending under an
       // older key would hand new writing to whoever left. Either way, hold.
       this.roomEpoch = typeof ack.epoch === "number" ? ack.epoch : 0;
-      this.awaitingKeys = this.roomEpoch !== this.opts.keyring.current.epoch;
+      // Compared with the epoch the cipher sends under, not the keyring's: a
+      // keyring that advanced before adoptEpoch ran must not send under a key
+      // the room has left.
+      this.awaitingKeys = this.roomEpoch !== this.epoch;
       // The AEAD sender component must be the server-assigned 16-byte peer id
       // (what receivers read from the envelope), not our public key. Re-label
       // in place: the nonce stream must never restart.
@@ -718,8 +724,7 @@ export class RunaSocket {
         /* malformed error frame: treat as a protocol error */
       }
       if (code === 4006) {
-        // A frame of ours was refused for its epoch: this tab is more than the
-        // overlap behind. Joining again resends everything not yet stored, and
+        // A frame of ours was refused for its epoch. Joining again resends everything not yet stored, and
         // waits for a handover if the room has moved on (amendment J).
         this.abandonConnection();
         return;
@@ -1184,7 +1189,9 @@ export class RunaSocket {
     const body = new Uint8Array(8 + envelope.length);
     new DataView(body.buffer).setBigUint64(0, covers, false);
     body.set(envelope, 8);
-    const frame = buildFrame(FT.SNAPSHOT, this.opts.roomId, this.epoch, this.cipher.sess, body);
+    // The header sealed into the AAD, not a fresh one: an epoch adopted while
+    // the encrypt was awaited must not relabel a ciphertext made under the old key.
+    const frame = concatBytes(header, body);
     if (frame.length > this.limits.maxFrameBytes) {
       // Skipping leaves the log uncompacted, which is a slow problem.
       // Sending it closes the connection, which is an immediate one.

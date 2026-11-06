@@ -583,6 +583,7 @@ describe("epochs (amendment J)", () => {
     const frames = docFrames(ws);
     expect(frames).toHaveLength(1);
     expect(new DataView(frames[0].buffer, frames[0].byteOffset).getUint32(20, false)).toBe(1);
+    expect(await readAsPeer(frames[0], keyring.current.contentKey)).toEqual(text("held"));
   });
 
   it("reads a stored entry under the epoch it was written in", async () => {
@@ -644,7 +645,7 @@ describe("epochs (amendment J)", () => {
     expect(onEpochStale).not.toHaveBeenCalled();
   });
 
-  it("reconnects when the server refuses an update for its epoch", async () => {
+  it("reconnects when the server refuses an update for its epoch, and resends it", async () => {
     const { socket } = await makeSocket();
     const ws = latest();
     ws.open();
@@ -654,8 +655,98 @@ describe("epochs (amendment J)", () => {
     await sleep(20);
     const before = FakeWebSocket.all.length;
     ws.deliver(buildJsonFrame(FT.DOC_ACK, ROOM, 0, { ok: false, epoch: 1 }));
-    await sleep(700);
-    expect(FakeWebSocket.all.length).toBeGreaterThan(before);
+    await waitFor(() => FakeWebSocket.all.length > before, 2000);
+    const ws2 = latest();
+    ws2.open();
+    ws2.deliver(joinAck());
+    await waitFor(() => docFrames(ws2).length === 1);
+  });
+
+  it("resends under the epoch it adopted, as a peer can read it, after a reconnect", async () => {
+    const { socket, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    await socket.sendUpdate(text("after rotation"));
+    await sleep(20);
+    expect(docFrames(ws)).toHaveLength(1);
+    const before = FakeWebSocket.all.length;
+    ws.close();
+    await waitFor(() => FakeWebSocket.all.length > before, 2000);
+    const ws2 = latest();
+    ws2.open();
+    ws2.deliver(joinAck({ epoch: 1 }));
+    await waitFor(() => docFrames(ws2).length === 1);
+    const frame = docFrames(ws2)[0];
+    expect(new DataView(frame.buffer, frame.byteOffset).getUint32(20, false)).toBe(1);
+    expect(await readAsPeer(frame, keyring.current.contentKey)).toEqual(text("after rotation"));
+  });
+
+  it("labels a snapshot with the epoch it was sealed under even if the epoch changes while it seals", async () => {
+    const { socket, key, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    await stepRing(keyring);
+    const sealing = socket.sendSnapshot(text("state"), 5n);
+    socket.adoptEpoch(1);
+    await sealing;
+    const frame = ws.sent.filter((f) => f[3] === FT.SNAPSHOT)[0];
+    const epoch = new DataView(frame.buffer, frame.byteOffset).getUint32(20, false);
+    const opener = epoch === 0 ? key : keyring.current.contentKey;
+    const header = frame.slice(0, HEADER_LEN);
+    const envelope = frame.slice(HEADER_LEN + 8);
+    expect(await decryptEnvelope(opener, header, PEER, envelope, 5n)).toEqual(text("state"));
+    expect(header.slice(24, 28)).toEqual(envelope.slice(0, 4));
+  });
+
+  it("does not warn for a live frame from an epoch ahead of the one it sends under", async () => {
+    const onAwareness = vi.fn();
+    const onEpochStale = vi.fn();
+    const { key, keyring } = await makeSocket({ epochOverlapMs: 0, events: { onAwareness, onEpochStale } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    await stepRing(keyring);
+    ws.deliver(await incoming(FT.AWARENESS, 1, keyring.current.contentKey, text("{}")));
+    await sleep(20);
+    expect(onEpochStale).not.toHaveBeenCalled();
+    expect(key).toBeTruthy();
+  });
+
+  it("holds sends when the keyring advanced but the socket has not adopted the epoch", async () => {
+    const { socket, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    await stepRing(keyring);
+    ws.deliver(joinAck({ epoch: 1 }));
+    await sleep(0);
+    expect(socket.isAwaitingKeys).toBe(true);
+    await socket.sendUpdate(text("must wait"));
+    await sleep(20);
+    expect(docFrames(ws)).toHaveLength(0);
+    socket.adoptEpoch(1);
+    await waitFor(() => docFrames(ws).length === 1);
+  });
+
+  it("labels a cipher adopted before the join with the public key, so receivers refuse anything sent early", async () => {
+    const { socket, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    const ownKey = new Uint8Array(32).fill(5);
+    // Sealed under the epoch-1 key with the cipher's own sender label.
+    const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.AWARENESS, roomId: ROOM, epoch: 1, nonceSess: socket.sessionId, flags: 0 });
+    const probe = (socket as unknown as { cipher: FrameCipher }).cipher;
+    const env = await probe.encrypt(header, text("x"));
+    await expect(decryptEnvelope(keyring.current.contentKey, header, PEER, env)).rejects.toThrow();
+    await expect(decryptEnvelope(keyring.current.contentKey, header, ownKey, env)).resolves.toBeDefined();
   });
 
   it("reconnects on ERROR 4006", async () => {
