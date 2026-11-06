@@ -4,7 +4,7 @@ name: fuzz
 # takes about 45 minutes, 40 of them fuzzing, which on a weekly schedule was
 # most of a month's free CI minutes for a parser that has never had anything
 # to find. Run it after touching anything a target covers: frame parsing,
-# room names, log compaction, or the room-creation body.
+# room names, log compaction, the room-creation body, epochs, or eviction commits.
 on:
   workflow_dispatch:
 
@@ -59,3 +59,4 @@ jobs:
           cargo +nightly fuzz run log_compaction  -- -max_total_time=900
           cargo +nightly fuzz run create_body     -- -max_total_time=900
           cargo +nightly fuzz run epoch_advance   -- -max_total_time=300
+          cargo +nightly fuzz run evict_commit    -- -max_total_time=300

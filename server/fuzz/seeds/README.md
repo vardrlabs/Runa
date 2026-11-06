@@ -17,3 +17,7 @@ failing to parse.
 The CI job copies these into the corpus before running. They are valid bodies,
 one per TTL kind, and exist to get the fuzzer past the parser — not to be
 interesting in themselves.
+
+`evict_commit` has a seed for the same reason: its input has to get through a
+length-prefixed config and a vote count before the votes are read. The seed is
+a well-formed two-vote commit with a short tail.
