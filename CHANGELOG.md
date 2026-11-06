@@ -6,6 +6,21 @@ section — so this file is not documentation of the release, it is part of it.
 
 ## Unreleased
 
+### Added
+
+- **Highest-security rooms change their key when someone leaves.** Once a
+  person has been gone for a minute (ten minutes during a server restart, so
+  everyone can reconnect), the person who has been in the room longest draws a
+  new secret and hands it to each remaining member under a key agreed with that
+  member alone. What is written afterwards is under a key the person who left
+  never receives, so they can no longer read along quietly from ciphertext. They
+  can still come back with the link, visibly, like anyone else. Someone who joins
+  later is handed the secrets by a member who is present and reads the whole
+  history. Everyday rooms keep their promise that the link opens them later, so
+  they do not rotate on a departure. The design and its limits are in
+  `docs/THREAT_MODEL.md` and `docs/PROTOCOL.md` amendment J. Removing someone
+  and changing a room's link come in a later release.
+
 ### Fixed
 
 - **The deploy never actually let unattended-upgrades patch Caddy.** 0.5.4
