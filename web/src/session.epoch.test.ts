@@ -25,7 +25,7 @@ describe("key status text", () => {
   it("has no em dashes and no 'we'", () => {
     for (const t of Object.values(KEY_STATUS_TEXT)) {
       if (t === null) continue;
-      expect(t).not.toMatch(/—/);
+      expect(t).not.toMatch(/\u2014/);
       expect(t).not.toMatch(/\bwe\b/i);
     }
   });
