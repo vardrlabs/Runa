@@ -184,7 +184,8 @@ hand a newcomer false secrets either, because they cannot compute the
 confirmation. A member who holds the link can: the newcomer would then hold
 keys nobody else has, and nothing would open. Other members who see that
 handover notice that its confirmation does not match their own, say so, and
-send their own. A rotation that fails is refused and shown, and the room stops
+send their own, and the newcomer shows that the two disagree. It keeps the
+first set it applied, though, so it has to reload to recover. A rotation that fails is refused and shown, and the room stops
 working until people leave it. Only a member or the server can cause that, and
 either could already disrupt a room.
 
