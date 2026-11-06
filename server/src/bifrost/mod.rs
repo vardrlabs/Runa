@@ -16,7 +16,8 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::bifrost::frame::*;
-use crate::runar::room::TtlKind;
+use crate::runar::epoch::Admit;
+use crate::runar::room::{PeerKx, TtlKind};
 use crate::error::WireCode;
 use crate::gjallarhorn;
 use crate::heimdall::ratelimit::RateLimiter;
@@ -70,6 +71,12 @@ struct JoinBody {
     /// This connection will send PING and wants PONG (amendment G).
     #[serde(default)]
     heartbeat: bool,
+    /// This session's ECDH P-256 key and the session's signature over it
+    /// (amendment J). Kept only when both are well formed.
+    #[serde(default)]
+    kx_pubkey: Option<String>,
+    #[serde(default)]
+    kx_sig: Option<String>,
 }
 
 /// What one connection negotiated in its JOIN. Each is off for a client that
@@ -86,6 +93,10 @@ struct RosterJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     pubkey: Option<String>,
     joined_at_seq: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kx_pubkey: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kx_sig: Option<String>,
 }
 
 /// The limits a connection is held to, sent to a client that resends its
@@ -104,6 +115,7 @@ struct LimitsJson {
 struct JoinAck {
     peer_id: String,
     epoch: u32,
+    root_epoch: u32,
     log_len: u64,
     base_index: u64,
     has_snapshot: bool,
@@ -396,15 +408,41 @@ async fn run_connection(
         .and_then(|k| B64.decode(k).ok())
         .filter(|v| v.len() == 32 || v.len() == 65);
 
+    let kx = match (join.kx_pubkey.as_deref(), join.kx_sig.as_deref()) {
+        (Some(p), Some(s)) => match (B64.decode(p), B64.decode(s)) {
+            (Ok(p), Ok(s)) if p.len() == 65 && p[0] == 0x04 && s.len() == 64 => {
+                Some(PeerKx { pubkey: p, sig: s })
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CAPACITY);
     let peer_tx = crate::runar::room::PeerTx::new(tx, cfg.max_queued_bytes_per_conn)
         .with_indexes(join.indexed);
     let queue_meter = peer_tx.meter();
-    let entry = match room.add_peer(session_pubkey.clone(), peer_tx) {
+    let final_error = peer_tx.close_flag();
+    let entry = match room.add_peer(session_pubkey.clone(), kx, peer_tx) {
         Ok(e) => e,
         Err(JoinError::Full) => {
             let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::RoomFull))).await;
             return Err(WireCode::RoomFull);
+        }
+        // Amendment J: a client that sent no key-agreement key cannot be
+        // handed the key of a rotated room, and would write under a key
+        // someone who left holds. `add_peer` decides this under the room's
+        // locks, so a step on another thread cannot slip between the check
+        // and the insert.
+        Err(JoinError::Rotated) => {
+            let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::ProtocolError))).await;
+            let _ = sink
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: u16::from(WireCode::ProtocolError),
+                    reason: "".into(),
+                })))
+                .await;
+            return Err(WireCode::ProtocolError);
         }
         Err(JoinError::AuthLockedOut(_)) => {
             floor_delay(cfg.auth_floor).await;
@@ -430,7 +468,8 @@ async fn run_connection(
         };
         let ack = JoinAck {
             peer_id: B64.encode(peer_id),
-            epoch: room.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            epoch: room.epoch(),
+            root_epoch: room.root_epoch(),
             log_len,
             base_index,
             has_snapshot,
@@ -480,6 +519,8 @@ async fn run_connection(
             "peer_id": B64.encode(peer_id),
             "pubkey": session_pubkey.map(|k| B64.encode(k)),
             "joined_at_seq": entry.joined_at_seq,
+            "kx_pubkey": entry.kx.as_ref().map(|k| B64.encode(&k.pubkey)),
+            "kx_sig": entry.kx.as_ref().map(|k| B64.encode(&k.sig)),
         }),
     );
     room.broadcast_event(&join_evt, None).await;
@@ -549,6 +590,9 @@ async fn run_connection(
                     Some(bytes) => {
                         let is_purge = bytes.len() >= HEADER_LEN && bytes[3] == FT_PURGE;
                         let is_ticket = bytes.len() >= HEADER_LEN && bytes[3] == FT_RESTART_TICKET;
+                        let is_final_error = bytes.len() >= HEADER_LEN
+                            && bytes[3] == FT_ERROR
+                            && final_error.load(std::sync::atomic::Ordering::SeqCst);
                         let n = bytes.len();
                         let sent = sink.send(Message::Binary(bytes)).await;
                         // Quota returns once the frame is off our hands.
@@ -565,6 +609,12 @@ async fn run_connection(
                         // the member comes back to the new process with it.
                         if is_ticket {
                             conn_ok = Err(WireCode::ServiceRestart);
+                            break;
+                        }
+                        // A client that cannot be handed the room's new key:
+                        // its ERROR 4005 was the last frame it gets.
+                        if is_final_error {
+                            conn_ok = Err(WireCode::ProtocolError);
                             break;
                         }
                     }
@@ -599,6 +649,15 @@ async fn run_connection(
     conn_ok
 }
 
+/// Frames whose bodies are ciphertext under an epoch's content key. Only these
+/// are held to the room's epoch; control frames carry nothing to protect.
+fn carries_ciphertext(frame_type: u8) -> bool {
+    matches!(
+        frame_type,
+        FT_DOC_UPDATE | FT_SNAPSHOT | FT_AWARENESS | FT_SHRED_REQUEST | FT_SHRED_VOTE | FT_SHRED_CANCEL
+    )
+}
+
 /// Returns Ok on handled, Err(Some(code)) to close, Err(None) silently ignored.
 async fn process_frame(
     state: &AppState,
@@ -619,6 +678,31 @@ async fn process_frame(
         return Err(Some(WireCode::ProtocolError));
     }
     let frame_bytes = Bytes::copy_from_slice(data);
+
+    // Amendment J: ciphertext from an epoch the room has left is refused once
+    // the overlap has passed, and so is ciphertext from one it has not
+    // reached. A snapshot rebases history, so it must be current.
+    if carries_ciphertext(header.frame_type) {
+        let admit = room.admit_epoch(header.epoch, std::time::Instant::now(), state.cfg.epoch_overlap);
+        match admit {
+            Admit::Current => {}
+            // A snapshot rebases history, so it must be current. One from the
+            // epoch just left is dropped without an answer: the member that
+            // rotated is usually the snapshotter, and must not be made to
+            // reconnect for a snapshot sent between its step and the echo.
+            Admit::Overlap if header.frame_type == FT_SNAPSHOT => return Ok(()),
+            Admit::Overlap => {}
+            Admit::Stale => {
+                if header.frame_type == FT_DOC_UPDATE && caps.acks {
+                    let body = serde_json::json!({ "ok": false, "epoch": room.epoch() });
+                    direct.push(json_frame(room.id, FT_DOC_ACK, &body));
+                } else {
+                    direct.push(error_frame(room.id, WireCode::EpochStale));
+                }
+                return Ok(());
+            }
+        }
+    }
 
     match header.frame_type {
         FT_DOC_UPDATE => {
@@ -746,7 +830,22 @@ async fn process_frame(
             Ok(())
         }
 
-        FT_SHRED_REQUEST | FT_SHRED_VOTE | FT_SHRED_CANCEL | FT_EPOCH_KEY => {
+        FT_EPOCH_KEY => {
+            let now = std::time::Instant::now();
+            // Decision and fan-out are one critical section in the room, so
+            // every peer sees steps in the order the server decided them.
+            let _ = room.step_epoch(
+                header.epoch,
+                now,
+                state.cfg.epoch_min_interval,
+                &frame_bytes,
+                sender,
+                &error_frame(room.id, WireCode::ProtocolError),
+            );
+            Ok(())
+        }
+
+        FT_SHRED_REQUEST | FT_SHRED_VOTE | FT_SHRED_CANCEL => {
             if header.frame_type == FT_SHRED_REQUEST {
                 room.note_shred_request();
             }
@@ -838,6 +937,8 @@ fn roster_json(room: &Room) -> Vec<RosterJson> {
             peer_id: B64.encode(p.peer_id),
             pubkey: p.pubkey.map(|k| B64.encode(k)),
             joined_at_seq: p.joined_at_seq,
+            kx_pubkey: p.kx.as_ref().map(|k| B64.encode(&k.pubkey)),
+            kx_sig: p.kx.as_ref().map(|k| B64.encode(&k.sig)),
         })
         .collect()
 }

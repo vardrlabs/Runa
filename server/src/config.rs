@@ -41,6 +41,12 @@ pub struct Config {
     /// Rooms live only in memory, so a restart ends every one of them, and this
     /// is the time people get to export. Zero stops at once.
     pub shutdown_grace: Duration,
+    /// How long after a room moves to a new epoch frames from the epoch it
+    /// left are still accepted, so edits already in flight land
+    /// (PROTOCOL.md amendment J).
+    pub epoch_overlap: Duration,
+    /// The shortest time between two epoch steps in one room.
+    pub epoch_min_interval: Duration,
     pub frames_per_conn_per_sec: u32,
     pub bytes_per_conn_per_sec: u64,
     pub rooms_created_per_ip_per_hour: u32,
@@ -99,6 +105,8 @@ impl Default for Config {
             auth_attempts_per_ip_per_min: 30,
             max_conns_per_ip: 64,
             shutdown_grace: Duration::from_secs(60),
+            epoch_overlap: Duration::from_secs(30),
+            epoch_min_interval: Duration::from_secs(5),
             frames_per_conn_per_sec: 100,
             bytes_per_conn_per_sec: 1024 * 1024,
             rooms_created_per_ip_per_hour: 20,

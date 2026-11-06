@@ -40,3 +40,9 @@ name = "create_body"
 path = "fuzz_targets/create_body.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "epoch_advance"
+path = "fuzz_targets/epoch_advance.rs"
+test = false
+doc = false

@@ -79,6 +79,13 @@ pub struct Ticket {
     pub p: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_blob: Option<String>,
+    /// The room's epoch and the epoch of its current root (amendment J). A
+    /// ticket from a process that predates them has neither and restores the
+    /// room at 0. Covered by the HMAC like every other field.
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(default)]
+    pub root_epoch: u32,
     pub issued: u64,
     pub expires: u64,
 }
@@ -128,6 +135,8 @@ pub fn issue(key: &RestartKey, room: &Room, now: u64) -> Option<String> {
         t: room.kdf_t,
         p: room.kdf_p,
         config_blob: room.config_blob.as_ref().map(|b| B64.encode(b)),
+        epoch: room.epoch(),
+        root_epoch: room.root_epoch(),
         issued: now,
         expires: now.saturating_add(TICKET_LIFETIME_SECS),
     };
@@ -184,6 +193,23 @@ mod tests {
     }
 
     const KEY: RestartKey = RestartKey([1u8; 32]);
+
+    #[test]
+    fn a_ticket_carries_the_rooms_epochs() {
+        let r = room(RoomClass::Unlisted);
+        r.restore_epochs(7, 2);
+        let now = 1_800_000_000;
+        let t = issue(&KEY, &r, now).expect("ticket");
+        let opened = open(&KEY, &t, now).expect("opens");
+        assert_eq!((opened.epoch, opened.root_epoch), (7, 2));
+    }
+
+    #[test]
+    fn a_ticket_from_before_epochs_restores_at_zero() {
+        let json = r#"{"v":1,"id":"00","created":1,"ttl_kind":"none","ttl_secs":0,"ttl_ext":0,"optout":false,"verifier":"","salt":"","m_kib":1,"t":1,"p":1,"issued":1,"expires":2}"#;
+        let t: Ticket = serde_json::from_str(json).unwrap();
+        assert_eq!((t.epoch, t.root_epoch), (0, 0));
+    }
 
     #[test]
     fn a_ticket_opens_under_its_own_key_and_carries_the_room() {
