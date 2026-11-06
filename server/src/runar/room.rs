@@ -10,6 +10,8 @@ use secrecy::{ExposeSecret, SecretBox as Secret};
 use tokio::sync::mpsc;
 
 use crate::bifrost::frame::Header;
+use crate::error::WireCode;
+use crate::runar::evict::{decide, PeerView, Refusal, Target};
 use crate::runar::log::{LogBudget, RoomLog};
 use crate::runar::names;
 
@@ -56,6 +58,29 @@ pub struct PeerKx {
     pub sig: Vec<u8>,
 }
 
+/// Set when the next ERROR frame queued for a connection is its last, with
+/// the code to close it with: 4005 for a client that cannot be handed a
+/// rotated key, 4014 for a peer the room removed. The first code set stays.
+/// The connection's writer holds this and never a `PeerTx`: a second
+/// `Sender` kept alive for the connection's life would stop `recv()` from
+/// returning `None` when the room drops a backlogged peer.
+#[derive(Clone, Default)]
+pub struct CloseFlag(std::sync::Arc<std::sync::atomic::AtomicU16>);
+
+impl CloseFlag {
+    pub fn set(&self, code: WireCode) {
+        let _ = self.0.compare_exchange(0, u16::from(code), Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    pub fn get(&self) -> Option<WireCode> {
+        match self.0.load(Ordering::SeqCst) {
+            0 => None,
+            c if c == u16::from(WireCode::Evicted) => Some(WireCode::Evicted),
+            _ => Some(WireCode::ProtocolError),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RosterEntry {
     pub peer_id: [u8; 16],
@@ -89,10 +114,8 @@ pub struct PeerTx {
     /// This connection asked for the log index of every DOC_UPDATE relayed to
     /// it (amendment H).
     pub indexed: bool,
-    /// Set when the next ERROR frame queued for this connection is its last:
-    /// the writer closes the connection after sending it, the way it does
-    /// after a PURGE or RESTART_TICKET.
-    close_after_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// See `CloseFlag`.
+    close: CloseFlag,
 }
 
 impl PeerTx {
@@ -102,22 +125,20 @@ impl PeerTx {
             queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes,
             indexed: false,
-            close_after_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close: CloseFlag::default(),
         }
     }
 
-    /// Queue `error` and close the connection once the writer has sent it.
-    pub fn send_final_error(&self, error: Bytes) -> Result<(), PeerBacklogged> {
-        self.close_after_error.store(true, Ordering::SeqCst);
+    /// Queue `error` and close the connection with `code` once the writer has
+    /// sent it.
+    pub fn send_final_error(&self, error: Bytes, code: WireCode) -> Result<(), PeerBacklogged> {
+        self.close.set(code);
         self.try_send(error)
     }
 
-    /// The flag `send_final_error` sets. The connection's writer holds this
-    /// and never a `PeerTx`: a second `Sender` kept alive for the
-    /// connection's life would stop `recv()` from returning `None` when the
-    /// room drops a backlogged peer, and that peer would stay connected.
-    pub fn close_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        self.close_after_error.clone()
+    /// The flag `send_final_error` sets, for the connection's writer.
+    pub fn close_flag(&self) -> CloseFlag {
+        self.close.clone()
     }
 
     /// Relay DOC_UPDATEs to this connection with their log index.
@@ -265,6 +286,79 @@ impl AuthGuard {
     }
 }
 
+/// What lets someone into the room and what they are told when they arrive:
+/// the verifier a JOIN is checked against, the KDF salt, and the sealed
+/// config. An eviction replaces all three at once (amendment K), so they live
+/// beside the epoch they belong to, under the same lock.
+struct Access {
+    verifier: Option<Secret<[u8; 32]>>,
+    salt: [u8; 16],
+    config_blob: Option<Bytes>,
+    /// Bumped by every re-root. A JOIN is admitted only at the generation its
+    /// key was checked against.
+    generation: u64,
+}
+
+struct Epochs {
+    state: EpochState,
+    access: Access,
+    /// For each peer that has sent an EVICT_REQUEST lately: when the server
+    /// relayed it, and the join sequence number the next peer would have had
+    /// then. A commit from that peer counts only the peers that joined before
+    /// it (amendment K), as amendment A's purge cohort does for a shred. The
+    /// server cannot read a request's id, so this is that sender's most
+    /// recent request. Kept per sender, so a request from someone else (the
+    /// target, say) cannot move the cohort of a vote already open. Under this
+    /// lock because `commit_eviction` reads it beside the epoch, and lock
+    /// order stays `epochs`, then `peers`.
+    evict_opened: std::collections::HashMap<[u8; 16], (Instant, u64)>,
+}
+
+/// How long a recorded EVICT_REQUEST decides a commit's cohort: the longest
+/// vote a client accepts (one hour), and a minute for the commit to follow.
+const EVICT_REQUEST_WINDOW: Duration = Duration::from_secs(3_660);
+
+/// At most this many senders' requests are remembered; the oldest goes first.
+/// Peer ids are per connection, so without a cap reconnects could grow it.
+const MAX_EVICT_REQUESTS: usize = 64;
+
+impl Epochs {
+    fn view(&self) -> AccessView {
+        AccessView {
+            epoch: self.state.epoch(),
+            root_epoch: self.state.root_epoch(),
+            verifier: self.access.verifier.as_ref().map(|v| zeroize::Zeroizing::new(*v.expose_secret())),
+            salt: self.access.salt,
+            config_blob: self.access.config_blob.clone(),
+        }
+    }
+}
+
+/// One consistent reading of a room's way in, for JOIN_ACK and restart
+/// tickets. The verifier copy is zeroed when dropped.
+pub struct AccessView {
+    pub epoch: u32,
+    pub root_epoch: u32,
+    pub verifier: Option<zeroize::Zeroizing<[u8; 32]>>,
+    pub salt: [u8; 16],
+    pub config_blob: Option<Bytes>,
+}
+
+/// An EVICT_COMMIT whose signatures have been checked against the signing
+/// key each voter joined with (amendment K).
+pub struct ReRoot {
+    /// The epoch the votes were signed for: the commit's header epoch.
+    pub at_epoch: u32,
+    /// The named connection and the digest of the signing key the votes
+    /// name for it; None for a link change.
+    pub target: Option<Target>,
+    /// Each voter, and the signing key its signature was checked against.
+    pub voters: Vec<([u8; 16], Vec<u8>)>,
+    pub verifier: [u8; 32],
+    pub salt: [u8; 16],
+    pub config_blob: Option<Bytes>,
+}
+
 pub struct Room {
     pub max_peers: usize,
     pub id: [u8; 16],
@@ -275,17 +369,15 @@ pub struct Room {
     pub ceiling_optout: bool,
     pub last_edit: Mutex<Instant>,
     pub last_peer_left: Mutex<Instant>,
-    pub verifier: Option<Secret<[u8; 32]>>,
     pub kdf_m_kib: u32,
     pub kdf_t: u32,
     pub kdf_p: u32,
-    pub salt: [u8; 16],
-    pub config_blob: Option<Bytes>,
     pub log: std::sync::RwLock<RoomLog>,
     pub peers: Mutex<Vec<ConnectedPeer>>,
     pub next_seq: AtomicU64,
-    /// The room's epoch and the epoch of its current root (amendment J).
-    epochs: Mutex<EpochState>,
+    /// The room's epoch, the epoch of its current root (amendment J), and its
+    /// way in (amendment K). Lock order everywhere: this, then `peers`.
+    epochs: Mutex<Epochs>,
     pub ttl_extension_secs: AtomicU64,
     /// Random per `Room` value, and so per log. A room brought back after a
     /// restart has the same id and a new, empty log; this is how a member
@@ -346,6 +438,9 @@ pub enum JoinError {
     /// The room has stepped to a new epoch and this peer sent no
     /// key-agreement key, so it cannot be handed the key (amendment J).
     Rotated,
+    /// The room changed its way in after this JOIN's key was checked
+    /// (amendment K). Answered like a wrong key.
+    Rekeyed,
     AuthLockedOut(Duration),
 }
 
@@ -403,17 +498,23 @@ impl Room {
             ceiling_optout,
             last_edit: Mutex::new(now),
             last_peer_left: Mutex::new(now),
-            verifier: verifier.map(|v| Secret::new(Box::new(v))),
             kdf_m_kib,
             kdf_t,
             kdf_p,
-            salt,
-            config_blob,
             log: std::sync::RwLock::new(RoomLog::with_budget(log_max_bytes, budget)),
             peers: Mutex::new(Vec::new()),
             max_peers,
             next_seq: AtomicU64::new(1),
-            epochs: Mutex::new(EpochState::new(0, 0)),
+            epochs: Mutex::new(Epochs {
+                state: EpochState::new(0, 0),
+                access: Access {
+                    verifier: verifier.map(|v| Secret::new(Box::new(v))),
+                    salt,
+                    config_blob,
+                    generation: 0,
+                },
+                evict_opened: std::collections::HashMap::new(),
+            }),
             ttl_extension_secs: AtomicU64::new(0),
             log_id: {
                 let mut b = [0u8; 8];
@@ -426,8 +527,41 @@ impl Room {
         }
     }
 
-    pub fn verifier_ref(&self) -> Option<&[u8; 32]> {
-        self.verifier.as_ref().map(|s| s.expose_secret())
+    /// Check a JOIN's key against the current verifier, in constant time.
+    /// Returns the generation it was checked at, for `join`.
+    pub fn check_auth(&self, presented: &[u8]) -> Option<u64> {
+        let epochs = self.epochs.lock().unwrap();
+        let verifier = epochs.access.verifier.as_ref().map(|s| s.expose_secret());
+        crate::heimdall::verifier::verify(verifier, presented).then_some(epochs.access.generation)
+    }
+
+    pub fn salt(&self) -> [u8; 16] {
+        self.epochs.lock().unwrap().access.salt
+    }
+
+    pub fn access_view(&self) -> AccessView {
+        self.epochs.lock().unwrap().view()
+    }
+
+    /// An EVICT_REQUEST from `sender` is being relayed (amendment K). Remember
+    /// who could have seen it: everyone who joined before now.
+    pub fn note_evict_request(&self, sender: [u8; 16]) {
+        self.note_evict_request_at(sender, Instant::now());
+    }
+
+    fn note_evict_request_at(&self, sender: [u8; 16], now: Instant) {
+        // `next_seq` moves only inside `admit`, under this same lock, so every
+        // peer is either counted here or joined after.
+        let mut epochs = self.epochs.lock().unwrap();
+        let seq = self.next_seq.load(Ordering::SeqCst);
+        let opened = &mut epochs.evict_opened;
+        opened.retain(|_, (at, _)| now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW);
+        if !opened.contains_key(&sender) && opened.len() >= MAX_EVICT_REQUESTS {
+            if let Some(oldest) = opened.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| *k) {
+                opened.remove(&oldest);
+            }
+        }
+        opened.insert(sender, (now, seq));
     }
 
     pub fn auth_allowed(&self, caller: &str) -> bool {
@@ -456,23 +590,52 @@ impl Room {
         *self.last_edit.lock().unwrap() = Instant::now();
     }
 
+    /// Add a peer without an authentication check. Tests and callers that
+    /// have none to bind use this; a real JOIN goes through `join`.
     pub fn add_peer(
         &self,
         pubkey: Option<Vec<u8>>,
         kx: Option<PeerKx>,
         tx: PeerTx,
     ) -> Result<RosterEntry, JoinError> {
-        // Lock order, everywhere: `epochs`, then `peers`. The rotated-room
-        // check and the insert are one critical section against
-        // `step_epoch`, which advances the epoch and closes the peers
-        // without a key under the same two locks: a joiner is either in the
-        // list when the step closes the kx-less peers, or sees the new epoch.
+        self.admit(None, pubkey, kx, tx).map(|(entry, _)| entry)
+    }
+
+    /// Add a peer whose key was checked at `generation` (`check_auth`), and
+    /// return what its JOIN_ACK reports, read under the same lock. A commit
+    /// between the check and this call refuses it: the key it presented no
+    /// longer opens the room.
+    pub fn join(
+        &self,
+        generation: u64,
+        pubkey: Option<Vec<u8>>,
+        kx: Option<PeerKx>,
+        tx: PeerTx,
+    ) -> Result<(RosterEntry, AccessView), JoinError> {
+        self.admit(Some(generation), pubkey, kx, tx)
+    }
+
+    fn admit(
+        &self,
+        generation: Option<u64>,
+        pubkey: Option<Vec<u8>>,
+        kx: Option<PeerKx>,
+        tx: PeerTx,
+    ) -> Result<(RosterEntry, AccessView), JoinError> {
+        // Lock order, everywhere: `epochs`, then `peers`. The checks and the
+        // insert are one critical section against `step_epoch` and
+        // `commit_eviction`, which move the epoch and close peers under the
+        // same two locks: a joiner is either in the list when they do, or
+        // sees what they did.
         let epochs = self.epochs.lock().unwrap();
         let mut peers = self.peers.lock().unwrap();
+        if generation.is_some_and(|g| g != epochs.access.generation) {
+            return Err(JoinError::Rekeyed);
+        }
         if peers.len() >= self.max_peers {
             return Err(JoinError::Full);
         }
-        if kx.is_none() && epochs.epoch() != epochs.root_epoch() {
+        if kx.is_none() && epochs.state.epoch() != epochs.state.root_epoch() {
             return Err(JoinError::Rotated);
         }
         // No authentication check here. The caller has already authenticated
@@ -487,7 +650,7 @@ impl Room {
             joined_at_seq: seq,
         };
         peers.push(ConnectedPeer { peer_id: entry.peer_id, pubkey, kx, joined_at_seq: seq, tx });
-        Ok(entry)
+        Ok((entry, epochs.view()))
     }
 
     pub fn remove_peer(&self, peer_id: &[u8; 16]) -> bool {
@@ -521,11 +684,11 @@ impl Room {
     }
 
     pub fn epoch(&self) -> u32 {
-        self.epochs.lock().unwrap().epoch()
+        self.epochs.lock().unwrap().state.epoch()
     }
 
     pub fn root_epoch(&self) -> u32 {
-        self.epochs.lock().unwrap().root_epoch()
+        self.epochs.lock().unwrap().state.root_epoch()
     }
 
     /// Decide an EPOCH_KEY and enqueue it, in one critical section.
@@ -555,7 +718,7 @@ impl Room {
         kx_less_error: &Bytes,
     ) -> Offer {
         let mut epochs = self.epochs.lock().unwrap();
-        let offer = epochs.offer(header_epoch, now, min_interval);
+        let offer = epochs.state.offer(header_epoch, now, min_interval);
         if offer == Offer::Refused {
             return offer;
         }
@@ -565,7 +728,7 @@ impl Room {
             let peers = self.peers.lock().unwrap();
             if offer == Offer::Advanced {
                 for p in peers.iter().filter(|p| p.kx.is_none()) {
-                    if p.tx.send_final_error(kx_less_error.clone()).is_err() {
+                    if p.tx.send_final_error(kx_less_error.clone(), WireCode::ProtocolError).is_err() {
                         dead.push(p.peer_id);
                     }
                 }
@@ -586,13 +749,106 @@ impl Room {
         offer
     }
 
+    /// Apply an EVICT_COMMIT whose signatures have been checked, in one
+    /// critical section with the decision (amendment K).
+    ///
+    /// Same lock order and the same shape as `step_epoch`: the room decides
+    /// against its epoch, the sender's recorded request and the peers
+    /// connected right now, and on success
+    /// swaps the way in, moves to a new root and queues everything before
+    /// either lock is released, so a step or a second commit for the same
+    /// epoch is decided after this one and reaches every peer after it. The
+    /// fan-out is `try_send`, so nothing awaits under the locks.
+    ///
+    /// On success every connection of the target's (the named one, if it is
+    /// still connected, and every other holding the key the votes name) gets
+    /// `evicted_error` and is closed with 4014 (a target that has gone does
+    /// not stop the commit: controller's decision 3), peers without a
+    /// key-agreement key get `kx_less_error` and are closed
+    /// with 4005, and every other peer, the sender included, gets the commit
+    /// with the sender envelope. Returns the new epoch.
+    pub fn commit_eviction(
+        &self,
+        r: &ReRoot,
+        now: Instant,
+        frame: &Bytes,
+        sender: [u8; 16],
+        evicted_error: &Bytes,
+        kx_less_error: &Bytes,
+    ) -> Result<u32, Refusal> {
+        let mut epochs = self.epochs.lock().unwrap();
+        if epochs.state.epoch() != r.at_epoch {
+            return Err(Refusal::WrongEpoch);
+        }
+        // Only someone who approved may send the commit. The person being
+        // removed, or anyone who arrived during the vote, sees every vote go
+        // by and could otherwise send one with no wraps, moving the room to a
+        // way in nobody was given.
+        if !r.voters.iter().any(|(v, _)| *v == sender) {
+            return Err(Refusal::SenderNotVoter);
+        }
+        // The cohort: who was in the room when this sender's request was
+        // relayed. Connections opened after it can neither vote nor hold the
+        // floor down.
+        let Some(since) = epochs
+            .evict_opened
+            .get(&sender)
+            .filter(|(at, _)| now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW)
+            .map(|(_, seq)| *seq)
+        else {
+            return Err(Refusal::NoOpenRequest);
+        };
+        let mut dead = Vec::new();
+        {
+            let peers = self.peers.lock().unwrap();
+            let views: Vec<PeerView<'_>> = peers
+                .iter()
+                .map(|p| PeerView { peer_id: p.peer_id, pubkey: p.pubkey.as_deref(), joined_at_seq: p.joined_at_seq })
+                .collect();
+            decide(r.target, &r.voters, &views, since)?;
+            if !epochs.state.reroot(r.at_epoch, now) {
+                return Err(Refusal::LastEpoch);
+            }
+            // Every open request named the epoch just left.
+            epochs.evict_opened.clear();
+            let generation = epochs.access.generation + 1;
+            epochs.access = Access {
+                verifier: Some(Secret::new(Box::new(r.verifier))),
+                salt: r.salt,
+                config_blob: r.config_blob.clone(),
+                generation,
+            };
+            let outbound = envelop(frame, sender);
+            for p in peers.iter() {
+                if r.target.is_some_and(|t| t.covers(&p.peer_id, p.pubkey.as_deref())) {
+                    if p.tx.send_final_error(evicted_error.clone(), WireCode::Evicted).is_err() {
+                        dead.push(p.peer_id);
+                    }
+                    continue;
+                }
+                if p.kx.is_none() && p.tx.send_final_error(kx_less_error.clone(), WireCode::ProtocolError).is_err() {
+                    dead.push(p.peer_id);
+                }
+                if p.tx.try_send(outbound.clone()).is_err() {
+                    dead.push(p.peer_id);
+                }
+            }
+        }
+        let epoch = epochs.state.epoch();
+        drop(epochs);
+        for id in dead {
+            self.remove_peer(&id);
+        }
+        Ok(epoch)
+    }
+
     pub fn admit_epoch(&self, frame_epoch: u32, now: Instant, overlap: Duration) -> Admit {
-        self.epochs.lock().unwrap().admit(frame_epoch, now, overlap)
+        self.epochs.lock().unwrap().state.admit(frame_epoch, now, overlap)
     }
 
     /// Set a room brought back from a restart ticket to the epochs it had.
     pub fn restore_epochs(&self, epoch: u32, root_epoch: u32) {
-        *self.epochs.lock().unwrap() = EpochState::new(epoch, root_epoch);
+        self.epochs.lock().unwrap().state = EpochState::new(epoch, root_epoch);
     }
 
     /// Fan out a **server-authored** frame verbatim. PROTOCOL.md amendment C
@@ -1711,5 +1967,351 @@ mod queue_tests {
         drop(rx);
         assert!(peer.try_send(Bytes::from_static(b"x")).is_err());
         assert!(peer.send_backpressured(Bytes::from_static(b"x")).await.is_err());
+    }
+}
+
+#[cfg(test)]
+mod evict_tests {
+    use super::*;
+    use crate::heimdall::verifier::hash_auth_key;
+    use crate::runar::evict::{key_digest, Refusal, Target};
+
+    const OLD_AUTH: [u8; 32] = [0xA1; 32];
+    const NEW_AUTH: [u8; 32] = [0xB2; 32];
+    const NEW_SALT: [u8; 16] = [0xC3; 16];
+    const ERR_EVICTED: &[u8] = b"EVICTED";
+    const ERR_KX_LESS: &[u8] = b"KX-LESS";
+
+    fn room() -> Room {
+        Room::new(
+            [5u8; 16],
+            RoomClass::Unlisted,
+            unix_now(),
+            Ttl::default(),
+            false,
+            Some(hash_auth_key(&OLD_AUTH)),
+            65536,
+            3,
+            1,
+            test_salt(),
+            Some(Bytes::from_static(b"old-config")),
+            32 * 1024 * 1024,
+            5,
+            32,
+        )
+    }
+
+    struct Member {
+        id: [u8; 16],
+        flag: CloseFlag,
+        rx: mpsc::Receiver<Bytes>,
+    }
+
+    fn key(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    fn member(r: &Room, n: u8, with_kx: bool) -> Member {
+        let (tx, rx) = mpsc::channel(16);
+        let tx = PeerTx::new(tx, 1 << 20);
+        let flag = tx.close_flag();
+        let kx = with_kx.then(|| PeerKx { pubkey: vec![4u8; 65], sig: vec![1u8; 64] });
+        let id = r.add_peer(Some(key(n)), kx, tx).unwrap().peer_id;
+        Member { id, flag, rx }
+    }
+
+    /// The target as the votes name it: a peer id and the digest of key(n),
+    /// the key member n joins with.
+    fn target(id: [u8; 16], n: u8) -> Option<Target> {
+        Some(Target { peer_id: id, key_digest: key_digest(&key(n)) })
+    }
+
+    fn reroot(at: u32, target: Option<Target>, voters: &[(&Member, u8)]) -> ReRoot {
+        ReRoot {
+            at_epoch: at,
+            target,
+            voters: voters.iter().map(|(m, n)| (m.id, key(*n))).collect(),
+            verifier: hash_auth_key(&NEW_AUTH),
+            salt: NEW_SALT,
+            config_blob: Some(Bytes::from_static(b"new-config")),
+        }
+    }
+
+    fn commit(r: &Room, rr: &ReRoot, frame: &Bytes, sender: [u8; 16]) -> Result<u32, Refusal> {
+        r.commit_eviction(
+            rr,
+            Instant::now(),
+            frame,
+            sender,
+            &Bytes::from_static(ERR_EVICTED),
+            &Bytes::from_static(ERR_KX_LESS),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_commit_swaps_the_way_in_moves_the_root_and_closes_the_target() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let mut b = member(&r, 2, true);
+        let mut t = member(&r, 3, true);
+        let a_id = a.id;
+        r.note_evict_request(a_id);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a_id), Ok(1));
+
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 1));
+        assert!(r.check_auth(&OLD_AUTH).is_none(), "the old key no longer opens the room");
+        assert_eq!(r.check_auth(&NEW_AUTH), Some(1));
+        assert_eq!(r.salt(), NEW_SALT);
+        assert_eq!(r.access_view().config_blob.as_deref(), Some(&b"new-config"[..]));
+
+        // The sender and the other member get the commit with the sender
+        // envelope; the target gets only its error and is marked 4014.
+        for m in [&mut a, &mut b] {
+            let got = m.rx.recv().await.unwrap();
+            assert_eq!(&got[32..48], &a_id);
+            assert_eq!(got.len(), 56);
+        }
+        assert_eq!(&t.rx.recv().await.unwrap()[..], ERR_EVICTED);
+        assert!(t.rx.try_recv().is_err());
+        assert_eq!(t.flag.get(), Some(WireCode::Evicted));
+        assert_eq!(a.flag.get(), None);
+    }
+
+    #[tokio::test]
+    async fn a_commit_closes_peers_that_cannot_be_handed_a_key() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let mut old = member(&r, 3, false);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        assert_eq!(&old.rx.recv().await.unwrap()[..], ERR_KX_LESS);
+        assert_eq!(old.flag.get(), Some(WireCode::ProtocolError));
+        assert_eq!(a.flag.get(), None);
+    }
+
+    #[test]
+    fn a_refused_commit_changes_nothing() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let c = member(&r, 3, true);
+        let t = member(&r, 4, true);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 4), &[(&a, 1)]), &frame, a.id), Err(Refusal::BelowFloor));
+        let all = [(&a, 1), (&b, 2), (&c, 3)];
+        assert_eq!(commit(&r, &reroot(1, target(t.id, 4), &all), &frame, a.id), Err(Refusal::WrongEpoch));
+        // A target that has gone, with nobody holding its key, leaves all
+        // four connected in the floor, so two signatures are not enough.
+        assert_eq!(commit(&r, &reroot(0, target([9; 16], 9), &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::BelowFloor));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!(r.check_auth(&OLD_AUTH), Some(0));
+        assert_eq!(t.flag.get(), None);
+    }
+
+    #[tokio::test]
+    async fn a_commit_whose_target_has_gone_reroots_and_closes_nobody() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let mut b = member(&r, 2, true);
+        r.note_evict_request(a.id);
+        let gone = [0xEE; 16];
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(gone, 0xEE), &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 1));
+        assert!(r.check_auth(&OLD_AUTH).is_none(), "the old key no longer opens the room");
+        assert_eq!(r.check_auth(&NEW_AUTH), Some(1));
+        for m in [&mut a, &mut b] {
+            assert_eq!(m.rx.recv().await.unwrap().len(), 56, "everyone still here gets the commit");
+            assert_eq!(m.flag.get(), None, "nobody is closed");
+        }
+        assert_eq!(r.peer_count(), 2);
+    }
+
+    #[test]
+    fn only_a_voter_may_send_the_commit() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        // The target sends a request of its own, so a missing request is not
+        // what stops it below.
+        r.note_evict_request(t.id);
+        let frame = Bytes::from(vec![0u8; 40]);
+        // The target saw every vote go by and sends the commit itself.
+        let rr = reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]);
+        assert_eq!(commit(&r, &rr, &frame, t.id), Err(Refusal::SenderNotVoter));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!(r.check_auth(&OLD_AUTH), Some(0));
+        assert_eq!(t.flag.get(), None);
+        assert_eq!(commit(&r, &rr, &frame, a.id), Ok(1));
+    }
+
+    #[tokio::test]
+    async fn connections_opened_after_the_request_do_not_hold_the_floor_down() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        // The target opens three more connections once it has seen the request.
+        let late: Vec<Member> = (4..7).map(|n| member(&r, n, true)).collect();
+        assert_eq!(r.peer_count(), 6);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        assert_eq!(a.rx.recv().await.unwrap().len(), 56);
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 1));
+        drop(late);
+    }
+
+    #[test]
+    fn connections_opened_before_the_request_still_count() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        // Two more connections that were there before anyone asked: they are
+        // in the room's list, so the request had to be put to them too.
+        let _early = (member(&r, 4, true), member(&r, 5, true));
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::BelowFloor));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn every_connection_holding_the_targets_key_is_closed_and_none_holds_the_floor_down() {
+        // A room of two people: a, and the target with two connections under
+        // one key, the older one opened first. Counted, the older one would
+        // make a's one signature half of two.
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let mut t0 = member(&r, 3, true);
+        let mut t = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1)]), &frame, a.id), Ok(1));
+        assert_eq!(a.rx.recv().await.unwrap().len(), 56);
+        for m in [&mut t0, &mut t] {
+            assert_eq!(&m.rx.recv().await.unwrap()[..], ERR_EVICTED);
+            assert!(m.rx.try_recv().is_err(), "the target gets no commit");
+            assert_eq!(m.flag.get(), Some(WireCode::Evicted));
+        }
+        assert_eq!(a.flag.get(), None);
+    }
+
+    #[test]
+    fn a_connection_under_the_targets_key_cannot_vote_and_the_named_key_must_match() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let t2 = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0u8; 40]);
+        let with_t2 = reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2), (&t2, 3)]);
+        assert_eq!(commit(&r, &with_t2, &frame, a.id), Err(Refusal::TargetVoted));
+        // Votes naming t with a key t does not hold were not made by members
+        // who checked their roster.
+        let wrong_key = reroot(0, target(t.id, 9), &[(&a, 1), (&b, 2)]);
+        assert_eq!(commit(&r, &wrong_key, &frame, a.id), Err(Refusal::TargetKeyMismatch));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!((t.flag.get(), t2.flag.get()), (None, None));
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        assert_eq!((t.flag.get(), t2.flag.get()), (Some(WireCode::Evicted), Some(WireCode::Evicted)));
+    }
+
+    #[test]
+    fn a_voter_who_arrived_after_the_request_is_refused() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let t = member(&r, 2, true);
+        r.note_evict_request(a.id);
+        let late = member(&r, 3, true);
+        let frame = Bytes::from(vec![0u8; 40]);
+        let rr = reroot(0, target(t.id, 2), &[(&a, 1), (&late, 3)]);
+        assert_eq!(commit(&r, &rr, &frame, a.id), Err(Refusal::VoterAfterRequest));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+    }
+
+    #[test]
+    fn a_commit_needs_its_senders_request_within_the_window() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let frame = Bytes::from(vec![0u8; 40]);
+        let none = Bytes::new();
+        let rr = reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]);
+        assert_eq!(commit(&r, &rr, &frame, a.id), Err(Refusal::NoOpenRequest), "nobody asked");
+        // A request from someone else, the target here, opens nothing for a.
+        r.note_evict_request(t.id);
+        assert_eq!(commit(&r, &rr, &frame, a.id), Err(Refusal::NoOpenRequest), "only the target asked");
+        r.note_evict_request(a.id);
+        let later = Instant::now() + EVICT_REQUEST_WINDOW + Duration::from_secs(1);
+        assert_eq!(r.commit_eviction(&rr, later, &frame, a.id, &none, &none), Err(Refusal::NoOpenRequest), "too old");
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!(t.flag.get(), None);
+        assert_eq!(commit(&r, &rr, &frame, a.id), Ok(1));
+    }
+
+    #[test]
+    fn a_join_checked_before_a_commit_is_refused_after_it() {
+        let r = room();
+        let a = member(&r, 1, true);
+        r.note_evict_request(a.id);
+        let checked = r.check_auth(&OLD_AUTH).expect("the old key opens the room");
+        commit(&r, &reroot(0, None, &[(&a, 1)]), &Bytes::from(vec![0u8; 40]), a.id).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(matches!(
+            r.join(checked, Some(key(2)), None, PeerTx::new(tx, 1 << 20)),
+            Err(JoinError::Rekeyed)
+        ));
+        assert_eq!(r.peer_count(), 1, "the refused joiner is not in the list");
+        let fresh = r.check_auth(&NEW_AUTH).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        let (_, view) = r.join(fresh, Some(key(2)), None, PeerTx::new(tx, 1 << 20)).unwrap();
+        assert_eq!((view.epoch, view.root_epoch, view.salt), (1, 1, NEW_SALT));
+        assert_eq!(view.config_blob.as_deref(), Some(&b"new-config"[..]));
+    }
+
+    #[tokio::test]
+    async fn a_step_that_loses_to_a_commit_is_relayed_after_it() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let mut b = member(&r, 2, true);
+        let t = Instant::now();
+        let err = Bytes::from_static(b"ERR");
+        let commit_frame = Bytes::from(vec![0xC0u8; 32]);
+        let step_frame = Bytes::from(vec![0x57u8; 32]);
+        r.note_evict_request(a.id);
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &commit_frame, a.id), Ok(1));
+        // The step for epoch 1 now names the room's epoch: only a handover.
+        assert_eq!(r.step_epoch(1, t, Duration::ZERO, &step_frame, b.id, &err), Offer::Handover);
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0xC0);
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
+        assert_eq!(b.rx.recv().await.unwrap()[0], 0xC0);
+        assert!(b.rx.try_recv().is_err(), "B gets no copy of its own losing step");
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn a_commit_that_loses_to_a_step_is_refused() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let err = Bytes::from_static(b"ERR");
+        let step_frame = Bytes::from(vec![0x57u8; 32]);
+        r.note_evict_request(a.id);
+        assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step_frame, b.id, &err), Offer::Advanced);
+        let refused = commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &Bytes::from(vec![0xC0u8; 32]), a.id);
+        assert_eq!(refused, Err(Refusal::WrongEpoch));
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
+        assert!(a.rx.try_recv().is_err(), "nothing of the refused commit is relayed");
     }
 }

@@ -21,7 +21,6 @@ use crate::runar::room::{PeerKx, TtlKind};
 use crate::error::WireCode;
 use crate::gjallarhorn;
 use crate::heimdall::ratelimit::RateLimiter;
-use crate::heimdall::verifier;
 use crate::runar::log::LogEntry;
 use crate::runar::room::{
     JoinError, PurgeAckStatus, Room, RoomState,
@@ -378,7 +377,10 @@ async fn run_connection(
 
     let presented = join.auth_key.as_deref().unwrap_or("");
     let presented_bytes = B64.decode(presented).unwrap_or_default();
-    let auth_ok = verifier::verify(room.verifier_ref(), &presented_bytes);
+    // The generation the key was checked at, so a commit between this check
+    // and the insert below refuses the join (amendment K).
+    let auth = room.check_auth(&presented_bytes);
+    let auth_ok = auth.is_some();
     drop(presented_bytes);
 
     if !state.auth_per_ip.check(&ip) {
@@ -423,8 +425,9 @@ async fn run_connection(
         .with_indexes(join.indexed);
     let queue_meter = peer_tx.meter();
     let final_error = peer_tx.close_flag();
-    let entry = match room.add_peer(session_pubkey.clone(), kx, peer_tx) {
-        Ok(e) => e,
+    let generation = auth.expect("checked above");
+    let (entry, view) = match room.join(generation, session_pubkey.clone(), kx, peer_tx) {
+        Ok(joined) => joined,
         Err(JoinError::Full) => {
             let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::RoomFull))).await;
             return Err(WireCode::RoomFull);
@@ -443,6 +446,13 @@ async fn run_connection(
                 })))
                 .await;
             return Err(WireCode::ProtocolError);
+        }
+        // The room's link changed between the key check and now: the key
+        // this JOIN presented no longer opens it.
+        Err(JoinError::Rekeyed) => {
+            floor_delay(cfg.auth_floor).await;
+            let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::AuthFailed))).await;
+            return Err(WireCode::AuthFailed);
         }
         Err(JoinError::AuthLockedOut(_)) => {
             floor_delay(cfg.auth_floor).await;
@@ -468,8 +478,8 @@ async fn run_connection(
         };
         let ack = JoinAck {
             peer_id: B64.encode(peer_id),
-            epoch: room.epoch(),
-            root_epoch: room.root_epoch(),
+            epoch: view.epoch,
+            root_epoch: view.root_epoch,
             log_len,
             base_index,
             has_snapshot,
@@ -481,7 +491,7 @@ async fn run_connection(
                 m_kib: room.kdf_m_kib,
                 t: room.kdf_t,
                 p: room.kdf_p,
-                salt: B64.encode(room.salt),
+                salt: B64.encode(view.salt),
             },
             acks: wants_acks,
             limits: wants_acks.then(|| LimitsJson {
@@ -492,7 +502,7 @@ async fn run_connection(
             indexed: join.indexed,
             heartbeat: join.heartbeat,
             log_id: hex::encode(room.log_id),
-            config_blob: room.config_blob.as_ref().map(|b| B64.encode(b)),
+            config_blob: view.config_blob.as_ref().map(|b| B64.encode(b)),
             roster: roster_json(&room),
         };
         let frame = json_frame(room_id, FT_JOIN_ACK, &ack);
@@ -590,9 +600,11 @@ async fn run_connection(
                     Some(bytes) => {
                         let is_purge = bytes.len() >= HEADER_LEN && bytes[3] == FT_PURGE;
                         let is_ticket = bytes.len() >= HEADER_LEN && bytes[3] == FT_RESTART_TICKET;
-                        let is_final_error = bytes.len() >= HEADER_LEN
-                            && bytes[3] == FT_ERROR
-                            && final_error.load(std::sync::atomic::Ordering::SeqCst);
+                        let closing = if bytes.len() >= HEADER_LEN && bytes[3] == FT_ERROR {
+                            final_error.get()
+                        } else {
+                            None
+                        };
                         let n = bytes.len();
                         let sent = sink.send(Message::Binary(bytes)).await;
                         // Quota returns once the frame is off our hands.
@@ -611,10 +623,11 @@ async fn run_connection(
                             conn_ok = Err(WireCode::ServiceRestart);
                             break;
                         }
-                        // A client that cannot be handed the room's new key:
-                        // its ERROR 4005 was the last frame it gets.
-                        if is_final_error {
-                            conn_ok = Err(WireCode::ProtocolError);
+                        // The last frame this connection gets: ERROR 4005
+                        // for a client that cannot be handed the room's new
+                        // key, ERROR 4014 for a peer the room removed.
+                        if let Some(code) = closing {
+                            conn_ok = Err(code);
                             break;
                         }
                     }

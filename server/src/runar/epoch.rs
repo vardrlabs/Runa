@@ -67,6 +67,24 @@ impl EpochState {
         Offer::Advanced
     }
 
+    /// An eviction or link change (amendment K): the room moves to the next
+    /// epoch and that epoch becomes its root. Only from `at`, the epoch the
+    /// votes were signed for, and never past `u32::MAX`. A quorum of
+    /// signatures limits it, so it is not held to the step interval, but it
+    /// starts that interval for the next step.
+    pub fn reroot(&mut self, at: u32, now: Instant) -> bool {
+        if at != self.epoch {
+            return false;
+        }
+        let Some(next) = self.epoch.checked_add(1) else {
+            return false;
+        };
+        self.epoch = next;
+        self.root_epoch = next;
+        self.last_advance = Some(now);
+        true
+    }
+
     pub fn admit(&self, frame_epoch: u32, now: Instant, overlap: Duration) -> Admit {
         if frame_epoch == self.epoch {
             return Admit::Current;
@@ -88,6 +106,50 @@ mod tests {
 
     const MIN: Duration = Duration::from_secs(5);
     const OVERLAP: Duration = Duration::from_secs(30);
+
+    #[test]
+    fn a_reroot_moves_the_epoch_and_the_root_together() {
+        let t = Instant::now();
+        let mut s = EpochState::new(0, 0);
+        s.offer(1, t, Duration::ZERO);
+        assert!(s.reroot(1, t));
+        assert_eq!((s.epoch(), s.root_epoch()), (2, 2));
+    }
+
+    #[test]
+    fn a_reroot_only_from_the_epoch_its_votes_name() {
+        let t = Instant::now();
+        let mut s = EpochState::new(3, 0);
+        assert!(!s.reroot(2, t));
+        assert!(!s.reroot(4, t));
+        assert_eq!((s.epoch(), s.root_epoch()), (3, 0));
+    }
+
+    #[test]
+    fn a_reroot_ignores_the_step_interval_but_starts_it() {
+        let t = Instant::now();
+        let mut s = EpochState::new(0, 0);
+        assert_eq!(s.offer(1, t, MIN), Offer::Advanced);
+        assert!(s.reroot(1, t + Duration::from_secs(1)));
+        assert_eq!(s.offer(3, t + Duration::from_secs(2), MIN), Offer::Refused);
+        assert_eq!(s.offer(3, t + Duration::from_secs(6), MIN), Offer::Advanced);
+    }
+
+    #[test]
+    fn the_last_epoch_cannot_be_rerooted() {
+        let mut s = EpochState::new(u32::MAX, 0);
+        assert!(!s.reroot(u32::MAX, Instant::now()));
+        assert_eq!(s.epoch(), u32::MAX);
+    }
+
+    #[test]
+    fn the_epoch_a_reroot_left_is_admitted_inside_the_overlap() {
+        let t = Instant::now();
+        let mut s = EpochState::new(0, 0);
+        assert!(s.reroot(0, t));
+        assert_eq!(s.admit(0, t + Duration::from_secs(29), OVERLAP), Admit::Overlap);
+        assert_eq!(s.admit(0, t + OVERLAP, OVERLAP), Admit::Stale);
+    }
 
     #[test]
     fn a_new_room_is_at_epoch_zero() {

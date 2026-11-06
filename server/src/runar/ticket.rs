@@ -116,7 +116,8 @@ pub fn ttl_kind_name(kind: TtlKind) -> &'static str {
 /// A ticket for `room` as it stands. None for a room with no verifier, which
 /// nothing the server creates today lacks, and which could not be rejoined.
 pub fn issue(key: &RestartKey, room: &Room, now: u64) -> Option<String> {
-    let verifier = room.verifier_ref()?;
+    let view = room.access_view();
+    let verifier = view.verifier.as_ref()?;
     let body = Ticket {
         v: 1,
         id: hex::encode(room.id),
@@ -129,14 +130,14 @@ pub fn issue(key: &RestartKey, room: &Room, now: u64) -> Option<String> {
         ttl_secs: room.ttl.secs,
         ttl_ext: room.ttl_extension_secs.load(std::sync::atomic::Ordering::SeqCst),
         optout: room.ceiling_optout,
-        verifier: B64.encode(verifier),
-        salt: B64.encode(room.salt),
+        verifier: B64.encode(&verifier[..]),
+        salt: B64.encode(view.salt),
         m_kib: room.kdf_m_kib,
         t: room.kdf_t,
         p: room.kdf_p,
-        config_blob: room.config_blob.as_ref().map(|b| B64.encode(b)),
-        epoch: room.epoch(),
-        root_epoch: room.root_epoch(),
+        config_blob: view.config_blob.as_ref().map(|b| B64.encode(b)),
+        epoch: view.epoch,
+        root_epoch: view.root_epoch,
         issued: now,
         expires: now.saturating_add(TICKET_LIFETIME_SECS),
     };
@@ -262,4 +263,32 @@ mod tests {
         assert!(RestartKey::from_hex(&"ab".repeat(31)).is_none());
         assert!(RestartKey::from_hex("not hex").is_none());
     }
+    #[test]
+    fn a_ticket_after_a_commit_carries_the_new_way_in() {
+        let r = room(RoomClass::Unlisted);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        let a = r
+            .add_peer(Some(vec![1u8; 32]), None, crate::runar::room::PeerTx::new(tx, 1 << 20))
+            .unwrap()
+            .peer_id;
+        r.note_evict_request(a);
+        let verifier = crate::heimdall::verifier::hash_auth_key(&[7u8; 32]);
+        let rr = crate::runar::room::ReRoot {
+            at_epoch: 0,
+            target: None,
+            voters: vec![(a, vec![1u8; 32])],
+            verifier,
+            salt: [0x6b; 16],
+            config_blob: Some(bytes::Bytes::from_static(b"sealed-again")),
+        };
+        let none = bytes::Bytes::new();
+        r.commit_eviction(&rr, std::time::Instant::now(), &bytes::Bytes::from(vec![0u8; 40]), a, &none, &none)
+            .unwrap();
+        let body = open(&KEY, &issue(&KEY, &r, 2_000).unwrap(), 2_010).unwrap();
+        assert_eq!(B64.decode(&body.verifier).unwrap(), verifier.to_vec());
+        assert_eq!(B64.decode(&body.salt).unwrap(), vec![0x6b; 16]);
+        assert_eq!(B64.decode(body.config_blob.unwrap()).unwrap(), b"sealed-again");
+        assert_eq!((body.epoch, body.root_epoch), (1, 1));
+    }
+
 }

@@ -106,7 +106,7 @@ pub async fn meta_unlisted(
                 m_kib: room.kdf_m_kib,
                 t: room.kdf_t,
                 p: room.kdf_p,
-                salt: B64.encode(room.salt),
+                salt: B64.encode(room.salt()),
             },
         },
         None => {
@@ -158,7 +158,7 @@ pub async fn names_resolve(
                     "m_kib": room.kdf_m_kib,
                     "t": room.kdf_t,
                     "p": room.kdf_p,
-                    "salt": B64.encode(room.salt),
+                    "salt": B64.encode(room.salt()),
                 },
             }),
         ),
