@@ -311,3 +311,21 @@ async fn malformed_key_agreement_keys_are_dropped() {
         assert!(entry.get("kx_pubkey").is_none(), "kept a malformed key: {entry}");
     }
 }
+
+#[tokio::test]
+async fn purge_keeps_epoch_zero_after_the_room_has_stepped() {
+    let s = spawn(cfg_with(30_000, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    let (mut b, _) = join_with(&s, &k, json!({})).await;
+    a.send(frame(&k.hex, 0x20, 1, b"step-one")).await.unwrap();
+    let _ = next_ft(&mut a, 0x20).await;
+    let _ = next_ft(&mut b, 0x20).await;
+
+    a.send(frame(&k.hex, 0x14, 1, json!({"request_id": "r1"}).to_string().as_bytes())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    b.send(frame(&k.hex, 0x14, 1, json!({"request_id": "r1"}).to_string().as_bytes())).await.unwrap();
+
+    let purge = next_ft(&mut a, 0x13).await;
+    assert_eq!(&purge[20..24], &[0, 0, 0, 0], "server-authored frames carry epoch 0");
+}

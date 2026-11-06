@@ -611,7 +611,6 @@ async fn run_connection(
     conn_ok
 }
 
-/// Returns Ok on handled, Err(Some(code)) to close, Err(None) silently ignored.
 /// Frames whose bodies are ciphertext under an epoch's content key. Only these
 /// are held to the room's epoch; control frames carry nothing to protect.
 fn carries_ciphertext(frame_type: u8) -> bool {
@@ -621,6 +620,7 @@ fn carries_ciphertext(frame_type: u8) -> bool {
     )
 }
 
+/// Returns Ok on handled, Err(Some(code)) to close, Err(None) silently ignored.
 async fn process_frame(
     state: &AppState,
     room: &std::sync::Arc<Room>,
