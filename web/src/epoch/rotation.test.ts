@@ -37,6 +37,17 @@ describe("DepartureTracker", () => {
   });
 });
 
+describe("restart notice", () => {
+  it("ignores a non-finite or negative lead time", () => {
+    for (const n of [NaN, Infinity, -Infinity, -1]) {
+      const t = new DepartureTracker();
+      t.noteRestartNotice(0, n);
+      t.left("k1", 1);
+      expect(t.isDue(1 + LEAVE_GRACE_MS)).toBe(true);
+    }
+  });
+});
+
 describe("election", () => {
   const roster = [
     { peerId: id(3), joinedAtSeq: 7 },

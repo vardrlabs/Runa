@@ -16,6 +16,7 @@ export class DepartureTracker {
 
   /// A restart that promises a handover gives everyone time to come back.
   noteRestartNotice(now: number, inSecs: number): void {
+    if (!Number.isFinite(inSecs) || inSecs < 0) return;
     this.restartGraceUntil = Math.max(this.restartGraceUntil, now + inSecs * 1000 + RESTART_GRACE_MS);
   }
 

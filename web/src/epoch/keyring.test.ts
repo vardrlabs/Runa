@@ -100,4 +100,85 @@ describe("Keyring", () => {
     expect(r.keyFor(1)).toBeNull();
     expect(r.secretsBlob().length).toBe(0);
   });
+
+  it("lets exactly one of two concurrent steps to the same epoch commit", async () => {
+    const r = await ring();
+    const s = randomEpochSecret();
+    const confirm = (await stepKeys(r.current, s)).confirm;
+    const [x, y] = await Promise.all([r.applyStep(1, s, confirm), r.applyStep(1, s, confirm)]);
+    expect([x, y].filter((k) => k !== null).length).toBe(1);
+    expect(r.current.epoch).toBe(1);
+    expect(r.secretsBlob().length).toBe(32);
+  });
+
+  it("stays consistent when a step lands during a handover", async () => {
+    const a = await ring();
+    const secrets: Uint8Array[] = [];
+    for (let i = 1; i <= 3; i++) {
+      const s = randomEpochSecret();
+      secrets.push(s);
+      await a.applyStep(i, s, (await stepKeys(a.current, s)).confirm);
+    }
+    const blob = a.secretsBlob();
+    const b = await ring();
+    const first = (await stepKeys(b.current, secrets[0])).confirm;
+    await Promise.all([b.applyHandover(3, blob, a.current.confirm), b.applyStep(1, secrets[0], first)]);
+    expect(b.secretsBlob().length).toBe((b.current.epoch - b.rootEpoch) * 32);
+    expect(b.current.epoch).toBe(3);
+  });
+
+  it("is unusable after wipe", async () => {
+    const r = await ring();
+    const s = randomEpochSecret();
+    const confirm = (await stepKeys(r.current, s)).confirm;
+    expect(r.wiped).toBe(false);
+    r.wipe();
+    expect(r.wiped).toBe(true);
+    expect(await r.applyStep(1, s, confirm)).toBeNull();
+    expect(await r.applyHandover(1, s, confirm)).toBeNull();
+    expect(r.keyFor(0)).toBeNull();
+    expect(r.secretsBlob().length).toBe(0);
+  });
+
+  it("accepts a handover that agrees with what the member holds", async () => {
+    const a = await ring();
+    for (let i = 1; i <= 3; i++) {
+      const s = randomEpochSecret();
+      await a.applyStep(i, s, (await stepKeys(a.current, s)).confirm);
+    }
+    const b = await ring();
+    const blob = a.secretsBlob();
+    const first = blob.slice(0, 32);
+    await b.applyStep(1, first, (await stepKeys(b.current, first)).confirm);
+    const k = await b.applyHandover(3, blob, a.current.confirm);
+    expect(k?.epoch).toBe(3);
+    expect(b.secretsBlob()).toEqual(blob);
+    for (const e of [0, 1, 2, 3]) expect(await sameKey(a.keyFor(e)!, b.keyFor(e)!)).toBe(true);
+  });
+
+  it("refuses a handover that disagrees with what the member holds", async () => {
+    const a = await ring();
+    for (let i = 1; i <= 3; i++) {
+      const s = randomEpochSecret();
+      await a.applyStep(i, s, (await stepKeys(a.current, s)).confirm);
+    }
+    const b = await ring();
+    const mine = randomEpochSecret();
+    await b.applyStep(1, mine, (await stepKeys(b.current, mine)).confirm);
+    const key1 = b.keyFor(1)!;
+    const before = b.secretsBlob();
+    expect(await b.applyHandover(3, a.secretsBlob(), a.current.confirm)).toBeNull();
+    expect(b.current.epoch).toBe(1);
+    expect(b.keyFor(1)).toBe(key1);
+    expect(b.keyFor(3)).toBeNull();
+    expect(b.secretsBlob()).toEqual(before);
+  });
+
+  it("hands out a copy of the secrets", async () => {
+    const r = await ring();
+    const s = randomEpochSecret();
+    await r.applyStep(1, s, (await stepKeys(r.current, s)).confirm);
+    r.secretsBlob().fill(0);
+    expect(r.secretsBlob()).toEqual(s);
+  });
 });
