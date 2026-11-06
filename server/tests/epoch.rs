@@ -299,7 +299,7 @@ async fn frames_without_ciphertext_are_never_refused_for_their_epoch() {
 }
 
 #[tokio::test]
-async fn a_snapshot_is_accepted_only_at_the_current_epoch() {
+async fn a_snapshot_from_an_epoch_the_room_has_not_reached_is_refused() {
     let s = spawn(cfg_with(30_000, 0)).await;
     let k = create(&s).await;
     let (mut a, _) = join_with(&s, &k, json!({})).await;
@@ -307,7 +307,7 @@ async fn a_snapshot_is_accepted_only_at_the_current_epoch() {
     let _ = next_ft(&mut a, 0x20).await;
     let mut body = 0u64.to_be_bytes().to_vec();
     body.extend_from_slice(&[0u8; 64]);
-    a.send(frame(&k.hex, 0x21, 0, &body)).await.unwrap();
+    a.send(frame(&k.hex, 0x21, 5, &body)).await.unwrap();
     let err = json_body(&next_ft(&mut a, 0x30).await);
     assert_eq!(err["code"], 4006);
 }
@@ -455,4 +455,41 @@ async fn a_client_without_key_agreement_is_closed_when_a_step_is_accepted() {
     assert_eq!(leaves.len(), 1);
     let (_c, ack) = join_with(&s, &k, json!({})).await;
     assert_eq!(ack["roster"].as_array().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_stale_update_from_a_connection_that_did_not_ask_for_acks_gets_4006() {
+    let s = spawn(cfg_with(100, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    a.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    let _ = next_ft(&mut a, 0x20).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.send(frame(&k.hex, 0x03, 0, &[0u8; 64])).await.unwrap();
+    let err = json_body(&next_ft(&mut a, 0x30).await);
+    assert_eq!(err["code"], 4006);
+}
+
+#[tokio::test]
+async fn a_snapshot_from_the_epoch_just_left_is_dropped_quietly() {
+    let s = spawn(cfg_with(400, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    let (mut b, _) = join_with(&s, &k, json!({})).await;
+    a.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    let _ = next_ft(&mut a, 0x20).await;
+    let _ = next_ft(&mut b, 0x20).await;
+    let mut body = 0u64.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0u8; 64]);
+
+    a.send(frame(&k.hex, 0x21, 0, &body)).await.unwrap();
+    assert!(frames_of(&mut a, 0x30, 300).await.is_empty(), "an overlap snapshot got an error");
+    assert!(frames_of(&mut b, 0x21, 100).await.is_empty(), "an overlap snapshot was relayed");
+    let (_c, ack) = join_with(&s, &k, json!({})).await;
+    assert_eq!(ack["has_snapshot"], false, "an overlap snapshot was stored");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.send(frame(&k.hex, 0x21, 0, &body)).await.unwrap();
+    let err = json_body(&next_ft(&mut a, 0x30).await);
+    assert_eq!(err["code"], 4006);
 }

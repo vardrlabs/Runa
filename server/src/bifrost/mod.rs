@@ -669,19 +669,23 @@ async fn process_frame(
     // reached. A snapshot rebases history, so it must be current.
     if carries_ciphertext(header.frame_type) {
         let admit = room.admit_epoch(header.epoch, std::time::Instant::now(), state.cfg.epoch_overlap);
-        let refuse = match admit {
-            Admit::Current => false,
-            Admit::Overlap => header.frame_type == FT_SNAPSHOT,
-            Admit::Stale => true,
-        };
-        if refuse {
-            if header.frame_type == FT_DOC_UPDATE && caps.acks {
-                let body = serde_json::json!({ "ok": false, "epoch": room.epoch() });
-                direct.push(json_frame(room.id, FT_DOC_ACK, &body));
-            } else {
-                direct.push(error_frame(room.id, WireCode::EpochStale));
+        match admit {
+            Admit::Current => {}
+            // A snapshot rebases history, so it must be current. One from the
+            // epoch just left is dropped without an answer: the member that
+            // rotated is usually the snapshotter, and must not be made to
+            // reconnect for a snapshot sent between its step and the echo.
+            Admit::Overlap if header.frame_type == FT_SNAPSHOT => return Ok(()),
+            Admit::Overlap => {}
+            Admit::Stale => {
+                if header.frame_type == FT_DOC_UPDATE && caps.acks {
+                    let body = serde_json::json!({ "ok": false, "epoch": room.epoch() });
+                    direct.push(json_frame(room.id, FT_DOC_ACK, &body));
+                } else {
+                    direct.push(error_frame(room.id, WireCode::EpochStale));
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     }
 
