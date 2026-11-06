@@ -35,8 +35,11 @@ class Hub {
   phantom: MemberView | null = null;
   /// While set, frames are held here instead of relayed.
   captured: { from: Peer; h: Uint8Array; body: Uint8Array }[] | null = null;
+  /// While set, this peer's socket is down: its frames go nowhere and send reports false.
+  down: Peer | null = null;
 
   route(from: Peer, h: Uint8Array, body: Uint8Array): boolean {
+    if (this.down === from) return false;
     if (this.captured) {
       this.captured.push({ from, h, body });
       return true;
@@ -548,6 +551,28 @@ describe("EpochCoordinator", () => {
     expect(d.keyring.current.epoch).toBe(1);
     expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
     expect(d.statuses.at(-1)).toBe("ok");
+  });
+
+  it("a handover that did not go out is scheduled again when the holder reconnects", async () => {
+    const { hub, peers } = await room(2);
+    const [a, c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    expect(a.keyring.current.epoch).toBe(1);
+    // d arrives and a's socket drops before its handover can be sent.
+    const d = await makePeer(hub);
+    arrive(hub, d);
+    await d.coord.joined(1);
+    hub.down = a;
+    await tickAll(hub);
+    expect(d.keyring.current.epoch).toBe(0);
+    // a reconnects into the same roster: d must be handed keys this time.
+    hub.down = null;
+    await a.coord.joined(1);
+    await tickAll(hub);
+    expect(d.keyring.current.epoch).toBe(1);
+    expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
   });
 
   it("a holder that reconnects into a roster it already knew schedules no handovers", async () => {

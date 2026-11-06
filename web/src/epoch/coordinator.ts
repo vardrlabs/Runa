@@ -145,6 +145,8 @@ export class EpochCoordinator {
       // A late PEER_LEAVE for a connection the member has already replaced:
       // the same signing key is still here under a new peer id.
       if (this.d.members().some((r) => r.pubkey && hex(r.pubkey) === key && !eq(r.peerId, m.peerId))) return;
+      // Gone for good: if it comes back it is a newcomer again.
+      this.seen.delete(key);
       this.tracker.left(key, this.d.now());
       this.departed.set(key, hex(m.peerId));
     }
@@ -240,7 +242,12 @@ export class EpochCoordinator {
         const rank = rankOf(members.filter((m) => hex(m.peerId) !== peer), me);
         if (turnHasCome(rank, now - since, HANDOVER_FALLBACK_MS)) {
           this.handovers.delete(peer);
-          await this.sendHandover(me, peer);
+          if (!(await this.sendHandover(me, peer))) {
+            // Not sent (socket down, no verified key yet): forget the member
+            // so the next joined() schedules it again.
+            const lost = members.find((m) => hex(m.peerId) === peer);
+            if (lost?.pubkey) this.seen.delete(hex(lost.pubkey));
+          }
         }
       }
     } catch {
@@ -303,17 +310,18 @@ export class EpochCoordinator {
     }
   }
 
-  private async sendHandover(me: Uint8Array, peerHex: string): Promise<void> {
+  /// True when the frame went out.
+  private async sendHandover(me: Uint8Array, peerHex: string): Promise<boolean> {
     const target = this.d.members().find((m) => hex(m.peerId) === peerHex);
-    if (!target) return;
+    if (!target) return true;
     await this.noteMember(target);
     const kxPub = this.verifiedKx.get(peerHex);
-    if (!kxPub) return;
+    if (!kxPub) return false;
     const ring = this.d.keyring;
     const cur = ring.current;
     const blob = ring.secretsBlob();
     try {
-      if (blob.length === 0 || blob.length / 32 > MAX_HANDOVER_SECRETS) return;
+      if (blob.length === 0 || blob.length / 32 > MAX_HANDOVER_SECRETS) return false;
       const header = this.d.header(cur.epoch);
       const key = await wrapKey(this.d.kx, kxPub, this.d.roomId, cur.epoch, me, target.peerId);
       const { iv, ct } = await sealWrap(key, header, blob);
@@ -331,10 +339,11 @@ export class EpochCoordinator {
         },
         this.d.identity,
       );
-      this.d.send(header, body);
+      return this.d.send(header, body);
     } catch {
       // A newcomer whose key no one can agree with (off the curve, say) is
       // skipped, and the rest of the tick carries on.
+      return false;
     } finally {
       blob.fill(0);
     }
