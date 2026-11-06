@@ -187,8 +187,9 @@ keys nobody else has, and nothing would open. Other members who see that
 handover notice that its confirmation does not match their own, say so, and
 send their own, and the newcomer shows that the two disagree. It keeps the
 first set it applied, though, so it has to reload to recover. A rotation that
-fails is refused and shown, and the room stops working until people leave it. Only a member or the server can cause that, and
-either could already disrupt a room.
+fails is refused and shown, and the room stops working until people leave it.
+Only a member or the server can cause that, and either could already disrupt a
+room.
 
 Against the server, rotation holds as long as the server does not collude with
 the departed peer. Each new key comes from the secret mixed into a chain that
