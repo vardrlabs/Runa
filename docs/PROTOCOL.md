@@ -399,8 +399,10 @@ A second handover is harmless.
 *Server rules.*
 
 - An EPOCH_KEY whose header epoch is one above the room's advances the room,
-  atomically, so the first such frame wins and a second for the same epoch is
-  refused. Advances are refused for 5 seconds after the last one and at
+  atomically, so the first such frame wins. A later step for the same epoch
+  then matches the room's epoch and is relayed like a handover, and every
+  client ignores it, because a step must name the epoch after the one the
+  client holds. Advances are refused for 5 seconds after the last one and at
   `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
   and every peer, the sender too, moves to the new epoch when that copy
   arrives, so the server's order is the only order. A refused step is dropped
