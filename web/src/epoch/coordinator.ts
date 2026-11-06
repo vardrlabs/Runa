@@ -1,4 +1,4 @@
-import { randomEpochSecret, stepKeys } from "../crypto/epoch";
+import { confirmsEqual, randomEpochSecret, stepKeys } from "../crypto/epoch";
 import { verifyPayload, type Identity } from "../crypto/identity";
 import { algForPubkey, kxStatement, openWrap, sealWrap, wrapKey, type KxPair } from "../crypto/kx";
 import { canonicalRosterBytes } from "../shred/roster";
@@ -72,13 +72,16 @@ export class EpochCoordinator {
   /// Signing key (hex) of each departed member, mapped to its peer id (hex).
   private departed = new Map<string, string>();
   private dueSince: number | null = null;
-  private pendingStep: { to: number; secret: Uint8Array; sentAt: number } | null = null;
+  private pendingStep: { to: number; secret: Uint8Array; confirm: Uint8Array; sentAt: number } | null = null;
   /// Newcomers waiting for a handover: peer id (hex) to when they arrived.
   private handovers = new Map<string, number>();
   /// Key-agreement keys whose signature checked out, by peer id (hex).
   private verifiedKx = new Map<string, Uint8Array>();
   private awaitingEpoch: number | null = null;
   private busy = false;
+  /// EPOCH_KEY frames are handled one at a time, in the order they arrived,
+  /// so two steps for the same epoch cannot both pass the epoch checks.
+  private receiving: Promise<unknown> = Promise.resolve();
 
   constructor(private d: CoordinatorDeps) {}
 
@@ -86,9 +89,22 @@ export class EpochCoordinator {
     const id = hex(m.peerId);
     if (this.verifiedKx.has(id) || !m.pubkey || !m.kxPub || !m.kxSig) return;
     const alg = algForPubkey(m.pubkey);
-    if (!alg || m.kxPub.length !== 65) return;
-    if (await verifyPayload(alg, m.pubkey, m.kxSig, kxStatement(this.d.roomId, m.kxPub))) {
-      this.verifiedKx.set(id, m.kxPub);
+    if (!alg || m.kxPub.length !== 65 || m.kxPub[0] !== 0x04) return;
+    try {
+      if (await verifyPayload(alg, m.pubkey, m.kxSig, kxStatement(this.d.roomId, m.kxPub))) {
+        this.verifiedKx.set(id, m.kxPub);
+      }
+    } catch {
+      // Left unverified: no one wraps for this member, and it rejoins.
+    }
+  }
+
+  /// Drop a step this member sent once the keyring has reached its epoch,
+  /// whichever step got it there.
+  private settlePending(reached: number): void {
+    if (this.pendingStep && reached >= this.pendingStep.to) {
+      this.pendingStep.secret.fill(0);
+      this.pendingStep = null;
     }
   }
 
@@ -98,7 +114,7 @@ export class EpochCoordinator {
   }
 
   memberJoined(m: MemberView): void {
-    void this.noteMember(m);
+    this.noteMember(m).catch(() => undefined);
     if (m.pubkey) {
       const key = hex(m.pubkey);
       this.tracker.returned(key);
@@ -155,7 +171,10 @@ export class EpochCoordinator {
     this.busy = true;
     try {
       const now = this.d.now();
-      if (this.dueSince === null && this.tracker.isDue(now)) this.dueSince = now;
+      // A departure that came back, or a rejoin, can clear the deadlines
+      // after one fell due.
+      if (!this.tracker.isDue(now)) this.dueSince = null;
+      else if (this.dueSince === null) this.dueSince = now;
       if (this.awaitingEpoch !== null) this.d.status(this.othersPresent() ? "waiting" : "unreadable");
       const me = this.d.me();
       if (!me) return;
@@ -164,7 +183,12 @@ export class EpochCoordinator {
         this.pendingStep.secret.fill(0);
         this.pendingStep = null;
       }
-      if (this.dueSince !== null && !this.pendingStep) {
+      // A member still waiting for the room's key has nothing current to
+      // step from or hand over.
+      if (this.awaitingEpoch !== null) return;
+      // Asked now, not only when the departure was noted: the level can be a
+      // stale default until the sealed config has opened.
+      if (this.dueSince !== null && !this.pendingStep && this.d.highest()) {
         const rank = rankOf(this.d.members(), me);
         if (turnHasCome(rank, now - this.dueSince, ROTATOR_FALLBACK_MS)) await this.sendStep(me);
       }
@@ -180,6 +204,8 @@ export class EpochCoordinator {
           await this.sendHandover(me, peer);
         }
       }
+    } catch {
+      // Whatever failed is tried again on the next tick.
     } finally {
       this.busy = false;
     }
@@ -191,37 +217,48 @@ export class EpochCoordinator {
     const to = cur.epoch + 1;
     const header = this.d.header(to);
     const secret = randomEpochSecret();
-    const next = await stepKeys(cur, secret);
-    const wraps: Wrap[] = [];
-    for (const m of this.d.members()) {
-      if (eq(m.peerId, me)) continue;
-      await this.noteMember(m);
-      const kxPub = this.verifiedKx.get(hex(m.peerId));
-      if (!kxPub) continue;
-      const key = await wrapKey(this.d.kx, kxPub, this.d.roomId, to, me, m.peerId);
-      const { iv, ct } = await sealWrap(key, header, secret);
-      wraps.push({ p: m.peerId.slice(), iv, ct });
-    }
-    const body = await encodeEpochKey(
-      header,
-      {
-        kind: "step",
-        from: cur.epoch,
-        to,
-        root: ring.rootEpoch,
-        sender: me.slice(),
-        roster: await rosterDigest(this.d.members()),
-        confirm: next.confirm,
-        wraps,
-      },
-      this.d.identity,
-    );
-    // Recorded before sending: the server echoes the step back, and the echo
-    // must find the secret waiting.
-    this.pendingStep = { to, secret, sentAt: this.d.now() };
-    if (!this.d.send(header, body)) {
-      secret.fill(0);
-      this.pendingStep = null;
+    let kept = false;
+    try {
+      const next = await stepKeys(cur, secret);
+      const wraps: Wrap[] = [];
+      for (const m of this.d.members()) {
+        if (eq(m.peerId, me)) continue;
+        await this.noteMember(m);
+        const kxPub = this.verifiedKx.get(hex(m.peerId));
+        if (!kxPub) continue;
+        try {
+          const key = await wrapKey(this.d.kx, kxPub, this.d.roomId, to, me, m.peerId);
+          const { iv, ct } = await sealWrap(key, header, secret);
+          wraps.push({ p: m.peerId.slice(), iv, ct });
+        } catch {
+          // A key no one can agree with (off the curve, say). This member is
+          // left out of the step and rejoins to be handed the key.
+        }
+      }
+      const body = await encodeEpochKey(
+        header,
+        {
+          kind: "step",
+          from: cur.epoch,
+          to,
+          root: ring.rootEpoch,
+          sender: me.slice(),
+          roster: await rosterDigest(this.d.members()),
+          confirm: next.confirm,
+          wraps,
+        },
+        this.d.identity,
+      );
+      // Recorded before sending: the server echoes the step back, and the echo
+      // must find the secret waiting.
+      this.pendingStep = { to, secret, confirm: next.confirm, sentAt: this.d.now() };
+      kept = true;
+      if (!this.d.send(header, body)) {
+        this.pendingStep = null;
+        kept = false;
+      }
+    } finally {
+      if (!kept) secret.fill(0);
     }
   }
 
@@ -254,12 +291,23 @@ export class EpochCoordinator {
         this.d.identity,
       );
       this.d.send(header, body);
+    } catch {
+      // A newcomer whose key no one can agree with (off the curve, say) is
+      // skipped, and the rest of the tick carries on.
     } finally {
       blob.fill(0);
     }
   }
 
-  async receive(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
+  /// Handles one EPOCH_KEY after every earlier one has settled. Never rejects.
+  receive(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
+    const fn = (): Promise<void> => this.receiveNow(header, headerEpoch, sender, bytes);
+    const run = this.receiving.then(fn, fn);
+    this.receiving = run.catch(() => undefined);
+    return run.catch(() => undefined);
+  }
+
+  private async receiveNow(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
     const decoded = decodeEpochKey(bytes);
     if (!decoded) return;
     const { body } = decoded;
@@ -295,7 +343,11 @@ export class EpochCoordinator {
     const ring = this.d.keyring;
     if (body.to <= ring.current.epoch) return; // already held: a late duplicate
     const mine = eq(from.peerId, me);
-    if (body.to > ring.current.epoch + 1 || (!mine && !body.wraps.some((w) => eq(w.p, me)))) {
+    const pending = this.pendingStep;
+    // Our own echo is only followable with the secret it was built from: a
+    // step this tab gave up on, or an earlier one for the same epoch, is not.
+    const ownSecret = mine && pending?.to === body.to && confirmsEqual(pending.confirm, body.confirm);
+    if (body.to > ring.current.epoch + 1 || (mine && !ownSecret) || (!mine && !body.wraps.some((w) => eq(w.p, me)))) {
       // The room moved somewhere this member cannot follow. Join again and be
       // handed the keys as a newcomer.
       this.awaitingEpoch = body.to;
@@ -305,7 +357,9 @@ export class EpochCoordinator {
     }
     let secret: Uint8Array | null;
     if (mine) {
-      secret = this.pendingStep?.to === body.to ? this.pendingStep.secret : null;
+      // Taken over from pendingStep here, and zeroed below whatever happens.
+      secret = pending!.secret;
+      this.pendingStep = null;
     } else {
       secret = await this.unwrapFrom(header, body, from, me);
       if (!secret) {
@@ -313,13 +367,13 @@ export class EpochCoordinator {
         return;
       }
     }
-    if (!secret) return;
-    const applied = await ring.applyStep(body.to, secret, body.confirm);
-    secret.fill(0);
-    if (this.pendingStep) {
-      this.pendingStep.secret.fill(0);
-      this.pendingStep = null;
+    let applied;
+    try {
+      applied = await ring.applyStep(body.to, secret, body.confirm);
+    } finally {
+      secret.fill(0);
     }
+    if (applied) this.settlePending(applied.epoch);
     if (!applied) {
       this.d.status("refused");
       return;
@@ -352,12 +406,17 @@ export class EpochCoordinator {
       this.d.status("refused");
       return;
     }
-    const applied = await ring.applyHandover(body.to, blob, body.confirm);
-    blob.fill(0);
+    let applied;
+    try {
+      applied = await ring.applyHandover(body.to, blob, body.confirm);
+    } finally {
+      blob.fill(0);
+    }
     if (!applied) {
       this.d.status("refused");
       return;
     }
+    this.settlePending(applied.epoch);
     this.awaitingEpoch = null;
     this.d.adopt(applied.epoch);
     this.d.status("ok");
