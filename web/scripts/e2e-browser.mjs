@@ -145,8 +145,20 @@ async function rawPeer(roomIdHex, linkKey, linkSalt) {
   };
   const send = (ft, obj) => ws.send(Buffer.concat([header(ft), Buffer.from(JSON.stringify(obj))]));
   const joined = new Promise((resolve, reject) => {
+    // A well-formed key-agreement key with a signature nobody can verify: the
+    // server lets it into a rotated room, and no member ever wraps a secret
+    // for it, which is what the scenarios need.
+    const kxPub = new Uint8Array(65);
+    kxPub[0] = 0x04;
+    crypto.getRandomValues(kxPub.subarray(1));
     ws.onopen = () =>
-      send(0x01, { auth_key: b64(authKey), pubkey: b64(crypto.getRandomValues(new Uint8Array(32))), client_version: "e2e-raw" });
+      send(0x01, {
+        auth_key: b64(authKey),
+        pubkey: b64(crypto.getRandomValues(new Uint8Array(32))),
+        kx_pubkey: b64(kxPub),
+        kx_sig: b64(crypto.getRandomValues(new Uint8Array(64))),
+        client_version: "e2e-raw",
+      });
     onFrame = (b) => {
       if (b[3] === 0x02) resolve();
       if (b[3] === 0x30) reject(new Error(`raw peer refused: ${Buffer.from(b.slice(32)).toString()}`));
