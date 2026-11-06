@@ -141,8 +141,10 @@ gone for 60 seconds (ten minutes during a server restart, so everyone has time
 to reconnect), the remaining peer who has been connected longest draws a new
 256-bit secret. It wraps that secret separately for each remaining peer, under
 a key agreed with that peer's session key, and sends it. Everything written
-after that is encrypted under a key the departed peer never receives. The
-design is in PROTOCOL amendment J.
+after that is encrypted under a key the departed peer never receives, apart
+from what a member who has not yet received the new key sends in the 30
+seconds the server still accepts the old one. The design is in PROTOCOL
+amendment J.
 
 What that buys is narrow, so here it is exactly:
 
@@ -161,7 +163,14 @@ What that buys is narrow, so here it is exactly:
   promise: what was written after a rotation can be opened only through someone
   who is still in the room. A Highest room accepts that cost. If everyone leaves
   after a rotation, the link no longer opens what was written since, and the
-  room tells the next person who arrives.
+  room tells the next person who arrives. A server that strips an everyday
+  room's sealed configuration makes it behave as Highest, so it rotates; that
+  costs availability, not confidentiality, and the server could delete the room
+  anyway.
+- **A tab opened before key rotation existed is kept out once the key has
+  changed.** It cannot be handed a new key, so the server refuses it with a
+  version error and it has to be reloaded. Left in, it would lose its edits
+  without saying so, or write them under the original key.
 
 A peer who joins after a rotation still gets the whole history. A member who is
 present hands them the secrets drawn since the room began, and they derive each
@@ -170,10 +179,14 @@ that it is waiting for a member.
 
 Every rotation is signed, and it carries a confirmation value that each
 recipient recomputes from the key it derived. A peer who hands different
-members different secrets fails that check, and so does anyone who sends a
-newcomer secrets that do not belong to the room. A rotation that fails is
-refused and shown, and the room stops working until people leave it. Only a
-member or the server can cause that, and either could already disrupt a room.
+members different secrets fails that check. Someone without the link cannot
+hand a newcomer false secrets either, because they cannot compute the
+confirmation. A member who holds the link can: the newcomer would then hold
+keys nobody else has, and nothing would open. Other members who see that
+handover notice that its confirmation does not match their own, say so, and
+send their own. A rotation that fails is refused and shown, and the room stops
+working until people leave it. Only a member or the server can cause that, and
+either could already disrupt a room.
 
 Against the server, rotation holds as long as the server does not collude with
 the departed peer. Each new key comes from the secret mixed into a chain that
@@ -183,7 +196,9 @@ secrets are wrapped to arrive in the peer list, and the server supplies that
 list. A server working with a departed peer can put its own key in place of a
 member's and pass the new secret on. The two-word handles in the room are
 derived from session keys, but they are short enough for a server to find a key
-that produces the same handle, so comparing them does not catch this. As
+that produces the same handle, so comparing them does not catch this. A
+server can also hold a rotation back by never relaying it: the member rotating
+keeps trying, and nothing tells anyone that the change is overdue. As
 everywhere in this document, nothing here helps against a server that serves
 bad JavaScript, and running the server yourself is the answer to both.
 

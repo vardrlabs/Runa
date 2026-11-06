@@ -339,12 +339,21 @@ has the key.
 this session (65-byte uncompressed point, base64), and `kx_sig`, the session's
 signature over `"runa/v1/kx" || room_id || kx_pubkey`. Every peer uses P-256
 for this, whatever its signing algorithm, because two peers on different
-curves could not agree a key. The server checks only their lengths, and relays
-both in JOIN_ACK's roster, PEER_JOIN and PONG. A receiver verifies `kx_sig`
-against the roster's signing key for that peer and treats a peer whose
-signature fails as one it cannot send keys to. A peer whose client predates
-this amendment sends neither field, cannot be handed a key, and after a
-rotation sees the stale-epoch warning until it reloads.
+curves could not agree a key. The server checks only their lengths and that
+the key starts with 0x04, and relays both in JOIN_ACK's roster, PEER_JOIN and
+PONG. A receiver verifies `kx_sig` against the roster's signing key for that
+peer and treats a peer whose signature fails as one it cannot send keys to.
+
+A client that predates this amendment sends neither field and can never be
+handed a key. Restart tickets keep such tabs open across a deploy, so the
+server keeps them out of any room whose key has changed: a JOIN without
+`kx_pubkey` into a room whose epoch differs from its root epoch is refused
+with ERROR 4005, and when a room's epoch advances, every connection in it that
+joined without `kx_pubkey` is sent ERROR 4005 and closed with code 4005. Left
+in, such a client would lose its edits without saying so, and after a
+reconnect it would label frames with the room's epoch while encrypting them
+under the root key, which the person who left still holds. A room that has
+never rotated admits it as before.
 
 The key that wraps a secret for one recipient is
 `HKDF(ECDH(own kx, their kx), salt = room_id || epoch (u32 BE), info = "runa/v1/epoch-wrap" || sender_peer_id || recipient_peer_id)`,
@@ -372,8 +381,9 @@ from `root + 1` to `to`, concatenated in order, so the newcomer derives every
 epoch from its own link or passphrase. A handover is addressed to one
 newcomer and carries exactly one wrap, of at most 8192 secrets; a room that has
 rotated more often than that since its root can no longer be joined, which at
-one rotation per 5 seconds takes over eleven hours of continuous departures. A receiver checks the signature against
-its roster, unwraps its own entry, derives, and compares `confirm`. A frame
+one rotation per 5 seconds takes over eleven hours of continuous departures.
+A receiver checks the signature against its roster, unwraps its own entry,
+derives, and compares `confirm`. A frame
 that fails any of these is refused, and the refusal is shown. It also compares
 the roster hash with its own: a mismatch is shown as a warning that someone may
 be hidden from the room, but does not stop the step, because two honest peers
@@ -387,14 +397,26 @@ step. The step is sent by the remaining peer with the lowest `joined_at_seq`;
 if none has arrived 15 seconds after the deadline, the next one in that order
 sends it. Everyday rooms do not start steps, though their clients accept one.
 After a step, the peer the server lets snapshot (the lowest `joined_at_seq`)
-writes a snapshot under the new key straight away, so the log soon holds
-nothing older.
+writes a snapshot under the new key as soon as it can, and keeps trying on its
+regular snapshot timer until one is written, so the log soon holds nothing
+older.
+
+A client whose JOIN_ACK has no `root_epoch` is talking to a server that
+predates this amendment, which neither moves the epoch nor echoes steps. It
+sends no steps and ignores any it receives.
 
 *Newcomers.* JOIN_ACK carries `root_epoch`. A newcomer whose JOIN_ACK says
 `epoch == root_epoch` derives its keys as it always has. Otherwise the member
 with the lowest `joined_at_seq` sends it a handover when it sees the PEER_JOIN,
 and the next member in that order does so if none has arrived after 10 seconds.
-A second handover is harmless.
+A member that reconnects cannot tell who arrived while it was away, so it
+schedules a handover for every other member its JOIN_ACK lists. A second
+handover is harmless: a member that already holds the epoch ignores it.
+
+A handover's `confirm` is chosen by its sender, so a member who holds the link
+could hand a newcomer secrets that match a confirm it made up. Any other member
+who sees a handover for someone else whose `confirm` differs from its own for
+that epoch shows the handover as refused and sends its own.
 
 *Server rules.*
 
@@ -405,8 +427,8 @@ A second handover is harmless.
   client holds. A client that the winning step left out is waiting for a
   handover, and ignores every step for the epoch it is waiting for or an
   earlier one, so a losing step that happens to include it cannot put it on
-  a key nobody else holds. Advances are refused for 5 seconds after the last one and at
-  `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
+  a key nobody else holds. Advances are refused for 5 seconds after the last
+  one and at `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
   and every peer, the sender too, moves to the new epoch when that copy
   arrives, so the server's order is the only order. A refused step is dropped
   without an answer; its sender applies whichever step does arrive. A header
@@ -420,9 +442,11 @@ A second handover is harmless.
   `{ok: false, epoch}`; any other frame is dropped, and its sender gets ERROR
   4006. A client refused this way reconnects, which resends everything not yet
   stored, and waits for a handover if it does not hold the room's current key.
-  Only a client more than 30 seconds behind is ever refused, and such a client
-  has no newer key to resend with. A SNAPSHOT is accepted only at the room's
-  epoch.
+  An honest client is refused only when it is more than 30 seconds behind, and
+  then it has no newer key to resend with. A SNAPSHOT is stored only at the
+  room's epoch: one from the epoch just left, inside the overlap, is dropped
+  without an answer, because the member that steps is usually the one that
+  snapshots; one from any other epoch gets ERROR 4006.
 - PING, TTL_EXTEND, PURGE_ACK and DOC_SYNC_REQ carry no ciphertext and are
   never refused for their epoch. Server-authored frames still carry epoch 0.
 - Restart tickets cover `epoch` and `root_epoch`. A ticket from a process that
