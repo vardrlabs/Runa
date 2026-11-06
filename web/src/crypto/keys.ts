@@ -1,7 +1,6 @@
 export const INFO_AUTH = new TextEncoder().encode("runa/v1/auth");
 export const INFO_CONTENT = new TextEncoder().encode("runa/v1/content");
 export const INFO_FP = new TextEncoder().encode("runa/v1/fp");
-export const INFO_EPOCH = new TextEncoder().encode("runa/v1/epoch");
 
 export function concatBytes(...parts: Uint8Array[]): Uint8Array {
   const total = parts.reduce((n, p) => n + p.length, 0);
