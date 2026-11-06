@@ -660,6 +660,44 @@ describe("EpochCoordinator", () => {
     expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
   });
 
+  it("sends no step on a server that predates amendment J", async () => {
+    const { hub, peers } = await room(3);
+    // A JOIN_ACK without root_epoch: the server never advances or echoes.
+    for (const p of peers) await p.coord.joined(0, false);
+    leave(hub, peers[2]);
+    hub.now += LEAVE_GRACE_MS;
+    hub.captured = [];
+    await tickAll(hub);
+    hub.now += ROTATOR_FALLBACK_MS * 3;
+    await tickAll(hub);
+    expect(hub.captured).toEqual([]);
+    hub.captured = null;
+  });
+
+  it("ignores steps and handovers on a server that predates amendment J", async () => {
+    const { peers } = await room(2);
+    const [a, b] = peers;
+    await b.coord.joined(0, false);
+    const h = header(1);
+    const secret = randomEpochSecret();
+    const next = await stepKeys(a.keyring.current, secret);
+    const key = await wrapKey(a.kx, b.kx.publicKeyRaw, ROOM, 1, a.id, b.id);
+    const { iv, ct } = await sealWrap(key, h, secret);
+    const step = await encodeEpochKey(
+      h,
+      { kind: "step", from: 0, to: 1, root: 0, sender: a.id, roster: new Uint8Array(32), confirm: next.confirm, wraps: [{ p: b.id, iv, ct }] },
+      a.identity,
+    );
+    await b.coord.receive(h, 1, a.id, step);
+    const { h: hh, body } = await bogusHandover(a, b, 1);
+    await b.coord.receive(hh, 1, a.id, body);
+    expect(b.keyring.current.epoch).toBe(0);
+    expect(b.adopted).toEqual([]);
+    expect(b.rejoined).toBe(0);
+    expect(b.statuses.at(-1)).toBe("ok");
+    expect(b.statuses).not.toContain("refused");
+  });
+
   it("never wraps for a member whose key-agreement key is signed but does not start with 0x04", async () => {
     const hub = new Hub();
     const [a, b, c, d] = [await makePeer(hub), await makePeer(hub), await makePeer(hub), await makePeer(hub)];

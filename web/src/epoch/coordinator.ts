@@ -78,6 +78,10 @@ export class EpochCoordinator {
   /// Key-agreement keys whose signature checked out, by peer id (hex).
   private verifiedKx = new Map<string, Uint8Array>();
   private awaitingEpoch: number | null = null;
+  /// False when the JOIN_ACK had no `root_epoch`: that server predates
+  /// amendment J, never advances a room or echoes a step, so nothing is sent
+  /// and nothing received is followed.
+  private serverRotates = true;
   private busy = false;
   /// EPOCH_KEY frames are handled one at a time, in the order they arrived,
   /// so two steps for the same epoch cannot both pass the epoch checks.
@@ -145,7 +149,8 @@ export class EpochCoordinator {
 
   /// After JOIN_ACK: check everyone's key-agreement key, and say whether this
   /// tab can read the room yet.
-  async joined(roomEpoch: number): Promise<void> {
+  async joined(roomEpoch: number, serverRotates = true): Promise<void> {
+    this.serverRotates = serverRotates;
     await Promise.all(this.d.members().map((m) => this.noteMember(m)));
     // Anyone listed now is present, whatever this tab believed while it was
     // away: a departure that came back meanwhile must not cause a rotation.
@@ -199,7 +204,7 @@ export class EpochCoordinator {
       else if (this.dueSince === null) this.dueSince = now;
       if (this.awaitingEpoch !== null) this.d.status(this.othersPresent() ? "waiting" : "unreadable");
       const me = this.d.me();
-      if (!me) return;
+      if (!me || !this.serverRotates) return;
       if (this.pendingStep && now - this.pendingStep.sentAt > ROTATOR_FALLBACK_MS) {
         // Never echoed: another step won, or the server refused this one.
         this.pendingStep.secret.fill(0);
@@ -332,6 +337,7 @@ export class EpochCoordinator {
   }
 
   private async receiveNow(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
+    if (!this.serverRotates) return;
     const decoded = decodeEpochKey(bytes);
     if (!decoded) return;
     const { body } = decoded;

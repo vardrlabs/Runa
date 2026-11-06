@@ -315,6 +315,11 @@ export class Session {
   private keyStatus: KeyStatusReporter;
   /// The snapshot a rotation asks for, while it waits to run.
   private snapshotSoonTimer: ReturnType<typeof setTimeout> | null = null;
+  /// Rotations that asked for a snapshot, and how many of those asks a sent
+  /// snapshot has answered. While one is outstanding the regular loop forces
+  /// its snapshot, so an ask that came too early is not lost.
+  private snapshotAsked = 0;
+  private snapshotPaid = 0;
 
   private binding: Binding | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -683,7 +688,9 @@ export class Session {
     for (const gone of departedMembers(rosterBefore, [...this.internals.roster.values()])) {
       this.coordinator.memberLeft(gone);
     }
-    await this.coordinator.joined(typeof ack.epoch === "number" ? ack.epoch : 0);
+    // A JOIN_ACK without root_epoch comes from a server that predates
+    // amendment J: it never advances a room, so no step is sent or followed.
+    await this.coordinator.joined(typeof ack.epoch === "number" ? ack.epoch : 0, ack.root_epoch !== undefined);
 
     switch (effectiveTtl.kind) {
       case "none":
@@ -738,6 +745,7 @@ export class Session {
   /// After a rotation the elected member snapshots straight away, so the log
   /// soon holds nothing under an older key.
   snapshotSoon(): void {
+    this.snapshotAsked += 1;
     if (this.snapshotSoonTimer) clearTimeout(this.snapshotSoonTimer);
     this.snapshotSoonTimer = setTimeout(() => {
       this.snapshotSoonTimer = null;
@@ -898,7 +906,7 @@ export class Session {
   /// (joined_at_seq, peer_id) snapshots when thresholds fire.
   private startSnapshotLoop(): void {
     if (this.snapshotTimer) return;
-    this.snapshotTimer = setInterval(() => this.trySnapshot(false), 30_000);
+    this.snapshotTimer = setInterval(() => this.trySnapshot(this.snapshotAsked > this.snapshotPaid), 30_000);
   }
 
   private trySnapshot(force: boolean): void {
@@ -925,8 +933,13 @@ export class Session {
     });
     if (covers === null) return;
     if (!force && !this.doc.shouldSnapshot(BigInt(Math.max(covers, 1)))) return;
+    // Taken now, so only a rotation that came before this snapshot counts as
+    // answered by it.
+    const asked = this.snapshotAsked;
     void this.doc.createSnapshot(BigInt(covers)).then((made) => {
-      if (made) this.lastCovered = Math.max(this.lastCovered, covers);
+      if (!made) return;
+      this.lastCovered = Math.max(this.lastCovered, covers);
+      this.snapshotPaid = Math.max(this.snapshotPaid, asked);
     });
   }
 

@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { departedMembers, KEY_STATUS_TEXT, keyStatusReporter } from "./session";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { departedMembers, KEY_STATUS_TEXT, keyStatusReporter, Session } from "./session";
+import { toB64 } from "./transport/socket";
 
 const entry = (peer: number, key: number | null, seq: number) => ({
   peerId: new Uint8Array(16).fill(peer),
@@ -60,5 +61,83 @@ describe("keyStatusReporter", () => {
     expect(report.alarming()).toBe(true);
     report("waiting");
     expect(report.alarming()).toBe(false);
+  });
+});
+
+describe("the snapshot a step asks for", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /// A Session with only what the snapshot path reads, built without a
+  /// network: this tab is the elected member, and its copy holds entries no
+  /// snapshot covers yet.
+  function fakeSession() {
+    const me = new Uint8Array(16).fill(1);
+    const made: bigint[] = [];
+    const state = { ready: false, joinPerfMs: performance.now(), watermark: 10 };
+    const s = Object.create(Session.prototype) as Record<string, unknown>;
+    Object.assign(s, {
+      internals: {
+        get joinPerfMs() {
+          return state.joinPerfMs;
+        },
+        roster: new Map([[toB64(me), { peerId: me, joinedAtSeq: 1 }]]),
+        myPeerId: toB64(me),
+      },
+      socket: { readyForSnapshot: () => state.ready },
+      cfg: { roomIdHex: "07".repeat(16) },
+      indexed: true,
+      lastCovered: 0,
+      snapshotTimer: null,
+      snapshotSoonTimer: null,
+      snapshotAsked: 0,
+      snapshotPaid: 0,
+      doc: {
+        cursor: {
+          get watermark() {
+            return state.watermark;
+          },
+        },
+        baseIndex: 0,
+        storedCount: 0,
+        // The usual thresholds are not met: only a forced snapshot is taken.
+        shouldSnapshot: () => false,
+        createSnapshot: async (covers: bigint) => {
+          made.push(covers);
+          return true;
+        },
+      },
+    });
+    const session = s as unknown as { snapshotSoon(): void; startSnapshotLoop(): void };
+    return { session, state, made };
+  }
+
+  it("is still taken by the regular loop when the first try came too early", async () => {
+    vi.useFakeTimers();
+    const { session, state, made } = fakeSession();
+    session.startSnapshotLoop();
+    session.snapshotSoon();
+    // The quick try finds the member joined under a minute ago and not ready.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(made).toEqual([]);
+    state.joinPerfMs -= 120_000;
+    state.ready = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(made).toEqual([10n]);
+    // Once one has been sent, the loop goes back to its usual thresholds.
+    state.watermark = 20;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(made).toEqual([10n]);
+  });
+
+  it("still makes the quick try when nothing holds it back", async () => {
+    vi.useFakeTimers();
+    const { session, state, made } = fakeSession();
+    state.joinPerfMs -= 120_000;
+    state.ready = true;
+    session.snapshotSoon();
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(made).toEqual([10n]);
   });
 });
