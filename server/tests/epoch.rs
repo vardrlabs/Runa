@@ -493,3 +493,61 @@ async fn a_snapshot_from_the_epoch_just_left_is_dropped_quietly() {
     let err = json_body(&next_ft(&mut a, 0x30).await);
     assert_eq!(err["code"], 4006);
 }
+
+/// A peer that cannot keep up is dropped when its queue overflows: its
+/// connection closes once it has drained what was queued, and the others are
+/// told it left. The connection must not outlive its place in the room (a
+/// second long-lived sender would keep the writer waiting for more frames
+/// forever, leaving a peer that is connected, off the roster, and deaf).
+#[tokio::test]
+async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
+    let mut cfg = cfg_with(30_000, 0);
+    cfg.max_queued_bytes_per_conn = 256 * 1024;
+    cfg.frames_per_conn_per_sec = 100_000;
+    cfg.bytes_per_conn_per_sec = 1 << 30;
+    let s = spawn(cfg).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    let (mut b, _) = join_with(&s, &k, json!({})).await;
+    let (mut slow, ack) = join_with(&s, &k, json!({})).await;
+    let slow_id = ack["peer_id"].as_str().unwrap().to_string();
+
+    // The slow peer reads one frame per 20 ms and then waits for the stream
+    // to end, which it only does if the server closes the connection.
+    let slow_reader = tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            match slow.next().await {
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(_)) => {}
+            }
+        }
+    });
+
+    let hex = k.hex.clone();
+    let flood = tokio::spawn(async move {
+        let payload = vec![0xAAu8; 32 * 1024];
+        for _ in 0..4000 {
+            if a.send(frame(&hex, 0x06, 0, &payload)).await.is_err() {
+                break;
+            }
+            // Paced, so B (which reads at full speed) keeps up.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        a
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let leave = loop {
+        match tokio::time::timeout_at(deadline, b.next()).await {
+            Ok(Some(Ok(Message::Binary(m)))) if m.len() >= 4 && m[3] == 0x08 => break m,
+            Ok(Some(Ok(_))) => {}
+            other => panic!("no PEER_LEAVE for the backlogged peer: {other:?}"),
+        }
+    };
+    assert_eq!(json_body(&leave)["peer_id"].as_str().unwrap(), slow_id);
+    flood.abort();
+
+    let closed = tokio::time::timeout(Duration::from_secs(30), slow_reader).await;
+    assert!(closed.is_ok(), "the backlogged peer's connection stayed open");
+}

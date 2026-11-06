@@ -435,7 +435,7 @@ async fn run_connection(
     let peer_tx = crate::runar::room::PeerTx::new(tx, cfg.max_queued_bytes_per_conn)
         .with_indexes(join.indexed);
     let queue_meter = peer_tx.meter();
-    let final_error = peer_tx.clone();
+    let final_error = peer_tx.close_flag();
     let entry = match room.add_peer(session_pubkey.clone(), kx, peer_tx) {
         Ok(e) => e,
         Err(JoinError::Full) => {
@@ -577,7 +577,7 @@ async fn run_connection(
                         let is_ticket = bytes.len() >= HEADER_LEN && bytes[3] == FT_RESTART_TICKET;
                         let is_final_error = bytes.len() >= HEADER_LEN
                             && bytes[3] == FT_ERROR
-                            && final_error.closes_after_error();
+                            && final_error.load(std::sync::atomic::Ordering::SeqCst);
                         let n = bytes.len();
                         let sent = sink.send(Message::Binary(bytes)).await;
                         // Quota returns once the frame is off our hands.

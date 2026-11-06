@@ -112,9 +112,12 @@ impl PeerTx {
         self.try_send(error)
     }
 
-    /// Whether the next ERROR frame this connection writes ends it.
-    pub fn closes_after_error(&self) -> bool {
-        self.close_after_error.load(Ordering::SeqCst)
+    /// The flag `send_final_error` sets. The connection's writer holds this
+    /// and never a `PeerTx`: a second `Sender` kept alive for the
+    /// connection's life would stop `recv()` from returning `None` when the
+    /// room drops a backlogged peer, and that peer would stay connected.
+    pub fn close_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.close_after_error.clone()
     }
 
     /// Relay DOC_UPDATEs to this connection with their log index.
