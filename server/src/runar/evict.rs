@@ -204,7 +204,7 @@ pub fn verify_vote(pubkey: &[u8], message: &[u8], sig: &[u8; SIG_LEN]) -> bool {
             };
             // Normalised first, so acceptance does not depend on whether the
             // verifier itself tolerates a high s.
-            let sig = sig.normalize_s().unwrap_or(sig);
+            let sig = sig.normalize_s();
             key.verify(message, &sig).is_ok()
         }
         _ => false,

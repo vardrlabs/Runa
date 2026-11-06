@@ -16,7 +16,7 @@ getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 rlimit = "0.10"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
