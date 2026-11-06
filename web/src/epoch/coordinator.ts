@@ -131,6 +131,9 @@ export class EpochCoordinator {
     this.verifiedKx.delete(hex(m.peerId));
     if (this.d.highest() && m.pubkey) {
       const key = hex(m.pubkey);
+      // A late PEER_LEAVE for a connection the member has already replaced:
+      // the same signing key is still here under a new peer id.
+      if (this.d.members().some((r) => r.pubkey && hex(r.pubkey) === key && !eq(r.peerId, m.peerId))) return;
       this.tracker.left(key, this.d.now());
       this.departed.set(key, hex(m.peerId));
     }
@@ -163,6 +166,17 @@ export class EpochCoordinator {
       this.awaitingEpoch = roomEpoch;
       this.d.status(this.othersPresent() ? "waiting" : "unreadable");
     }
+    // Newcomers that arrived while this tab was away were never announced to
+    // it, and may be waiting for a handover nobody else can send. A member
+    // that already holds the epoch ignores a redundant one.
+    const me = this.d.me();
+    if (me && held > this.d.keyring.rootEpoch) {
+      const now = this.d.now();
+      for (const m of this.d.members()) {
+        const id = hex(m.peerId);
+        if (!eq(m.peerId, me) && !this.handovers.has(id)) this.handovers.set(id, now);
+      }
+    }
   }
 
   /// Once a second.
@@ -171,6 +185,14 @@ export class EpochCoordinator {
     this.busy = true;
     try {
       const now = this.d.now();
+      // A departure whose signing key is back in the roster, however that was
+      // learned, is not a departure.
+      const present = new Set(this.d.members().flatMap((m) => (m.pubkey ? [hex(m.pubkey)] : [])));
+      for (const key of this.tracker.pendingKeys()) {
+        if (!present.has(key)) continue;
+        this.tracker.returned(key);
+        this.departed.delete(key);
+      }
       // A departure that came back, or a rejoin, can clear the deadlines
       // after one fell due.
       if (!this.tracker.isDue(now)) this.dueSince = null;

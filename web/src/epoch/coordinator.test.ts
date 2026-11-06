@@ -530,6 +530,53 @@ describe("EpochCoordinator", () => {
     expect((a.coord as unknown as { pendingStep: unknown }).pendingStep).toBeNull();
   });
 
+  it("a holder that reconnects hands keys to a newcomer that joined while it was away", async () => {
+    const { hub, peers } = await room(2);
+    const [a, c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    expect(a.keyring.current.epoch).toBe(1);
+    // d joined while a was disconnected, so a never saw its PEER_JOIN. a's
+    // JOIN_ACK roster is the first it hears of d.
+    const d = await makePeer(hub);
+    hub.peers.push(d);
+    await d.coord.joined(1);
+    expect(d.statuses.at(-1)).toBe("waiting");
+    await a.coord.joined(1);
+    await tickAll(hub);
+    expect(d.keyring.current.epoch).toBe(1);
+    expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
+    expect(d.statuses.at(-1)).toBe("ok");
+  });
+
+  it("does not rotate when a member's new connection is announced before its old one leaves", async () => {
+    const { hub, peers } = await room(3);
+    const [, , c] = peers;
+    // PEER_JOIN for the new peer id arrives first, then the late PEER_LEAVE.
+    const back = await makePeer(hub, true, c.identity);
+    arrive(hub, back);
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    hub.now += ROTATOR_FALLBACK_MS * 3;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+  });
+
+  it("does not rotate for a departure whose signing key is back in the roster, however it got there", async () => {
+    const { hub, peers } = await room(3);
+    const [, , c] = peers;
+    leave(hub, c);
+    // The member is back (a roster refresh, say) without a PEER_JOIN.
+    hub.peers.push(await makePeer(hub, true, c.identity));
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    hub.now += ROTATOR_FALLBACK_MS * 3;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+  });
+
   it("never wraps for a member whose key-agreement key is signed but does not start with 0x04", async () => {
     const hub = new Hub();
     const [a, b, c, d] = [await makePeer(hub), await makePeer(hub), await makePeer(hub), await makePeer(hub)];
