@@ -422,7 +422,8 @@ async fn a_client_without_key_agreement_is_refused_a_rotated_room() {
     assert_eq!(ack["roster"].as_array().unwrap().len(), 2, "the refused join was on the roster");
     // Nobody was told the refused client had joined: a sees only c's PEER_JOIN
     // (its own was skipped while waiting for the echo).
-    assert_eq!(frames_of(&mut a, 0x07, 300).await.len(), 1);
+    let _c_joined = next_ft(&mut a, 0x07).await;
+    assert!(frames_of(&mut a, 0x07, 300).await.is_empty(), "a PEER_JOIN went out for the refused client");
 }
 
 #[tokio::test]
@@ -451,8 +452,8 @@ async fn a_client_without_key_agreement_is_closed_when_a_step_is_accepted() {
     assert_eq!(close_code(&mut old).await, 4005);
 
     // It left the roster, and the others were told.
-    let leaves = frames_of(&mut b, 0x08, 500).await;
-    assert_eq!(leaves.len(), 1);
+    let _left = next_ft(&mut b, 0x08).await;
+    assert!(frames_of(&mut b, 0x08, 300).await.is_empty(), "more than one PEER_LEAVE");
     let (_c, ack) = join_with(&s, &k, json!({})).await;
     assert_eq!(ack["roster"].as_array().unwrap().len(), 3);
 }
@@ -562,6 +563,23 @@ async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
 /// times over. Whichever the server decides first wins, and every member must
 /// see that step first: nobody may be wrapped in the one that lost.
 // Multi-threaded so the server and the clients can truly race; still probabilistic.
+/// The first EPOCH_KEY for `epoch` that this peer receives. Every peer is
+/// sent the winning step, so this waits for it rather than for a fixed time: a
+/// fixed 40 ms window per peer, read one peer after another, missed the frame
+/// on a loaded CI runner. Frames for older rounds still queued are skipped.
+async fn first_step_of(ws: &mut Ws, epoch: u32) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Ok(Some(Ok(Message::Binary(b)))) if b.len() >= 24 && b[3] == 0x20 && epoch_of(&b) == epoch => {
+                return Some(b.to_vec());
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => return None,
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn racing_steps_reach_every_peer_in_the_order_the_server_decided() {
     let s = spawn(cfg_with(30_000, 0)).await;
@@ -577,10 +595,9 @@ async fn racing_steps_reach_every_peer_in_the_order_the_server_decided() {
         let _ = tokio::join!(a.send(fa), b.send(fb));
         let mut firsts = Vec::new();
         for ws in [&mut a, &mut b, &mut c] {
-            let seen = frames_of(ws, 0x20, 40).await;
-            let mine: Vec<&Vec<u8>> = seen.iter().filter(|f| epoch_of(f) == round).collect();
-            assert!(!mine.is_empty(), "round {round}: a peer saw no step");
-            firsts.push(mine[0][48..].to_vec());
+            let first = first_step_of(ws, round).await;
+            let first = first.unwrap_or_else(|| panic!("round {round}: a peer saw no step within 5 s"));
+            firsts.push(first[48..].to_vec());
         }
         assert!(
             firsts.iter().all(|f| f == &firsts[0]),
