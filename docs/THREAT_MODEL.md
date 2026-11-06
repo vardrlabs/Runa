@@ -133,6 +133,60 @@ every other A3 risk: run the server yourself. Nothing in the protocol can fix
 it, because a peer's identity has to arrive from somewhere, and on a first
 visit that somewhere is the relay.
 
+## Key rotation protects against people who have left, within limits
+
+A room starts with one content key, derived from its link or passphrase. In a
+Highest-security room the key changes when someone leaves. Once a peer has been
+gone for 60 seconds (ten minutes during a server restart, so everyone has time
+to reconnect), the remaining peer who has been connected longest draws a new
+256-bit secret. It wraps that secret separately for each remaining peer, under
+a key agreed with that peer's session key, and sends it. Everything written
+after that is encrypted under a key the departed peer never receives. The
+design is in PROTOCOL amendment J.
+
+What that buys is narrow, so here it is exactly:
+
+- **It stops someone who left from reading on quietly.** Without rotation, a
+  departed peer who kept the key could read everything written afterwards from
+  ciphertext alone, if a colluding operator or a captured stream gave it to
+  them. With rotation, that ciphertext is useless to them.
+- **It does not stop them coming back.** They still hold the link or the
+  passphrase, so they can rejoin, appear in the peer list like anyone else, and
+  be handed the current key. Rotation turns silent reading into a visible
+  return.
+- **It gives no backward secrecy.** A departed peer keeps everything they saw
+  while they were there.
+- **Everyday rooms do not rotate when someone leaves.** An everyday room
+  promises that its link opens it later, and a rotated room cannot keep that
+  promise: what was written after a rotation can be opened only through someone
+  who is still in the room. A Highest room accepts that cost. If everyone leaves
+  after a rotation, the link no longer opens what was written since, and the
+  room tells the next person who arrives.
+
+A peer who joins after a rotation still gets the whole history. A member who is
+present hands them the secrets drawn since the room began, and they derive each
+key from their own link or passphrase. Until that happens, the room shows them
+that it is waiting for a member.
+
+Every rotation is signed, and it carries a confirmation value that each
+recipient recomputes from the key it derived. A peer who hands different
+members different secrets fails that check, and so does anyone who sends a
+newcomer secrets that do not belong to the room. A rotation that fails is
+refused and shown, and the room stops working until people leave it. Only a
+member or the server can cause that, and either could already disrupt a room.
+
+Against the server, rotation holds as long as the server does not collude with
+the departed peer. Each new key comes from the secret mixed into a chain that
+starts at the link or passphrase, which the server never sees, so intercepting
+a wrapped secret gives the server nothing on its own. But the session keys that
+secrets are wrapped to arrive in the peer list, and the server supplies that
+list. A server working with a departed peer can put its own key in place of a
+member's and pass the new secret on. The two-word handles in the room are
+derived from session keys, but they are short enough for a server to find a key
+that produces the same handle, so comparing them does not catch this. As
+everywhere in this document, nothing here helps against a server that serves
+bad JavaScript, and running the server yourself is the answer to both.
+
 ## Metadata the server unavoidably learns
 
 | Leak | Why | Mitigation |
@@ -145,6 +199,7 @@ visit that somewhere is the relay.
 | Session duration | Connection lifetime | None |
 | Room TTL | The server enforces it, so it must know it | None. It is a scheduling parameter, not a secret |
 | A named room's name | It is the routing address | None, by construction. This is the entire trade; it is why named rooms are a separate class with a separate promise |
+| When a room's key changes, and how many times | It relays each rotation and enforces the room's current epoch | None. It already sees every departure that causes one |
 
 ## Known limits stated plainly
 
