@@ -11,6 +11,13 @@ export const KX_PUBKEY_LEN = 65;
 const KX_DOMAIN = enc.encode("runa/v1/kx");
 const WRAP_INFO = enc.encode("runa/v1/epoch-wrap");
 const P256: EcKeyImportParams = { name: "ECDH", namedCurve: "P-256" };
+const ROOM_ID_LEN = 16;
+const PEER_ID_LEN = 16;
+const WRAP_IV_LEN = 12;
+
+function need(ok: boolean, what: string): void {
+  if (!ok) throw new Error(what);
+}
 
 export interface KxPair {
   privateKey: CryptoKey;
@@ -26,12 +33,14 @@ export async function generateKx(): Promise<KxPair> {
 /// What a session signs so its key-agreement key cannot be swapped for
 /// another without breaking the signature, or replayed into another room.
 export function kxStatement(roomId: Uint8Array, kxPub: Uint8Array): Uint8Array {
+  need(roomId.length === ROOM_ID_LEN, "a room id is 16 bytes");
+  need(kxPub.length === KX_PUBKEY_LEN, "a key-agreement key is 65 bytes");
   return concatBytes(KX_DOMAIN, roomId, kxPub);
 }
 
 export function algForPubkey(raw: Uint8Array): SignatureAlg | null {
   if (raw.length === 32) return "Ed25519";
-  if (raw.length === 65) return "ECDSA-P256";
+  if (raw.length === 65 && raw[0] === 0x04) return "ECDSA-P256";
   return null;
 }
 
@@ -46,6 +55,9 @@ export async function wrapKey(
   if (theirPub.length !== KX_PUBKEY_LEN || theirPub[0] !== 0x04) {
     throw new Error("not an uncompressed P-256 key");
   }
+  need(roomId.length === ROOM_ID_LEN, "a room id is 16 bytes");
+  need(senderPeerId.length === PEER_ID_LEN && recipientPeerId.length === PEER_ID_LEN, "a peer id is 16 bytes");
+  need(Number.isInteger(epoch) && epoch >= 0 && epoch <= 0xffffffff, "an epoch is a u32");
   const their = await crypto.subtle.importKey("raw", theirPub as BufferSource, P256, false, []);
   const shared = new Uint8Array(
     await crypto.subtle.deriveBits({ name: "ECDH", public: their }, own.privateKey, 256),
@@ -97,6 +109,7 @@ export async function openWrap(
   iv: Uint8Array,
   ct: Uint8Array,
 ): Promise<Uint8Array> {
+  need(iv.length === WRAP_IV_LEN, "a wrap IV is 12 bytes");
   return new Uint8Array(
     await crypto.subtle.decrypt(
       { name: "AES-GCM", iv: iv as BufferSource, additionalData: aad as BufferSource, tagLength: 128 },

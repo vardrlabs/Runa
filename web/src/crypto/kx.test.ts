@@ -53,10 +53,65 @@ describe("key agreement", () => {
     await expect(wrapKey(a, new Uint8Array(64).fill(4), ROOM, 1, PA, PB)).rejects.toThrow();
   });
 
-  it("names the signing algorithm from the key length", () => {
+  it("names the signing algorithm from the key's shape", () => {
+    const p256 = new Uint8Array(65);
+    p256[0] = 0x04;
     expect(algForPubkey(new Uint8Array(32))).toBe("Ed25519");
-    expect(algForPubkey(new Uint8Array(65))).toBe("ECDSA-P256");
+    expect(algForPubkey(p256)).toBe("ECDSA-P256");
+    expect(algForPubkey(new Uint8Array(65))).toBeNull();
+    expect(algForPubkey(new Uint8Array(65).fill(0x02))).toBeNull();
     expect(algForPubkey(new Uint8Array(33))).toBeNull();
+  });
+
+  it("refuses a 65-byte key that is not on the curve", async () => {
+    const a = await generateKx();
+    const b = await generateKx();
+    const off = b.publicKeyRaw.slice();
+    off[64] ^= 1;
+    await expect(wrapKey(a, off, ROOM, 1, PA, PB)).rejects.toThrow();
+  });
+
+  it("binds the room", async () => {
+    const a = await generateKx();
+    const b = await generateKx();
+    const other = ROOM.slice();
+    other[0] ^= 1;
+    const { iv, ct } = await sealWrap(await wrapKey(a, b.publicKeyRaw, ROOM, 1, PA, PB), AAD, SECRET);
+    await expect(openWrap(await wrapKey(b, a.publicKeyRaw, other, 1, PA, PB), AAD, iv, ct)).rejects.toThrow();
+  });
+
+  it("binds who sent it", async () => {
+    const a = await generateKx();
+    const b = await generateKx();
+    const { iv, ct } = await sealWrap(await wrapKey(a, b.publicKeyRaw, ROOM, 1, PA, PB), AAD, SECRET);
+    await expect(openWrap(await wrapKey(b, a.publicKeyRaw, ROOM, 1, PC, PB), AAD, iv, ct)).rejects.toThrow();
+  });
+
+  it("checks every input's size at the boundary", async () => {
+    const a = await generateKx();
+    const b = await generateKx();
+    const pub = b.publicKeyRaw;
+    const short = new Uint8Array(15);
+    const long = new Uint8Array(17);
+    expect(() => kxStatement(short, pub)).toThrow();
+    expect(() => kxStatement(long, pub)).toThrow();
+    expect(() => kxStatement(ROOM, pub.slice(0, 64))).toThrow();
+    expect(() => kxStatement(ROOM, new Uint8Array(66))).toThrow();
+    await expect(wrapKey(a, pub, short, 1, PA, PB)).rejects.toThrow();
+    await expect(wrapKey(a, pub, long, 1, PA, PB)).rejects.toThrow();
+    await expect(wrapKey(a, pub, ROOM, 1, short, PB)).rejects.toThrow();
+    await expect(wrapKey(a, pub, ROOM, 1, PA, long)).rejects.toThrow();
+    await expect(wrapKey(a, pub.slice(0, 64), ROOM, 1, PA, PB)).rejects.toThrow();
+    for (const epoch of [-1, 0x1_0000_0000, 1.5, Number.NaN]) {
+      await expect(wrapKey(a, pub, ROOM, epoch, PA, PB)).rejects.toThrow();
+    }
+    await expect(wrapKey(a, pub, ROOM, 0, PA, PB)).resolves.toBeDefined();
+    await expect(wrapKey(a, pub, ROOM, 0xffffffff, PA, PB)).resolves.toBeDefined();
+    const key = await wrapKey(a, pub, ROOM, 1, PA, PB);
+    const { iv, ct } = await sealWrap(key, AAD, SECRET);
+    await expect(openWrap(key, AAD, iv.slice(0, 11), ct)).rejects.toThrow();
+    await expect(openWrap(key, AAD, new Uint8Array(16), ct)).rejects.toThrow();
+    expect(await openWrap(key, AAD, iv, ct)).toEqual(SECRET);
   });
 
   it("lets a peer sign its key-agreement key to this room", async () => {
