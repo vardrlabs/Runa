@@ -145,15 +145,24 @@ export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
 
 /// Passes a key status on only when it changes. The coordinator repeats
 /// "waiting" every second, and each report re-renders the room page.
-export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "onTemper">): (s: KeyStatus) => void {
+export type KeyStatusReporter = ((s: KeyStatus) => void) & {
+  /// Whether the last status reported was an alarming one.
+  alarming(): boolean;
+};
+
+const isAlarming = (s: KeyStatus | null): boolean => s === "refused" || s === "roster-mismatch" || s === "server-behind";
+
+export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "onTemper">): KeyStatusReporter {
   let last: KeyStatus | null = null;
-  return (s) => {
+  const report = ((s: KeyStatus) => {
     if (s === last) return;
     last = s;
-    const alarming = s === "refused" || s === "roster-mismatch" || s === "server-behind";
+    const alarming = isAlarming(s);
     events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
     if (alarming) events.onTemper("WATCH");
-  };
+  }) as KeyStatusReporter;
+  report.alarming = () => isAlarming(last);
+  return report;
 }
 
 /// The log index a snapshot taken now may claim to cover, or null when there
@@ -303,7 +312,7 @@ export class Session {
   /// A JOIN_ACK arrived while this tab held no key for the room's epoch, so
   /// the sync request waits for the handover.
   private syncDeferred = false;
-  private keyStatus: (s: KeyStatus) => void;
+  private keyStatus: KeyStatusReporter;
   /// The snapshot a rotation asks for, while it waits to run.
   private snapshotSoonTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -697,6 +706,8 @@ export class Session {
 
     this.events.onPeersChanged(this.internals.roster.size);
     this.events.onTemper("SECURE");
+    // SECURE must not hide an alarm the coordinator raised a moment ago.
+    if (this.keyStatus.alarming()) this.events.onTemper("WATCH");
     this.events.onJoinAck(ack);
     // Resume rather than replay: asking from 0 on every reconnect pulls the
     // entire room log down again each time. With indexes, resume from exactly

@@ -48,4 +48,17 @@ describe("keyStatusReporter", () => {
     expect(shown).toEqual([KEY_STATUS_TEXT.waiting, null, KEY_STATUS_TEXT.refused]);
     expect(tempers).toEqual(["WATCH"]);
   });
+
+  it("says whether the last status was alarming, so a later SECURE can be followed by WATCH", () => {
+    const report = keyStatusReporter({ onKeyStatus: () => {}, onTemper: () => {} });
+    expect(report.alarming()).toBe(false);
+    report("server-behind");
+    expect(report.alarming()).toBe(true);
+    report("ok");
+    expect(report.alarming()).toBe(false);
+    report("roster-mismatch");
+    expect(report.alarming()).toBe(true);
+    report("waiting");
+    expect(report.alarming()).toBe(false);
+  });
 });

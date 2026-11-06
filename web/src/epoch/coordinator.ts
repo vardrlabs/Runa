@@ -249,6 +249,8 @@ export class EpochCoordinator {
         },
         this.d.identity,
       );
+      // A step landed while this one was being built: it is stale.
+      if (this.d.keyring.current.epoch !== cur.epoch) return;
       // Recorded before sending: the server echoes the step back, and the echo
       // must find the secret waiting.
       this.pendingStep = { to, secret, confirm: next.confirm, sentAt: this.d.now() };
@@ -342,11 +344,20 @@ export class EpochCoordinator {
   private async receiveStep(header: Uint8Array, body: EpochKeyBody, from: MemberView, me: Uint8Array): Promise<void> {
     const ring = this.d.keyring;
     if (body.to <= ring.current.epoch) return; // already held: a late duplicate
+    // Left out of the winning step for this epoch or an earlier one: the
+    // server relays a later step for the same epoch like a handover, and
+    // following it would land on a key nobody else holds.
+    if (this.awaitingEpoch !== null && body.to <= this.awaitingEpoch) return;
     const mine = eq(from.peerId, me);
     const pending = this.pendingStep;
     // Our own echo is only followable with the secret it was built from: a
     // step this tab gave up on, or an earlier one for the same epoch, is not.
     const ownSecret = mine && pending?.to === body.to && confirmsEqual(pending.confirm, body.confirm);
+    if (mine && !ownSecret && pending?.to === body.to) {
+      // The room took another step for this epoch: the secret is no use now.
+      pending.secret.fill(0);
+      this.pendingStep = null;
+    }
     if (body.to > ring.current.epoch + 1 || (mine && !ownSecret) || (!mine && !body.wraps.some((w) => eq(w.p, me)))) {
       // The room moved somewhere this member cannot follow. Join again and be
       // handed the keys as a newcomer.

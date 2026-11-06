@@ -464,4 +464,87 @@ describe("EpochCoordinator", () => {
     await a.coord.tick();
     expect(hub.captured).toEqual([]);
   });
+
+  it("a member left out of the winning step ignores a losing step for the same epoch that wraps it", async () => {
+    const hub = new Hub();
+    const [a, b, m] = [await makePeer(hub), await makePeer(hub), await makePeer(hub)];
+    hub.peers.push(a, b, m);
+    for (const p of hub.peers) await p.coord.joined(0);
+    const h = header(1);
+    const build = async (from: Peer, target: Peer): Promise<Uint8Array> => {
+      const secret = randomEpochSecret();
+      const next = await stepKeys(from.keyring.current, secret);
+      const key = await wrapKey(from.kx, target.kx.publicKeyRaw, ROOM, 1, from.id, target.id);
+      const { iv, ct } = await sealWrap(key, h, secret);
+      return encodeEpochKey(
+        h,
+        { kind: "step", from: 0, to: 1, root: 0, sender: from.id, roster: new Uint8Array(32), confirm: next.confirm, wraps: [{ p: target.id, iv, ct }] },
+        from.identity,
+      );
+    };
+    const winner = await build(a, b); // leaves m out
+    const loser = await build(b, m); // wraps m, but lost the race
+    hub.epoch = 1;
+    await m.coord.receive(h, 1, a.id, winner);
+    await m.coord.receive(h, 1, b.id, loser);
+    expect(m.keyring.current.epoch).toBe(0);
+    expect(m.adopted).toEqual([]);
+    expect(m.statuses.at(-1)).toBe("waiting");
+    expect(m.rejoined).toBe(1);
+  });
+
+  it("zeroes its pending secret as soon as the room takes another step for that epoch", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    hub.captured = [];
+    await a.coord.tick();
+    hub.now += ROTATOR_FALLBACK_MS + 1;
+    await a.coord.tick();
+    const [first] = hub.captured;
+    hub.captured = null;
+    const pending = (a.coord as unknown as { pendingStep: { secret: Uint8Array } | null }).pendingStep!;
+    const secret = pending.secret;
+    expect(secret.some((x) => x !== 0)).toBe(true);
+    await a.coord.receive(first.h, 1, a.id, first.body);
+    expect((a.coord as unknown as { pendingStep: unknown }).pendingStep).toBeNull();
+    expect(secret.every((x) => x === 0)).toBe(true);
+  });
+
+  it("does not send a step when another step landed while it was being built", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    // Another step reaches a's keyring after sendStep has read it.
+    const stale = a.keyring.current;
+    const next = await stepKeys(stale, new Uint8Array(32).fill(5));
+    expect(await a.keyring.applyStep(1, new Uint8Array(32).fill(5), next.confirm)).not.toBeNull();
+    const real = a.keyring.current;
+    let reads = 0;
+    Object.defineProperty(a.keyring, "current", { get: () => (reads++ === 0 ? stale : real) });
+    hub.captured = [];
+    await a.coord.tick();
+    expect(hub.captured).toEqual([]);
+    expect((a.coord as unknown as { pendingStep: unknown }).pendingStep).toBeNull();
+  });
+
+  it("never wraps for a member whose key-agreement key is signed but does not start with 0x04", async () => {
+    const hub = new Hub();
+    const [a, b, c, d] = [await makePeer(hub), await makePeer(hub), await makePeer(hub), await makePeer(hub)];
+    b.kx.publicKeyRaw[0] = 0x05;
+    b.kxSig = await signPayload(b.identity, kxStatement(ROOM, b.kx.publicKeyRaw));
+    hub.peers.push(a, b, c, d);
+    for (const p of hub.peers) await p.coord.joined(0);
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    for (const p of hub.peers) await expect(p.coord.tick()).resolves.toBeUndefined();
+    await hub.flush();
+    expect(a.keyring.current.epoch).toBe(1);
+    expect(d.keyring.current.epoch).toBe(1);
+    expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
+    expect(b.keyring.current.epoch).toBe(0);
+    expect(b.rejoined).toBe(1);
+  });
 });
