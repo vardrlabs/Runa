@@ -1,12 +1,13 @@
 import { FrameCipher, decryptEnvelope } from "../crypto/aead";
 import type { Identity } from "../crypto/identity";
+import type { Keyring } from "../epoch/keyring";
+import { EPOCH_OVERLAP_MS } from "../epoch/rotation";
 import {
   concatBytes,
   encodeHeader,
   FT,
   HEADER_LEN,
   PROTOCOL_VERSION,
-  buildFrame,
   buildJsonFrame,
   parseFrame,
   stripEnvelope,
@@ -18,7 +19,19 @@ export interface RosterEntry {
   peerId: Uint8Array;
   pubkey?: Uint8Array;
   joinedAtSeq: number;
+  /// The peer's ECDH P-256 key and its signature over it (amendment J), as
+  /// the server relayed them. Unverified here; the coordinator checks them.
+  kxPub?: Uint8Array;
+  kxSig?: Uint8Array;
 }
+
+export type WireRoster = {
+  peer_id: string;
+  pubkey?: string;
+  joined_at_seq: number;
+  kx_pubkey?: string | null;
+  kx_sig?: string | null;
+}[];
 
 export interface JoinAck {
   peer_id: string;
@@ -34,7 +47,7 @@ export interface JoinAck {
   ceiling_optout: boolean;
   kdf: { alg: string; m_kib: number; t: number; p: number; salt: string };
   config_blob?: string;
-  roster: { peer_id: string; pubkey?: string; joined_at_seq: number }[];
+  roster: WireRoster;
   /// True when the server acknowledges every DOC_UPDATE it stores. A server
   /// that predates acks omits it, and its updates are sent once and trusted.
   acks?: boolean;
@@ -47,9 +60,10 @@ export interface JoinAck {
   /// Which log the room has. It changes only when the room was brought back
   /// after a restart with a new, empty one (amendment I).
   log_id?: string;
+  /// The epoch of the room's current root (amendment J). Absent from a
+  /// server that predates it, which means 0.
+  root_epoch?: number;
 }
-
-export type WireRoster = { peer_id: string; pubkey?: string; joined_at_seq: number }[];
 
 export interface SocketEvents {
   onJoinAck(ack: JoinAck): void;
@@ -66,6 +80,8 @@ export interface SocketEvents {
   /// can no longer be compacted.
   onSnapshotTooLarge(bytes: number): void;
   onEpochStale(epoch: number): void;
+  /// An EPOCH_KEY, unopened: the coordinator verifies and applies it.
+  onEpochKey?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
   onDisconnected(): void;
   /// This many of our document frames are now in the room log — or, against
   /// a server without acks, have been sent. The snapshot index is estimated
@@ -92,7 +108,15 @@ export interface SocketOptions {
   roomId: Uint8Array;
   authKey: Uint8Array;
   identity: Identity;
-  contentKey: CryptoKey;
+  /// Every epoch key this member holds (amendment J). The socket encrypts
+  /// under the epoch it last adopted and reads each frame under the key of
+  /// the epoch in that frame's header.
+  keyring: Keyring;
+  /// This session's key-agreement key and the session's signature over it,
+  /// sent in JOIN.
+  kx: { publicKeyRaw: Uint8Array; sig: Uint8Array };
+  /// How long frames from the epoch just left are still read. Tests shorten it.
+  epochOverlapMs?: number;
   events: SocketEvents;
   insecureAllowed?: boolean;
   maxBackoffMs?: number;
@@ -259,6 +283,14 @@ export class RunaSocket {
   private maxBackoffMs: number;
   private closedByUs = false;
   private epoch = 0;
+  /// The room's epoch, from JOIN_ACK and from every step adopted since.
+  private roomEpoch = 0;
+  /// When this socket started sending under its current epoch.
+  private switchedAt = 0;
+  /// The room is at an epoch this member holds no key for, or the server has
+  /// fallen behind this member. Nothing encrypted is sent until a step or a
+  /// handover settles it (amendment J).
+  private awaitingKeys = false;
   private peerId: Uint8Array = new Uint8Array(16);
   private joined = false;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -292,7 +324,8 @@ export class RunaSocket {
 
   constructor(private opts: SocketOptions) {
     this.maxBackoffMs = opts.maxBackoffMs ?? 15_000;
-    this.cipher = new FrameCipher(opts.contentKey, opts.identity.publicKeyRaw);
+    this.cipher = new FrameCipher(opts.keyring.current.contentKey, opts.identity.publicKeyRaw);
+    this.epoch = opts.keyring.current.epoch;
     this.events = opts.events;
   }
 
@@ -304,8 +337,61 @@ export class RunaSocket {
     return this.epoch;
   }
 
-  setEpoch(epoch: number): void {
+  get serverEpoch(): number {
+    return this.roomEpoch;
+  }
+
+  get isAwaitingKeys(): boolean {
+    return this.awaitingKeys;
+  }
+
+  /// Start encrypting under `epoch`, which the keyring now holds as current.
+  /// A new key gets a new cipher, so its nonce stream starts fresh; a cipher
+  /// is never rebuilt for a key it has already used, which would repeat nonces.
+  adoptEpoch(epoch: number): void {
+    const keys = this.opts.keyring.current;
+    if (keys.epoch !== epoch || epoch === this.epoch) return;
+    // Before JOIN_ACK the sender label is this session's public key, so receivers refuse
+    // anything sent early; JOIN_ACK relabels it with bindPeerId.
+    this.cipher = new FrameCipher(keys.contentKey, this.joined ? this.peerId : this.opts.identity.publicKeyRaw);
     this.epoch = epoch;
+    this.switchedAt = performance.now();
+    if (epoch >= this.roomEpoch) {
+      this.roomEpoch = epoch;
+      this.awaitingKeys = false;
+    }
+    void this.pump();
+  }
+
+  epochKeyHeader(epoch: number): Uint8Array {
+    return encodeHeader({
+      version: PROTOCOL_VERSION,
+      frameType: FT.EPOCH_KEY,
+      roomId: this.opts.roomId,
+      epoch,
+      nonceSess: new Uint8Array(4),
+      flags: 0,
+    });
+  }
+
+  /// Returns whether it went out.
+  sendEpochKey(header: Uint8Array, body: Uint8Array): boolean {
+    if (!this.joined) return false;
+    return this.rawSend(concatBytes(header, body));
+  }
+
+  /// Drop this connection and join again, to be handed the room's keys as a
+  /// newcomer. For a member that saw the room move to an epoch it cannot follow.
+  reconnectNow(): void {
+    this.abandonConnection();
+  }
+
+  private isStale(frameEpoch: number): boolean {
+    // Only an epoch below the one this socket sends under can be stale. One above it is
+    // live: the keyring has moved on and the adoption has not run yet.
+    if (frameEpoch >= this.epoch) return false;
+    const overlap = this.opts.epochOverlapMs ?? EPOCH_OVERLAP_MS;
+    return !(frameEpoch === this.epoch - 1 && performance.now() - this.switchedAt < overlap);
   }
 
   async connect(): Promise<void> {
@@ -346,7 +432,8 @@ export class RunaSocket {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this.backoffMs = Math.min(this.backoffMs * 2, this.maxBackoffMs);
-      this.cipher = new FrameCipher(this.opts.contentKey, this.opts.identity.publicKeyRaw);
+      this.cipher = new FrameCipher(this.opts.keyring.current.contentKey, this.opts.identity.publicKeyRaw);
+      this.epoch = this.opts.keyring.current.epoch;
       void this.connect().catch(() => this.scheduleReconnect());
     }, this.backoffMs + jitter);
   }
@@ -433,7 +520,8 @@ export class RunaSocket {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.cipher = new FrameCipher(this.opts.contentKey, this.opts.identity.publicKeyRaw);
+    this.cipher = new FrameCipher(this.opts.keyring.current.contentKey, this.opts.identity.publicKeyRaw);
+    this.epoch = this.opts.keyring.current.epoch;
     void this.connect().catch(() => this.scheduleReconnect());
   }
 
@@ -490,7 +578,7 @@ export class RunaSocket {
   dropKeys(): void {
     this.closedByUs = true;
     this.discardQueues();
-    (this.opts as unknown as { contentKey: CryptoKey | null }).contentKey = null;
+    this.opts.keyring.wipe();
   }
 
   private async sendJoin(): Promise<void> {
@@ -504,6 +592,8 @@ export class RunaSocket {
       acks: true,
       indexed: true,
       heartbeat: true,
+      kx_pubkey: toB64(this.opts.kx.publicKeyRaw),
+      kx_sig: toB64(this.opts.kx.sig),
     };
     keyCopy.fill(0);
     const frame = buildJsonFrame(FT.JOIN, this.opts.roomId, this.epoch, body);
@@ -532,7 +622,15 @@ export class RunaSocket {
       header.frameType === FT.RESTART_NOTICE ||
       header.frameType === FT.RESTART_TICKET ||
       header.frameType === FT.PONG;
-    if (!isServerEvent && header.epoch < this.epoch) {
+    // Presence and shred traffic is live-only, so a copy from before the
+    // overlap is stale and said so. Stored entries are not checked here: a
+    // replayed log spans epochs, and each is read under its own key below.
+    const liveOnly =
+      header.frameType === FT.AWARENESS ||
+      header.frameType === FT.SHRED_REQUEST ||
+      header.frameType === FT.SHRED_VOTE ||
+      header.frameType === FT.SHRED_CANCEL;
+    if (!isServerEvent && liveOnly && this.opts.keyring.has(header.epoch) && this.isStale(header.epoch)) {
       this.events.onEpochStale(header.epoch);
       return;
     }
@@ -549,7 +647,14 @@ export class RunaSocket {
       }
       this.joined = true;
       this.restartTicket = null;
-      this.epoch = ack.epoch ?? 0;
+      // Ahead of this member: a member must hand it the key. Behind: the
+      // server has lost track of the room's rotations, and sending under an
+      // older key would hand new writing to whoever left. Either way, hold.
+      this.roomEpoch = typeof ack.epoch === "number" ? ack.epoch : 0;
+      // Compared with the epoch the cipher sends under, not the keyring's: a
+      // keyring that advanced before adoptEpoch ran must not send under a key
+      // the room has left.
+      this.awaitingKeys = this.roomEpoch !== this.epoch;
       // The AEAD sender component must be the server-assigned 16-byte peer id
       // (what receivers read from the envelope), not our public key. Re-label
       // in place: the nonce stream must never restart.
@@ -618,6 +723,12 @@ export class RunaSocket {
       } catch {
         /* malformed error frame: treat as a protocol error */
       }
+      if (code === 4006) {
+        // A frame of ours was refused for its epoch. Joining again resends everything not yet stored, and
+        // waits for a handover if the room has moved on (amendment J).
+        this.abandonConnection();
+        return;
+      }
       // 4001 covers "wrong key" and "no such room" — both are terminal. Left
       // to reconnect, a purged room turned every open tab into a client that
       // hammered the server every 15 seconds indefinitely.
@@ -657,8 +768,20 @@ export class RunaSocket {
     }
     if (header.frameType === FT.PEER_JOIN) {
       try {
-        const j = JSON.parse(textDecoder.decode(parsed.body)) as { peer_id: string; pubkey?: string; joined_at_seq: number };
-        this.events.onPeerJoin({ peerId: fromB64(j.peer_id), pubkey: j.pubkey ? fromB64(j.pubkey) : undefined, joinedAtSeq: j.joined_at_seq });
+        const j = JSON.parse(textDecoder.decode(parsed.body)) as {
+          peer_id: string;
+          pubkey?: string;
+          joined_at_seq: number;
+          kx_pubkey?: string | null;
+          kx_sig?: string | null;
+        };
+        this.events.onPeerJoin({
+          peerId: fromB64(j.peer_id),
+          pubkey: j.pubkey ? fromB64(j.pubkey) : undefined,
+          joinedAtSeq: j.joined_at_seq,
+          kxPub: j.kx_pubkey ? fromB64(j.kx_pubkey) : undefined,
+          kxSig: j.kx_sig ? fromB64(j.kx_sig) : undefined,
+        });
       } catch {
         return;
       }
@@ -683,6 +806,15 @@ export class RunaSocket {
     if (!env) return;
     const { senderId } = env;
 
+    if (header.frameType === FT.EPOCH_KEY) {
+      this.events.onEpochKey?.(bytes.slice(0, HEADER_LEN), header.epoch, senderId, env.body);
+      return;
+    }
+    // An epoch this member holds no key for is read from the log later, once
+    // a member hands the key over; it is not counted as taken meanwhile.
+    const key = this.opts.keyring.keyFor(header.epoch);
+    if (!key) return;
+
     switch (header.frameType) {
       case FT.DOC_UPDATE: {
         // Against a server sending indexes, the entry's log index sits
@@ -698,7 +830,7 @@ export class RunaSocket {
         }
         let taken: number[];
         try {
-          const pt = await decryptEnvelope(this.opts.contentKey, bytes.slice(0, HEADER_LEN), senderId, body);
+          const pt = await decryptEnvelope(key, bytes.slice(0, HEADER_LEN), senderId, body);
           const accepted = this.acceptPlaintext(pt, index);
           if (accepted.whole) this.events.onDocUpdate(senderId, accepted.whole);
           taken = accepted.taken;
@@ -716,7 +848,7 @@ export class RunaSocket {
         const covers = snapshotCoversOf(env.body);
         try {
           const pt = await decryptEnvelope(
-            this.opts.contentKey,
+            key,
             bytes.slice(0, HEADER_LEN),
             senderId,
             env.body.slice(8),
@@ -731,7 +863,7 @@ export class RunaSocket {
       case FT.AWARENESS: {
         try {
           const pt = await decryptEnvelope(
-            this.opts.contentKey,
+            key,
             bytes.slice(0, HEADER_LEN),
             senderId,
             env.body,
@@ -744,11 +876,10 @@ export class RunaSocket {
       }
       case FT.SHRED_REQUEST:
       case FT.SHRED_VOTE:
-      case FT.SHRED_CANCEL:
-      case FT.EPOCH_KEY: {
+      case FT.SHRED_CANCEL: {
         try {
           const pt = await decryptEnvelope(
-            this.opts.contentKey,
+            key,
             bytes.slice(0, HEADER_LEN),
             senderId,
             env.body,
@@ -765,13 +896,18 @@ export class RunaSocket {
   }
 
   private handleAck(body: Uint8Array): void {
-    let parsed: { ok?: unknown; index?: unknown };
+    let parsed: { ok?: unknown; index?: unknown; epoch?: unknown };
     try {
-      parsed = JSON.parse(textDecoder.decode(body)) as { ok?: unknown; index?: unknown };
+      parsed = JSON.parse(textDecoder.decode(body)) as { ok?: unknown; index?: unknown; epoch?: unknown };
     } catch {
       return;
     }
     const ok = parsed.ok === true;
+    if (!ok && typeof parsed.epoch === "number") {
+      // Refused for its epoch, not because the log is full. See ERROR 4006.
+      this.abandonConnection();
+      return;
+    }
     const index = parsed.index;
     // Our own update is in our own document already, so its entry is taken
     // in the moment the server says where it went.
@@ -876,7 +1012,7 @@ export class RunaSocket {
   /// server, which cannot tell, stores a document update in the log for good
   /// and would compact history under a snapshot nobody can read.
   private canSendDocuments(): boolean {
-    return this.joined && this.ws?.readyState === WebSocket.OPEN;
+    return this.joined && !this.awaitingKeys && this.ws?.readyState === WebSocket.OPEN;
   }
 
   /// Queue an update for the room. It is sent once the connection is joined,
@@ -1053,7 +1189,9 @@ export class RunaSocket {
     const body = new Uint8Array(8 + envelope.length);
     new DataView(body.buffer).setBigUint64(0, covers, false);
     body.set(envelope, 8);
-    const frame = buildFrame(FT.SNAPSHOT, this.opts.roomId, this.epoch, this.cipher.sess, body);
+    // The header sealed into the AAD, not a fresh one: an epoch adopted while
+    // the encrypt was awaited must not relabel a ciphertext made under the old key.
+    const frame = concatBytes(header, body);
     if (frame.length > this.limits.maxFrameBytes) {
       // Skipping leaves the log uncompacted, which is a slow problem.
       // Sending it closes the connection, which is an immediate one.

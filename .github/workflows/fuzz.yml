@@ -58,3 +58,4 @@ jobs:
           cargo +nightly fuzz run room_name       -- -max_total_time=300
           cargo +nightly fuzz run log_compaction  -- -max_total_time=900
           cargo +nightly fuzz run create_body     -- -max_total_time=900
+          cargo +nightly fuzz run epoch_advance   -- -max_total_time=300

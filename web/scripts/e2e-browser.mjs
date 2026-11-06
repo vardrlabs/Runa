@@ -107,6 +107,102 @@ async function probeDocument(page) {
   ]);
 }
 
+const INFO_CONTENT_E2E = INFO_CONTENT;
+
+/// Wait until a page's preview contains `needle`.
+async function waitForPreview(page, needle, label, ms = 30_000) {
+  const until = Date.now() + ms;
+  for (;;) {
+    const text = await page.evaluate(() => document.querySelector(".pane-preview .preview-body")?.textContent ?? "");
+    if (text.includes(needle)) return;
+    if (Date.now() > until) throw new Error(`[${label}] never showed "${needle}"; preview: "${text.slice(0, 200)}"`);
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
+/// A peer that is not a browser: it joins with the link's key the way a
+/// departed member who kept the link would, and can fetch the room's log and
+/// try to open each entry with the epoch-0 key (PROTOCOL amendment J).
+async function rawPeer(roomIdHex, linkKey, linkSalt) {
+  const authKey = await hkdf(linkKey, linkSalt, INFO_AUTH, 32);
+  const contentRaw = await hkdf(linkKey, linkSalt, INFO_CONTENT_E2E, 32);
+  const content0 = await crypto.subtle.importKey("raw", contentRaw, { name: "AES-GCM" }, false, ["decrypt"]);
+  const roomId = Buffer.from(roomIdHex, "hex");
+  const ws = new WebSocket(`${BASE.replace("http", "ws")}/socket/${roomIdHex}`);
+  ws.binaryType = "arraybuffer";
+  const frames = [];
+  let onFrame = null;
+  ws.onmessage = (ev) => {
+    const b = new Uint8Array(ev.data);
+    frames.push(b);
+    onFrame?.(b);
+  };
+  const header = (ft) => {
+    const h = new Uint8Array(32);
+    h.set([0x52, 0x55, 0x01, ft]);
+    h.set(roomId, 4);
+    return h;
+  };
+  const send = (ft, obj) => ws.send(Buffer.concat([header(ft), Buffer.from(JSON.stringify(obj))]));
+  const joined = new Promise((resolve, reject) => {
+    // A well-formed key-agreement key with a signature nobody can verify: the
+    // server lets it into a rotated room, and no member ever wraps a secret
+    // for it, which is what the scenarios need.
+    const kxPub = new Uint8Array(65);
+    kxPub[0] = 0x04;
+    crypto.getRandomValues(kxPub.subarray(1));
+    ws.onopen = () =>
+      send(0x01, {
+        auth_key: b64(authKey),
+        pubkey: b64(crypto.getRandomValues(new Uint8Array(32))),
+        kx_pubkey: b64(kxPub),
+        kx_sig: b64(crypto.getRandomValues(new Uint8Array(64))),
+        client_version: "e2e-raw",
+      });
+    onFrame = (b) => {
+      if (b[3] === 0x02) resolve();
+      if (b[3] === 0x30) reject(new Error(`raw peer refused: ${Buffer.from(b.slice(32)).toString()}`));
+    };
+    ws.onerror = () => reject(new Error("raw peer socket error"));
+    setTimeout(() => reject(new Error("raw peer join timed out")), 10_000);
+  });
+  return {
+    joined,
+    content0,
+    close: () => ws.close(),
+    async syncAll() {
+      const start = frames.length;
+      send(0x04, { from_index: 0 });
+      await new Promise((r) => setTimeout(r, 2_000));
+      return frames
+        .slice(start)
+        .filter((b) => b[3] === 0x03 || b[3] === 0x21)
+        .map((b) => ({
+          epoch: new DataView(b.buffer, b.byteOffset).getUint32(20, false),
+          async openWith(key) {
+            const head = b.slice(0, 32);
+            const sender = b.slice(32, 48);
+            let body = b.slice(48);
+            let covers = new Uint8Array(8);
+            if (b[3] === 0x21) {
+              covers = body.slice(0, 8);
+              body = body.slice(8);
+            }
+            const counter = body.slice(4, 12);
+            const iv = Buffer.concat([body.slice(0, 4), counter]);
+            const aad = Buffer.concat([Buffer.from("runa/v1"), head, sender, counter, covers]);
+            try {
+              await crypto.subtle.decrypt({ name: "AES-GCM", iv, additionalData: aad, tagLength: 128 }, key, body.slice(12));
+              return true;
+            } catch {
+              return false;
+            }
+          },
+        }));
+    },
+  };
+}
+
 /// Supersede a stranded navigation with a full round trip: leave the page, then
 /// load the room again.
 ///
@@ -375,6 +471,85 @@ async function main() {
       throw new Error("[highest] the recipient's address kept the key");
     }
     await recipient.close();
+  }
+
+  // Key rotation (PROTOCOL amendment J). Three peers in a Highest room; one
+  // leaves. Sixty seconds later the room's key changes, the departed peer's
+  // epoch-0 key no longer opens anything written afterwards, and a newcomer is
+  // handed the keys and reads the whole history.
+  {
+    const a = await makePage("rotation-a");
+    await a.addInitScript(() => {
+      window.__copied = [];
+      const write = (t) => {
+        window.__copied.push(t);
+        return Promise.resolve();
+      };
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: write } });
+    });
+    await gotoPage(a, "rotation-a", `${BASE}/`);
+    await a.waitForSelector("#security", { timeout: 10_000 });
+    await a.selectOption("#security", "highest");
+    await a.click('button:has-text("Create private room")');
+    await a.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await a.click('.statusbar-actions button:has-text("Copy link")');
+    const link = await a.evaluate(() => window.__copied.at(-1));
+    const m = /\/r\/([0-9a-f]{32})#k=([^&]+)&s=(.+)$/.exec(link ?? "");
+    if (!m) throw new Error(`[rotation] Copy link gave no whole link: ${link}`);
+    const [, rid, k64, s64] = m;
+    const linkKey = Buffer.from(k64, "base64url");
+    const linkSalt = Buffer.from(s64, "base64url");
+
+    await a.waitForSelector("textarea.inputarea", { state: "attached", timeout: 15_000 });
+    await a.click(".monaco-editor .view-lines");
+    await a.keyboard.type("before-rotation ");
+
+    const b = await makePage("rotation-b");
+    await gotoPage(b, "rotation-b", link);
+    await b.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(b, "before-rotation", "rotation-b");
+
+    // The third peer joins, proves its epoch-0 key opens the log, and leaves.
+    const departed = await rawPeer(rid, linkKey, linkSalt);
+    await departed.joined;
+    const early = await departed.syncAll();
+    const opensEarly = (await Promise.all(early.map((e) => e.openWith(departed.content0)))).some(Boolean);
+    if (!opensEarly) throw new Error("[rotation] the departed peer's key opened nothing even before it left; the check below would prove nothing");
+    departed.close();
+
+    // 60 s of grace, then the longest-connected member steps.
+    await new Promise((r) => setTimeout(r, 65_000));
+    await a.click(".monaco-editor .view-lines");
+    await a.keyboard.press("End");
+    await a.keyboard.type("after-rotation ");
+    await waitForPreview(b, "after-rotation", "rotation-b");
+
+    const spy = await rawPeer(rid, linkKey, linkSalt);
+    await spy.joined;
+    const entries = await spy.syncAll();
+    spy.close();
+    if (!entries.some((e) => e.epoch >= 1)) {
+      throw new Error(`[rotation] no entry from after the rotation; epochs seen: ${[...new Set(entries.map((e) => e.epoch))]}`);
+    }
+    for (const e of entries) {
+      if (e.epoch >= 1 && (await e.openWith(departed.content0))) {
+        throw new Error(`[rotation] the departed peer's key opened an entry from epoch ${e.epoch}`);
+      }
+    }
+
+    for (const [label, page] of [["rotation-a", a], ["rotation-b", b]]) {
+      const alarms = await page.$$eval('.banner[role="alert"]', (els) => els.map((e) => e.textContent));
+      if (alarms.some((t) => /key change|list of people|lost track/.test(t))) {
+        throw new Error(`[${label}] showed a key alarm after an honest rotation: ${alarms.join(" | ")}`);
+      }
+    }
+
+    const c = await makePage("rotation-c");
+    await gotoPage(c, "rotation-c", link);
+    await c.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(c, "before-rotation", "rotation-c", 45_000);
+    await waitForPreview(c, "after-rotation", "rotation-c");
+    for (const p of [a, b, c]) await p.close();
   }
 
   const landing = await makePage("landing");
@@ -1639,6 +1814,7 @@ async function main() {
   console.log(`BROWSER E2E OK (${ENGINE_NAME})`);
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
+  console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
   console.log(`  shared rooms: highest keeps the name out of the address; everyday takes it after joining`);
   console.log(`  two headless peers joined ${roomIdHex.slice(0, 8)}…`);
   console.log(`  typed concurrently; Alice's preview converged to include Bob's text`);

@@ -86,6 +86,7 @@ function JoinableRoom(props: RoomProps) {
   // refresh forgets it. Said once, so nobody refreshes and is locked out.
   const [highestNotice, setHighestNotice] = useState(false);
   const [historyPressure, setHistoryPressure] = useState<string | null>(null);
+  const [keyStatus, setKeyStatus] = useState<{ text: string; alarming: boolean } | null>(null);
   const [tally, setTally] = useState<{ approved: number; total: number; waitingOn?: string } | null>(null);
   const [diverged, setDiverged] = useState(false);
   // A restart the server has announced, as a deadline on this page's clock.
@@ -207,7 +208,7 @@ function JoinableRoom(props: RoomProps) {
       roomSalt: Uint8Array;
     }) => {
       setPhase({ kind: "connecting" });
-      const { authKey, contentKey } = await deriveRoomKeys(
+      const { authKey, contentKey, chainKey } = await deriveRoomKeys(
         args.passMaterial,
         args.linkSecret,
         args.roomSalt,
@@ -219,6 +220,7 @@ function JoinableRoom(props: RoomProps) {
           roomIdHex: args.roomIdHex,
           authKey,
           contentKey,
+          chainKey,
           insecureAllowed: plainWebSocketAllowed(window.location),
           restoreRoom: (ticket) => api.restoreRoom(ticket),
         },
@@ -286,6 +288,7 @@ function JoinableRoom(props: RoomProps) {
             );
           },
           onHistoryPressure: (m) => setHistoryPressure(m),
+          onKeyStatus: (m, alarming) => setKeyStatus(m ? { text: m, alarming } : null),
           onDivergence: (d) => setDiverged(d),
           onPurge: () => setPhase({ kind: "purged" }),
           onRoomUnavailable: () => setPhase({ kind: "unavailable" }),
@@ -679,6 +682,11 @@ function JoinableRoom(props: RoomProps) {
         <div className="banner" role="alert">
           <span className="error-text">{historyPressure}</span>
           <button onClick={() => setHistoryPressure(null)}>Dismiss</button>
+        </div>
+      )}
+      {keyStatus && (
+        <div className="banner" role={keyStatus.alarming ? "alert" : "status"}>
+          <span className={keyStatus.alarming ? "error-text" : undefined}>{keyStatus.text}</span>
         </div>
       )}
       {ttlMismatch && (

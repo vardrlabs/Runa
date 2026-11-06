@@ -3,6 +3,10 @@ import { toB64, fromB64 } from "../transport/socket";
 export interface RosterEntry {
   peerId: Uint8Array;
   pubkey?: Uint8Array;
+  /// Key-agreement key and its signature (amendment J). The canonical bytes
+  /// ignore them, so roster hashes do not change.
+  kxPub?: Uint8Array;
+  kxSig?: Uint8Array;
   joinedAtSeq: number;
 }
 

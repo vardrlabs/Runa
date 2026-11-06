@@ -434,6 +434,9 @@ pub async fn restore_room(
     let Some(id) = parse_room_hex(&ticket.id) else {
         return code_response(StatusCode::BAD_REQUEST, "TICKET_INVALID");
     };
+    if ticket.root_epoch > ticket.epoch {
+        return code_response(StatusCode::BAD_REQUEST, "TICKET_INVALID");
+    }
     let as_create = CreateRoomBody {
         id: None,
         name: ticket.name.clone(),
@@ -475,6 +478,8 @@ pub async fn restore_room(
         state.cfg.max_log_bytes,
         state.cfg.auth_attempts_per_room_per_min,
         state.cfg.max_peers_per_room,
+        ticket.epoch,
+        ticket.root_epoch,
     ) {
         Ok(RestoreOutcome::Restored(_)) => {
             // A valid ticket is not a guess; see the refund after a join.

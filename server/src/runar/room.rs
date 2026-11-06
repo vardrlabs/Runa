@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::runar::epoch::{Admit, EpochState, Offer};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -45,17 +47,28 @@ pub enum RoomState {
     Dead,
 }
 
+/// A peer's key-agreement key and the peer's signature over it (amendment J).
+/// Opaque to the server, which checks only their lengths; peers verify the
+/// signature against the peer's signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerKx {
+    pub pubkey: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RosterEntry {
     pub peer_id: [u8; 16],
     /// Raw public key bytes: 32 B Ed25519 or 65 B uncompressed ECDSA P-256.
     pub pubkey: Option<Vec<u8>>,
+    pub kx: Option<PeerKx>,
     pub joined_at_seq: u64,
 }
 
 pub struct ConnectedPeer {
     pub peer_id: [u8; 16],
     pub pubkey: Option<Vec<u8>>,
+    pub kx: Option<PeerKx>,
     pub joined_at_seq: u64,
     pub tx: PeerTx,
 }
@@ -76,6 +89,10 @@ pub struct PeerTx {
     /// This connection asked for the log index of every DOC_UPDATE relayed to
     /// it (amendment H).
     pub indexed: bool,
+    /// Set when the next ERROR frame queued for this connection is its last:
+    /// the writer closes the connection after sending it, the way it does
+    /// after a PURGE or RESTART_TICKET.
+    close_after_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerTx {
@@ -85,7 +102,22 @@ impl PeerTx {
             queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes,
             indexed: false,
+            close_after_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Queue `error` and close the connection once the writer has sent it.
+    pub fn send_final_error(&self, error: Bytes) -> Result<(), PeerBacklogged> {
+        self.close_after_error.store(true, Ordering::SeqCst);
+        self.try_send(error)
+    }
+
+    /// The flag `send_final_error` sets. The connection's writer holds this
+    /// and never a `PeerTx`: a second `Sender` kept alive for the
+    /// connection's life would stop `recv()` from returning `None` when the
+    /// room drops a backlogged peer, and that peer would stay connected.
+    pub fn close_flag(&self) -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        self.close_after_error.clone()
     }
 
     /// Relay DOC_UPDATEs to this connection with their log index.
@@ -252,7 +284,8 @@ pub struct Room {
     pub log: std::sync::RwLock<RoomLog>,
     pub peers: Mutex<Vec<ConnectedPeer>>,
     pub next_seq: AtomicU64,
-    pub epoch: AtomicU32,
+    /// The room's epoch and the epoch of its current root (amendment J).
+    epochs: Mutex<EpochState>,
     pub ttl_extension_secs: AtomicU64,
     /// Random per `Room` value, and so per log. A room brought back after a
     /// restart has the same id and a new, empty log; this is how a member
@@ -310,6 +343,9 @@ pub const MAX_TTL_EXTENSION_SECS: u64 = 720 * 3600;
 #[derive(Debug, PartialEq, Eq)]
 pub enum JoinError {
     Full,
+    /// The room has stepped to a new epoch and this peer sent no
+    /// key-agreement key, so it cannot be handed the key (amendment J).
+    Rotated,
     AuthLockedOut(Duration),
 }
 
@@ -377,7 +413,7 @@ impl Room {
             peers: Mutex::new(Vec::new()),
             max_peers,
             next_seq: AtomicU64::new(1),
-            epoch: AtomicU32::new(0),
+            epochs: Mutex::new(EpochState::new(0, 0)),
             ttl_extension_secs: AtomicU64::new(0),
             log_id: {
                 let mut b = [0u8; 8];
@@ -420,10 +456,24 @@ impl Room {
         *self.last_edit.lock().unwrap() = Instant::now();
     }
 
-    pub fn add_peer(&self, pubkey: Option<Vec<u8>>, tx: PeerTx) -> Result<RosterEntry, JoinError> {
+    pub fn add_peer(
+        &self,
+        pubkey: Option<Vec<u8>>,
+        kx: Option<PeerKx>,
+        tx: PeerTx,
+    ) -> Result<RosterEntry, JoinError> {
+        // Lock order, everywhere: `epochs`, then `peers`. The rotated-room
+        // check and the insert are one critical section against
+        // `step_epoch`, which advances the epoch and closes the peers
+        // without a key under the same two locks: a joiner is either in the
+        // list when the step closes the kx-less peers, or sees the new epoch.
+        let epochs = self.epochs.lock().unwrap();
         let mut peers = self.peers.lock().unwrap();
         if peers.len() >= self.max_peers {
             return Err(JoinError::Full);
+        }
+        if kx.is_none() && epochs.epoch() != epochs.root_epoch() {
+            return Err(JoinError::Rotated);
         }
         // No authentication check here. The caller has already authenticated
         // and already spent a slot doing it; checking again spent a second one
@@ -433,9 +483,10 @@ impl Room {
         let entry = RosterEntry {
             peer_id: generate_peer_id(seq),
             pubkey: pubkey.clone(),
+            kx: kx.clone(),
             joined_at_seq: seq,
         };
-        peers.push(ConnectedPeer { peer_id: entry.peer_id, pubkey, joined_at_seq: seq, tx });
+        peers.push(ConnectedPeer { peer_id: entry.peer_id, pubkey, kx, joined_at_seq: seq, tx });
         Ok(entry)
     }
 
@@ -460,8 +511,88 @@ impl Room {
             .lock()
             .unwrap()
             .iter()
-            .map(|p| RosterEntry { peer_id: p.peer_id, pubkey: p.pubkey.clone(), joined_at_seq: p.joined_at_seq })
+            .map(|p| RosterEntry {
+                peer_id: p.peer_id,
+                pubkey: p.pubkey.clone(),
+                kx: p.kx.clone(),
+                joined_at_seq: p.joined_at_seq,
+            })
             .collect()
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epochs.lock().unwrap().epoch()
+    }
+
+    pub fn root_epoch(&self) -> u32 {
+        self.epochs.lock().unwrap().root_epoch()
+    }
+
+    /// Decide an EPOCH_KEY and enqueue it, in one critical section.
+    ///
+    /// The decision (`EpochState::offer`) and the fan-out happen while the
+    /// epochs lock is held, so two steps racing for the same epoch reach every
+    /// peer in the order the room decided them: the winner's copy is queued
+    /// before any relay of a loser's, and no peer is wrapped in a step the
+    /// room has already superseded. The fan-out is `try_send`, so nothing
+    /// awaits under the lock.
+    ///
+    /// Lock order is `epochs` then `peers` (see `add_peer`).
+    ///
+    /// * `Advanced`: peers without a key-agreement key get `kx_less_error`
+    ///   and are closed after it (they cannot be handed the new key); then
+    ///   every peer, the sender included, gets the frame with the sender
+    ///   envelope, so a sender learns its step won the way everyone does.
+    /// * `Handover`: every peer except the sender gets it, enveloped.
+    /// * `Refused`: nothing is sent.
+    pub fn step_epoch(
+        &self,
+        header_epoch: u32,
+        now: Instant,
+        min_interval: Duration,
+        frame: &Bytes,
+        sender: [u8; 16],
+        kx_less_error: &Bytes,
+    ) -> Offer {
+        let mut epochs = self.epochs.lock().unwrap();
+        let offer = epochs.offer(header_epoch, now, min_interval);
+        if offer == Offer::Refused {
+            return offer;
+        }
+        let outbound = envelop(frame, sender);
+        let mut dead = Vec::new();
+        {
+            let peers = self.peers.lock().unwrap();
+            if offer == Offer::Advanced {
+                for p in peers.iter().filter(|p| p.kx.is_none()) {
+                    if p.tx.send_final_error(kx_less_error.clone()).is_err() {
+                        dead.push(p.peer_id);
+                    }
+                }
+            }
+            for p in peers.iter() {
+                if offer == Offer::Handover && p.peer_id == sender {
+                    continue;
+                }
+                if p.tx.try_send(outbound.clone()).is_err() {
+                    dead.push(p.peer_id);
+                }
+            }
+        }
+        drop(epochs);
+        for id in dead {
+            self.remove_peer(&id);
+        }
+        offer
+    }
+
+    pub fn admit_epoch(&self, frame_epoch: u32, now: Instant, overlap: Duration) -> Admit {
+        self.epochs.lock().unwrap().admit(frame_epoch, now, overlap)
+    }
+
+    /// Set a room brought back from a restart ticket to the epochs it had.
+    pub fn restore_epochs(&self, epoch: u32, root_epoch: u32) {
+        *self.epochs.lock().unwrap() = EpochState::new(epoch, root_epoch);
     }
 
     /// Fan out a **server-authored** frame verbatim. PROTOCOL.md amendment C
@@ -959,6 +1090,8 @@ impl RoomRegistry {
         log_max_bytes: u64,
         auth_max: u32,
         max_peers: usize,
+        epoch: u32,
+        root_epoch: u32,
     ) -> Result<RestoreOutcome, RestoreError> {
         if let Some(n) = name {
             names::validate(n).map_err(|_| RestoreError::NameInvalid)?;
@@ -1007,6 +1140,7 @@ impl RoomRegistry {
         ));
         room.ttl_extension_secs
             .store(ttl_extension_secs.min(MAX_TTL_EXTENSION_SECS), Ordering::SeqCst);
+        room.restore_epochs(epoch, root_epoch);
         slot.insert(room.clone());
         Ok(RestoreOutcome::Restored(room))
     }
@@ -1215,7 +1349,7 @@ mod auth_throttle_tests {
         };
         room.auth_success("198.51.100.7");
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        room.add_peer(None, PeerTx::new(tx, 1 << 20)).expect("join");
+        room.add_peer(None, None, PeerTx::new(tx, 1 << 20)).expect("join");
         let after = {
             let mut n = 0;
             while room.auth_allowed("198.51.100.7") {
@@ -1302,7 +1436,57 @@ mod purge_ack_tests {
         let (tx, rx) = mpsc::channel(8);
         // Hold the receiver open for the lifetime of the test.
         std::mem::forget(rx);
-        room.add_peer(None, PeerTx::new(tx, 1 << 20)).unwrap().peer_id
+        room.add_peer(None, None, PeerTx::new(tx, 1 << 20)).unwrap().peer_id
+    }
+
+    fn kx() -> Option<PeerKx> {
+        Some(PeerKx { pubkey: vec![4u8; 65], sig: vec![1u8; 64] })
+    }
+
+    #[test]
+    fn a_rotated_room_refuses_a_joiner_without_a_key_and_takes_one_with() {
+        let r = room();
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(r.add_peer(None, None, PeerTx::new(tx, 1 << 20)).is_ok(), "epoch 0 admits it");
+        r.restore_epochs(1, 0);
+        let (tx, _rx) = mpsc::channel(8);
+        assert_eq!(
+            r.add_peer(None, None, PeerTx::new(tx, 1 << 20)).unwrap_err(),
+            JoinError::Rotated
+        );
+        assert_eq!(r.peer_count(), 1, "a refused joiner is not left in the list");
+        let (tx, _rx) = mpsc::channel(8);
+        assert!(r.add_peer(None, kx(), PeerTx::new(tx, 1 << 20)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_step_closes_peers_without_a_key_and_queues_in_decision_order() {
+        let r = room();
+        let t = Instant::now();
+        let none = Duration::ZERO;
+        let (tx_a, mut rx_a) = mpsc::channel(8);
+        let (tx_b, mut rx_b) = mpsc::channel(8);
+        let (tx_c, mut rx_c) = mpsc::channel(8);
+        let a = r.add_peer(None, kx(), PeerTx::new(tx_a, 1 << 20)).unwrap().peer_id;
+        let b = r.add_peer(None, kx(), PeerTx::new(tx_b, 1 << 20)).unwrap().peer_id;
+        r.add_peer(None, None, PeerTx::new(tx_c, 1 << 20)).unwrap();
+        let err = Bytes::from_static(b"ERR");
+        let win = Bytes::from(vec![0u8; 32]);
+        let lose = Bytes::from(vec![1u8; 32]);
+
+        assert_eq!(r.step_epoch(1, t, none, &win, a, &err), Offer::Advanced);
+        // The same-epoch step that lost is only ever a handover, after it.
+        assert_eq!(r.step_epoch(1, t, none, &lose, b, &err), Offer::Handover);
+
+        // A (the winner's sender) gets its own step, then the loser's relay.
+        assert_eq!(rx_a.recv().await.unwrap()[0], 0);
+        assert_eq!(rx_a.recv().await.unwrap()[0], 1);
+        // B gets the winner's step, and never its own loser as a relay.
+        assert_eq!(rx_b.recv().await.unwrap()[0], 0);
+        assert!(rx_b.try_recv().is_err());
+        // C had no key: the error comes first and then the step it lost.
+        assert_eq!(&rx_c.recv().await.unwrap()[..], b"ERR");
+        assert!(rx_c.try_recv().is_ok());
     }
 
     #[test]

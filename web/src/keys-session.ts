@@ -1,4 +1,5 @@
 import { deriveFromPassphrase, ARGON2_M_KIB, ARGON2_T, ARGON2_P } from "./crypto/kdf";
+import { deriveChainKey } from "./crypto/epoch";
 import { hkdfBits, INFO_AUTH, INFO_CONTENT, concatBytes } from "./crypto/keys";
 import type { SecurityLevel } from "./security-level";
 
@@ -90,6 +91,7 @@ function mergeMaterials(pass: Uint8Array | null, link: Uint8Array | null): Uint8
 export interface DerivedRoomKeys {
   authKey: Uint8Array;
   contentKey: CryptoKey;
+  chainKey: CryptoKey;
 }
 
 /// Single derivation point shared by creation and join so both sides compute
@@ -112,7 +114,8 @@ export async function deriveRoomKeys(
     ["encrypt", "decrypt"],
   );
   contentRaw.fill(0);
-  return { authKey, contentKey };
+  const chainKey = await deriveChainKey(ikm, roomSalt);
+  return { authKey, contentKey, chainKey };
 }
 
 export async function newIdentity(): Promise<Awaited<ReturnType<typeof import("./crypto/identity").generateIdentity>>> {

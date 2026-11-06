@@ -1,9 +1,9 @@
 # RÚNA Wire Protocol v1
 
 Normative reference for the frame format, handshake, and relay semantics.
-Normative reference for implementers. Six documented amendments appear at
-the bottom — additions the original design required implicitly but did not
-enumerate in its frame-type table.
+Normative reference for implementers. The amendments at the bottom record
+additions the original design required implicitly but did not enumerate in
+its frame-type table, and the features added since.
 
 ## Transport rules
 
@@ -25,7 +25,7 @@ enumerate in its frame-type table.
  2      1     version         0x01
  3      1     frame_type      see table
  4      16    room_id         128-bit internal id
- 20     4     epoch           u32 BE, rekey generation (field ships now; rekey is v1.1)
+ 20     4     epoch           u32 BE, rekey generation (amendment J)
  24     4     nonce_sess      first 4 bytes of this connection's nonce session id
  28     4     flags           bit0 padded, bit1 compressed, rest reserved 0
  --- body: see per-type table
@@ -40,23 +40,23 @@ Encrypted body = `counter` (8 B BE) `||` AES-256-GCM output `||` tag (16 B).
 
 | Value | Name | Dir | Body |
 |---|---|---|---|
-| 0x01 | JOIN | C→S | JSON `{auth_key_b64? (32 B), session_pubkey_b64 (32 B), client_version, acks?, indexed?, heartbeat?}` — amendments E, G, H |
-| 0x02 | JOIN_ACK | S→C | JSON `{peer_id, epoch, log_len, base_index, has_snapshot, ttl, elapsed_secs, ceiling_optout, kdf:{alg,m,t,p,salt_b64}, config_blob?, roster:[{peer_id,pubkey_b64,joined_at_seq}], acks?, limits?:{max_frame_bytes,frames_per_sec,bytes_per_sec}, indexed?, heartbeat?, log_id}` — amendments E, G, H, I |
+| 0x01 | JOIN | C→S | JSON `{auth_key_b64? (32 B), session_pubkey_b64 (32 B), client_version, acks?, indexed?, heartbeat?, kx_pubkey?, kx_sig?}`; amendments E, G, H, J |
+| 0x02 | JOIN_ACK | S→C | JSON `{peer_id, epoch, log_len, base_index, has_snapshot, ttl, elapsed_secs, ceiling_optout, kdf:{alg,m,t,p,salt_b64}, config_blob?, roster:[{peer_id,pubkey_b64,joined_at_seq,kx_pubkey?,kx_sig?}], acks?, limits?:{max_frame_bytes,frames_per_sec,bytes_per_sec}, indexed?, heartbeat?, log_id, root_epoch}`; amendments E, G, H, I, J |
 | 0x03 | DOC_UPDATE | both | encrypted Yjs update, or one part of a split one — amendment E |
 | 0x04 | DOC_SYNC_REQ | C→S | JSON `{from_index}` (index form; state vectors leak clocks and are not used) |
 | 0x05 | DOC_SYNC_RESP | S→C | one or more encrypted entries: snapshot blob then tail |
 | 0x06 | AWARENESS | both | encrypted JSON presence `{h, k, l, c, d?}`: handle, colour index 0–5, cursor line and column, and an optional 16-hex document hash. Receivers ignore `h` and derive the handle from the sender's roster public key, clamp `k`, `l` and `c`, and discard any `d` that is not 16 hex characters. Not the y-protocols awareness format. |
-| 0x07 | PEER_JOIN | S→C | JSON `{peer_id, pubkey_b64, joined_at_seq}` |
+| 0x07 | PEER_JOIN | S→C | JSON `{peer_id, pubkey_b64, joined_at_seq, kx_pubkey?, kx_sig?}`; amendment J |
 | 0x08 | PEER_LEAVE | S→C | JSON `{peer_id, reason}` |
-| 0x09 | **DOC_ACK** | S→C | JSON `{ok, index?}`, to the sender of each DOC_UPDATE, only if its JOIN asked — amendment E |
+| 0x09 | **DOC_ACK** | S→C | JSON `{ok, index?, epoch?}`, to the sender of each DOC_UPDATE, only if its JOIN asked; `epoch` only on a refusal for a stale epoch. Amendments E, J |
 | 0x10 | SHRED_REQUEST / SHRED_VOTE / SHRED_CANCEL (0x11, 0x12) | both | encrypted canonical-CBOR payload + Ed25519 signature over CBOR. No count fields exist anywhere. |
 | 0x13 | PURGE | S→C | JSON `{reason}` tombstone signal |
 | 0x14 | **PURGE_ACK** | C→S | JSON `{request_id}` — amendment A, below |
 | 0x15 | **RESTART_NOTICE** | S→C | JSON `{in_secs, handover}`: the process stops in this many seconds; `handover` says whether rooms will carry over — amendments F, I |
 | 0x16 | **RESTART_TICKET** | S→C | JSON `{ticket}`, sent as the process stops; the connection is then closed with 1012 — amendment I |
 | 0x17 | **PING** | C→S | JSON `{}`, only on a connection whose JOIN asked for `heartbeat` — amendment G |
-| 0x18 | **PONG** | S→C | JSON `{roster:[{peer_id,pubkey_b64,joined_at_seq}]}` — amendment G |
-| 0x20 | EPOCH_KEY | both | encrypted wrapped epoch secret (v1.1 consumer) |
+| 0x18 | **PONG** | S→C | JSON `{roster:[{peer_id,pubkey_b64,joined_at_seq,kx_pubkey?,kx_sig?}]}`; amendments G, J |
+| 0x20 | **EPOCH_KEY** | both | signed canonical-CBOR body holding one wrapped secret per recipient. The server reads only the header epoch; amendment J |
 | 0x22 | **TTL_EXTEND** | both | JSON `{add_secs}` C→S; server broadcasts `{added_by, add_secs, effective_secs, kind}` — amendment D |
 | 0x21 | **SNAPSHOT** | C→S | header ‖ `covers_up_to_index` u64 BE (8 B plaintext) ‖ encrypted blob — amendment B, below |
 | 0x30 | ERROR | S→C | JSON `{code}` |
@@ -112,6 +112,12 @@ known limits.
   nothing and understands nothing.
 - SHRED_*: relay verbatim to other peers (sender excluded). Count nothing,
   decide nothing.
+- EPOCH_KEY: a header epoch one above the room's advances the room to it, and
+  only the first such frame for that epoch does; a header epoch equal to the
+  room's is a handover and is relayed as it is; anything else is dropped. See
+  amendment J for the limits and the overlap window.
+- Any encrypted frame whose header epoch is below the room's is refused once
+  the overlap window has passed (amendment J).
 - PURGE_ACK: mark requester as acked for `{request_id}`; when every currently
   connected socket has acked the same id, execute surtr purge. An ack counts
   only while the peer that sent it is still connected, and the ledger is
@@ -301,6 +307,157 @@ members had shredded.
   with nobody in it at that moment still ends, as before.
 - Tickets are bearer tokens for recreating a room, not for entering one: the
   restored room holds the old verifier, so joining still takes the key.
+
+**J · Epochs, EPOCH_KEY (0x20) and key agreement.** The epoch field and the
+EPOCH_KEY frame type were in the first version of this protocol with nothing
+behind them. This amendment gives them meaning. What rotation claims is in the
+threat model's section on key rotation.
+
+*Key schedule.* A room's root is what it has always been: the link and
+passphrase material, from which `auth`, `content` and `fp` are derived. Epoch
+0 uses that `content` key, so a room that never rotates is unchanged. Next to it
+every member derives `chain_0 = HKDF(ikm, room_salt, "runa/v1/chain")`. To move
+from epoch n to n+1, a member draws a 32-byte random `epoch_secret` and every
+member computes, with `chain_n` as the HKDF key and the secret as the salt:
+
+```
+content_{n+1} = HKDF(chain_n, salt = epoch_secret, info = "runa/v1/epoch/content")   AES-256-GCM
+chain_{n+1}   = HKDF(chain_n, salt = epoch_secret, info = "runa/v1/epoch/chain")
+confirm_{n+1} = HKDF(chain_{n+1}, info = "runa/v1/epoch/confirm")                      16 bytes
+```
+
+Each frame is encrypted under the content key of the epoch in its header. A
+sender's nonce session and counter prefix are drawn fresh for every new key.
+A replayed log legitimately spans several epochs, so a client reads stored
+entries (DOC_UPDATE, SNAPSHOT) under whichever epoch's key it holds. It drops
+live-only frames (AWARENESS and the SHRED frames) from before the overlap
+window with the stale-epoch warning, and drops frames from an epoch it does not
+hold yet without counting them, since it will read them from the log once it
+has the key.
+
+*Key agreement.* JOIN carries `kx_pubkey`, an ECDH P-256 public key made for
+this session (65-byte uncompressed point, base64), and `kx_sig`, the session's
+signature over `"runa/v1/kx" || room_id || kx_pubkey`. Every peer uses P-256
+for this, whatever its signing algorithm, because two peers on different
+curves could not agree a key. The server checks only their lengths and that
+the key starts with 0x04, and relays both in JOIN_ACK's roster, PEER_JOIN and
+PONG. A receiver verifies `kx_sig` against the roster's signing key for that
+peer and treats a peer whose signature fails as one it cannot send keys to.
+
+A client that predates this amendment sends neither field and can never be
+handed a key. Restart tickets keep such tabs open across a deploy, so the
+server keeps them out of any room whose key has changed: a JOIN without
+`kx_pubkey` into a room whose epoch differs from its root epoch is refused
+with ERROR 4005, and when a room's epoch advances, every connection in it that
+joined without `kx_pubkey` is sent ERROR 4005 and closed with code 4005. Left
+in, such a client would lose its edits without saying so, and after a
+reconnect it would label frames with the room's epoch while encrypting them
+under the root key, which the person who left still holds. A room that has
+never rotated admits it as before.
+
+The key that wraps a secret for one recipient is
+`HKDF(ECDH(own kx, their kx), salt = room_id || epoch (u32 BE), info = "runa/v1/epoch-wrap" || sender_peer_id || recipient_peer_id)`,
+used with AES-256-GCM, a random 12-byte IV, and the frame's 32-byte header as
+AAD.
+
+*EPOCH_KEY body.* It is not encrypted under the content key, since a newcomer
+does not have the current one. It is `len (u32 BE) || cbor || sig`, where `cbor`
+is a canonical CBOR map:
+
+```
+{ "kind":    "step" | "handover",
+  "from":    u32,          the epoch the sender was in
+  "to":      u32,          equal to the header epoch
+  "root":    u32,          the epoch of the room's current root
+  "sender":  bstr(16),     must equal the relay envelope's sender
+  "roster":  bstr(32),     the sender's roster hash, as for shred votes
+  "confirm": bstr(16),     confirm_to; one value for every recipient
+  "wraps":   [ { "p": bstr(16) peer id, "iv": bstr(12), "ct": bstr } ] }
+```
+
+and `sig` is the sender's signature over `"runa/v1/epoch-key" || header (32 B) || cbor`.
+A step's wrap holds the new `epoch_secret`. A handover's wrap holds the secrets
+from `root + 1` to `to`, concatenated in order, so the newcomer derives every
+epoch from its own link or passphrase. A handover is addressed to one
+newcomer and carries exactly one wrap, of at most 8192 secrets; a room that has
+rotated more often than that since its root can no longer be joined, which at
+one rotation per 5 seconds takes over eleven hours of continuous departures.
+A receiver checks the signature against its roster, unwraps its own entry,
+derives, and compares `confirm`. A frame
+that fails any of these is refused, and the refusal is shown. It also compares
+the roster hash with its own: a mismatch is shown as a warning that someone may
+be hidden from the room, but does not stop the step, because two honest peers
+can briefly disagree about a departure that is still in flight.
+
+*When a room rotates.* In a Highest-security room, a peer that has been gone
+for 60 seconds starts a step, as does any peer gone ten minutes after a restart
+notice that promised a handover. A peer that comes back with the same signing
+key in that time does not, and several departures inside one window make one
+step. The step is sent by the remaining peer with the lowest `joined_at_seq`;
+if none has arrived 15 seconds after the deadline, the next one in that order
+sends it. Everyday rooms do not start steps, though their clients accept one.
+After a step, the peer the server lets snapshot (the lowest `joined_at_seq`)
+sends a snapshot under the new key as soon as it can, and keeps trying on its
+regular snapshot timer until one has been sent at the new epoch. In a quiet
+room that can wait for the next edit, so "soon" means once anything new is
+written.
+
+A client whose JOIN_ACK has no `root_epoch` is talking to a server that
+predates this amendment, which neither moves the epoch nor echoes steps. It
+sends no steps and ignores any it receives.
+
+*Newcomers.* JOIN_ACK carries `root_epoch`. A newcomer whose JOIN_ACK says
+`epoch == root_epoch` derives its keys as it always has. Otherwise the member
+with the lowest `joined_at_seq` sends it a handover when it sees the PEER_JOIN,
+and the next member in that order does so if none has arrived after 10 seconds.
+A member that reconnects cannot rely on having seen every PEER_JOIN, so it
+schedules a handover for every member its JOIN_ACK lists whose signing key it
+has not seen before. A second handover is harmless: a member that already
+holds the epoch ignores it.
+
+A handover's `confirm` is chosen by its sender, so a member who holds the link
+could hand a newcomer secrets that match a confirm it made up. Any other member
+who sees a handover for someone else whose `confirm` differs from its own for
+that epoch shows the handover as refused, and still sends its own if it was
+going to.
+
+*Server rules.*
+
+- An EPOCH_KEY whose header epoch is one above the room's advances the room,
+  atomically, so the first such frame wins. A later step for the same epoch
+  then matches the room's epoch and is relayed like a handover, and every
+  client ignores it, because a step must name the epoch after the one the
+  client holds. A client that the winning step left out is waiting for a
+  handover, and ignores every step for the epoch it is waiting for or an
+  earlier one, so a losing step that happens to include it cannot put it on
+  a key nobody else holds. Advances are refused for 5 seconds after the last
+  one and at `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
+  and every peer, the sender too, moves to the new epoch when that copy
+  arrives, so the server's order is the only order. A refused step is dropped
+  without an answer; its sender applies whichever step does arrive. A header
+  epoch equal to the room's is a handover and is relayed to the other peers.
+  Anything else is dropped.
+- For 30 seconds after an advance, encrypted frames from the previous epoch
+  are still accepted, so edits already in flight land. After that, an
+  encrypted frame (DOC_UPDATE, SNAPSHOT, AWARENESS, the SHRED frames) from an
+  earlier epoch is refused, and so is one from a later epoch than the room's: a
+  DOC_UPDATE is not stored, and a sender that asked for acks gets
+  `{ok: false, epoch}`; any other frame is dropped, and its sender gets ERROR
+  4006. A client refused this way reconnects, which resends everything not yet
+  stored, and waits for a handover if it does not hold the room's current key.
+  An honest client is refused only when it is more than 30 seconds behind, and
+  then it has no newer key to resend with. A SNAPSHOT is stored only at the
+  room's epoch: one from the epoch just left, inside the overlap, is dropped
+  without an answer, because the member that steps is usually the one that
+  snapshots; one from any other epoch gets ERROR 4006.
+- PING, TTL_EXTEND, PURGE_ACK and DOC_SYNC_REQ carry no ciphertext and are
+  never refused for their epoch. Server-authored frames still carry epoch 0.
+- Restart tickets cover `epoch` and `root_epoch`. A ticket from a process that
+  predates this amendment has neither, and restores the room at 0.
+
+Every rotation is visible to the server: it relays the frame and moves the
+epoch. It already saw the departure that caused it. The secret itself reaches
+only the peers it was wrapped for.
 
 All amendments keep the invariant that matters: the server never learns
 anything about document content.
