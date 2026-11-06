@@ -169,8 +169,9 @@ What that buys is narrow, so here it is exactly:
   anyway.
 - **A tab opened before key rotation existed is kept out once the key has
   changed.** It cannot be handed a new key, so the server refuses it with a
-  version error and it has to be reloaded. Left in, it would lose its edits
-  without saying so, or write them under the original key.
+  version error. The older page does not explain that error: it keeps trying to
+  connect until it is reloaded. Left in, it would lose its edits without saying
+  so, or write them under the original key.
 
 A peer who joins after a rotation still gets the whole history. A member who is
 present hands them the secrets drawn since the room began, and they derive each
@@ -185,8 +186,8 @@ confirmation. A member who holds the link can: the newcomer would then hold
 keys nobody else has, and nothing would open. Other members who see that
 handover notice that its confirmation does not match their own, say so, and
 send their own, and the newcomer shows that the two disagree. It keeps the
-first set it applied, though, so it has to reload to recover. A rotation that fails is refused and shown, and the room stops
-working until people leave it. Only a member or the server can cause that, and
+first set it applied, though, so it has to reload to recover. A rotation that
+fails is refused and shown, and the room stops working until people leave it. Only a member or the server can cause that, and
 either could already disrupt a room.
 
 Against the server, rotation holds as long as the server does not collude with

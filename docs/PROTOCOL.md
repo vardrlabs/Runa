@@ -397,9 +397,10 @@ step. The step is sent by the remaining peer with the lowest `joined_at_seq`;
 if none has arrived 15 seconds after the deadline, the next one in that order
 sends it. Everyday rooms do not start steps, though their clients accept one.
 After a step, the peer the server lets snapshot (the lowest `joined_at_seq`)
-writes a snapshot under the new key as soon as it can, and keeps trying on its
-regular snapshot timer until one is written, so the log soon holds nothing
-older.
+sends a snapshot under the new key as soon as it can, and keeps trying on its
+regular snapshot timer until one has been sent at the new epoch. In a quiet
+room that can wait for the next edit, so "soon" means once anything new is
+written.
 
 A client whose JOIN_ACK has no `root_epoch` is talking to a server that
 predates this amendment, which neither moves the epoch nor echoes steps. It
@@ -409,14 +410,16 @@ sends no steps and ignores any it receives.
 `epoch == root_epoch` derives its keys as it always has. Otherwise the member
 with the lowest `joined_at_seq` sends it a handover when it sees the PEER_JOIN,
 and the next member in that order does so if none has arrived after 10 seconds.
-A member that reconnects cannot tell who arrived while it was away, so it
-schedules a handover for every other member its JOIN_ACK lists. A second
-handover is harmless: a member that already holds the epoch ignores it.
+A member that reconnects cannot rely on having seen every PEER_JOIN, so it
+schedules a handover for every member its JOIN_ACK lists whose signing key it
+has not seen before. A second handover is harmless: a member that already
+holds the epoch ignores it.
 
 A handover's `confirm` is chosen by its sender, so a member who holds the link
 could hand a newcomer secrets that match a confirm it made up. Any other member
 who sees a handover for someone else whose `confirm` differs from its own for
-that epoch shows the handover as refused and sends its own.
+that epoch shows the handover as refused, and still sends its own if it was
+going to.
 
 *Server rules.*
 

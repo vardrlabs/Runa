@@ -20,8 +20,8 @@ section — so this file is not documentation of the release, it is part of it.
   they do not rotate on a departure. The design and its limits are in
   `docs/THREAT_MODEL.md` and `docs/PROTOCOL.md` amendment J. A tab still
   running an earlier version can't be handed the new key, so once a room's key
-  has changed the server turns it away with a version error, and reloading the
-  page fixes it. Removing someone and changing a room's link come in a later
+  has changed the server turns it away. The older page doesn't say why; it keeps
+  trying to connect until it is reloaded. Removing someone and changing a room's link come in a later
   release.
 
 ### Fixed
