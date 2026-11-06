@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 use crate::bifrost::frame::*;
-use crate::runar::epoch::{Admit, Offer};
+use crate::runar::epoch::Admit;
 use crate::runar::room::{PeerKx, TtlKind};
 use crate::error::WireCode;
 use crate::gjallarhorn;
@@ -418,19 +418,6 @@ async fn run_connection(
         _ => None,
     };
 
-    // Amendment J: a client that sent no key-agreement key cannot be handed the
-    // key of a rotated room, and would write under a key someone who left holds.
-    if kx.is_none() && room.epoch() != room.root_epoch() {
-        let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::ProtocolError))).await;
-        let _ = sink
-            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
-                code: u16::from(WireCode::ProtocolError),
-                reason: "".into(),
-            })))
-            .await;
-        return Err(WireCode::ProtocolError);
-    }
-
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CAPACITY);
     let peer_tx = crate::runar::room::PeerTx::new(tx, cfg.max_queued_bytes_per_conn)
         .with_indexes(join.indexed);
@@ -441,6 +428,21 @@ async fn run_connection(
         Err(JoinError::Full) => {
             let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::RoomFull))).await;
             return Err(WireCode::RoomFull);
+        }
+        // Amendment J: a client that sent no key-agreement key cannot be
+        // handed the key of a rotated room, and would write under a key
+        // someone who left holds. `add_peer` decides this under the room's
+        // locks, so a step on another thread cannot slip between the check
+        // and the insert.
+        Err(JoinError::Rotated) => {
+            let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::ProtocolError))).await;
+            let _ = sink
+                .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                    code: u16::from(WireCode::ProtocolError),
+                    reason: "".into(),
+                })))
+                .await;
+            return Err(WireCode::ProtocolError);
         }
         Err(JoinError::AuthLockedOut(_)) => {
             floor_delay(cfg.auth_floor).await;
@@ -817,15 +819,16 @@ async fn process_frame(
 
         FT_EPOCH_KEY => {
             let now = std::time::Instant::now();
-            match room.offer_epoch_key(header.epoch, now, state.cfg.epoch_min_interval) {
-                Offer::Advanced => {
-                    // Clients without key agreement cannot receive the new key.
-                    room.close_peers_without_kx(&error_frame(room.id, WireCode::ProtocolError));
-                    room.broadcast_to_all(&frame_bytes, sender).await
-                }
-                Offer::Handover => gjallarhorn::relay(room, &frame_bytes, sender).await,
-                Offer::Refused => {}
-            }
+            // Decision and fan-out are one critical section in the room, so
+            // every peer sees steps in the order the server decided them.
+            let _ = room.step_epoch(
+                header.epoch,
+                now,
+                state.cfg.epoch_min_interval,
+                &frame_bytes,
+                sender,
+                &error_frame(room.id, WireCode::ProtocolError),
+            );
             Ok(())
         }
 

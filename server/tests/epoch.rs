@@ -551,3 +551,33 @@ async fn a_backlogged_peer_is_closed_and_announced_as_gone() {
     let closed = tokio::time::timeout(Duration::from_secs(30), slow_reader).await;
     assert!(closed.is_ok(), "the backlogged peer's connection stayed open");
 }
+
+/// Two members step the room to the same next epoch at the same moment, many
+/// times over. Whichever the server decides first wins, and every member must
+/// see that step first: nobody may be wrapped in the one that lost.
+#[tokio::test]
+async fn racing_steps_reach_every_peer_in_the_order_the_server_decided() {
+    let s = spawn(cfg_with(30_000, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    let (mut b, _) = join_with(&s, &k, json!({})).await;
+    let (mut c, _) = join_with(&s, &k, json!({})).await;
+    for round in 1u32..=60 {
+        let (fa, fb) = (
+            frame(&k.hex, 0x20, round, format!("{round}-a").as_bytes()),
+            frame(&k.hex, 0x20, round, format!("{round}-b").as_bytes()),
+        );
+        let _ = tokio::join!(a.send(fa), b.send(fb));
+        let mut firsts = Vec::new();
+        for ws in [&mut a, &mut b, &mut c] {
+            let seen = frames_of(ws, 0x20, 40).await;
+            let mine: Vec<&Vec<u8>> = seen.iter().filter(|f| epoch_of(f) == round).collect();
+            assert!(!mine.is_empty(), "round {round}: a peer saw no step");
+            firsts.push(mine[0][48..].to_vec());
+        }
+        assert!(
+            firsts.iter().all(|f| f == &firsts[0]),
+            "round {round}: peers saw different steps first: {firsts:?}"
+        );
+    }
+}
