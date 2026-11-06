@@ -402,7 +402,10 @@ A second handover is harmless.
   atomically, so the first such frame wins. A later step for the same epoch
   then matches the room's epoch and is relayed like a handover, and every
   client ignores it, because a step must name the epoch after the one the
-  client holds. Advances are refused for 5 seconds after the last one and at
+  client holds. A client that the winning step left out is waiting for a
+  handover, and ignores every step for the epoch it is waiting for or an
+  earlier one, so a losing step that happens to include it cannot put it on
+  a key nobody else holds. Advances are refused for 5 seconds after the last one and at
   `u32::MAX`. An accepted step is relayed to every peer *including its sender*,
   and every peer, the sender too, moves to the new epoch when that copy
   arrives, so the server's order is the only order. A refused step is dropped
