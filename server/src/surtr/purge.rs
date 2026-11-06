@@ -20,7 +20,7 @@ pub async fn purge(registry: &RoomRegistry, room_id: &[u8; 16], reason: &str) ->
     room.mark_state(RoomState::Purging);
 
     let header =
-        Header::new(FT_PURGE, *room_id, room.epoch.load(std::sync::atomic::Ordering::SeqCst), [0; 4], 0);
+        Header::new(FT_PURGE, *room_id, room.epoch(), [0; 4], 0);
     let body = serde_json::json!({ "reason": reason }).to_string();
     let mut raw = header.encode();
     raw.extend_from_slice(body.as_bytes());

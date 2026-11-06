@@ -1,4 +1,6 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::runar::epoch::{Admit, EpochState, Offer};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -45,17 +47,28 @@ pub enum RoomState {
     Dead,
 }
 
+/// A peer's key-agreement key and the peer's signature over it (amendment J).
+/// Opaque to the server, which checks only their lengths; peers verify the
+/// signature against the peer's signing key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerKx {
+    pub pubkey: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
 #[derive(Debug, Clone)]
 pub struct RosterEntry {
     pub peer_id: [u8; 16],
     /// Raw public key bytes: 32 B Ed25519 or 65 B uncompressed ECDSA P-256.
     pub pubkey: Option<Vec<u8>>,
+    pub kx: Option<PeerKx>,
     pub joined_at_seq: u64,
 }
 
 pub struct ConnectedPeer {
     pub peer_id: [u8; 16],
     pub pubkey: Option<Vec<u8>>,
+    pub kx: Option<PeerKx>,
     pub joined_at_seq: u64,
     pub tx: PeerTx,
 }
@@ -252,7 +265,8 @@ pub struct Room {
     pub log: std::sync::RwLock<RoomLog>,
     pub peers: Mutex<Vec<ConnectedPeer>>,
     pub next_seq: AtomicU64,
-    pub epoch: AtomicU32,
+    /// The room's epoch and the epoch of its current root (amendment J).
+    epochs: Mutex<EpochState>,
     pub ttl_extension_secs: AtomicU64,
     /// Random per `Room` value, and so per log. A room brought back after a
     /// restart has the same id and a new, empty log; this is how a member
@@ -377,7 +391,7 @@ impl Room {
             peers: Mutex::new(Vec::new()),
             max_peers,
             next_seq: AtomicU64::new(1),
-            epoch: AtomicU32::new(0),
+            epochs: Mutex::new(EpochState::new(0, 0)),
             ttl_extension_secs: AtomicU64::new(0),
             log_id: {
                 let mut b = [0u8; 8];
@@ -420,7 +434,12 @@ impl Room {
         *self.last_edit.lock().unwrap() = Instant::now();
     }
 
-    pub fn add_peer(&self, pubkey: Option<Vec<u8>>, tx: PeerTx) -> Result<RosterEntry, JoinError> {
+    pub fn add_peer(
+        &self,
+        pubkey: Option<Vec<u8>>,
+        kx: Option<PeerKx>,
+        tx: PeerTx,
+    ) -> Result<RosterEntry, JoinError> {
         let mut peers = self.peers.lock().unwrap();
         if peers.len() >= self.max_peers {
             return Err(JoinError::Full);
@@ -433,9 +452,10 @@ impl Room {
         let entry = RosterEntry {
             peer_id: generate_peer_id(seq),
             pubkey: pubkey.clone(),
+            kx: kx.clone(),
             joined_at_seq: seq,
         };
-        peers.push(ConnectedPeer { peer_id: entry.peer_id, pubkey, joined_at_seq: seq, tx });
+        peers.push(ConnectedPeer { peer_id: entry.peer_id, pubkey, kx, joined_at_seq: seq, tx });
         Ok(entry)
     }
 
@@ -460,8 +480,53 @@ impl Room {
             .lock()
             .unwrap()
             .iter()
-            .map(|p| RosterEntry { peer_id: p.peer_id, pubkey: p.pubkey.clone(), joined_at_seq: p.joined_at_seq })
+            .map(|p| RosterEntry {
+                peer_id: p.peer_id,
+                pubkey: p.pubkey.clone(),
+                kx: p.kx.clone(),
+                joined_at_seq: p.joined_at_seq,
+            })
             .collect()
+    }
+
+    pub fn epoch(&self) -> u32 {
+        self.epochs.lock().unwrap().epoch()
+    }
+
+    pub fn root_epoch(&self) -> u32 {
+        self.epochs.lock().unwrap().root_epoch()
+    }
+
+    pub fn offer_epoch_key(&self, header_epoch: u32, now: Instant, min_interval: Duration) -> Offer {
+        self.epochs.lock().unwrap().offer(header_epoch, now, min_interval)
+    }
+
+    pub fn admit_epoch(&self, frame_epoch: u32, now: Instant, overlap: Duration) -> Admit {
+        self.epochs.lock().unwrap().admit(frame_epoch, now, overlap)
+    }
+
+    /// Set a room brought back from a restart ticket to the epochs it had.
+    pub fn restore_epochs(&self, epoch: u32, root_epoch: u32) {
+        *self.epochs.lock().unwrap() = EpochState::new(epoch, root_epoch);
+    }
+
+    /// Fan out an accepted epoch step to every peer, its sender included, each
+    /// copy carrying the sender envelope (amendment J). Every member moves to
+    /// the new epoch when this copy arrives, so the server's order is the only
+    /// order, and a sender learns that its step won the same way as everyone.
+    pub async fn broadcast_to_all(&self, frame: &Bytes, sender: [u8; 16]) {
+        let outbound = envelop(frame, sender);
+        let peers = self.peers.lock().unwrap();
+        let mut dead = Vec::new();
+        for p in peers.iter() {
+            if p.tx.try_send(outbound.clone()).is_err() {
+                dead.push(p.peer_id);
+            }
+        }
+        drop(peers);
+        for id in dead {
+            self.remove_peer(&id);
+        }
     }
 
     /// Fan out a **server-authored** frame verbatim. PROTOCOL.md amendment C
@@ -1215,7 +1280,7 @@ mod auth_throttle_tests {
         };
         room.auth_success("198.51.100.7");
         let (tx, _rx) = tokio::sync::mpsc::channel(4);
-        room.add_peer(None, PeerTx::new(tx, 1 << 20)).expect("join");
+        room.add_peer(None, None, PeerTx::new(tx, 1 << 20)).expect("join");
         let after = {
             let mut n = 0;
             while room.auth_allowed("198.51.100.7") {
@@ -1302,7 +1367,7 @@ mod purge_ack_tests {
         let (tx, rx) = mpsc::channel(8);
         // Hold the receiver open for the lifetime of the test.
         std::mem::forget(rx);
-        room.add_peer(None, PeerTx::new(tx, 1 << 20)).unwrap().peer_id
+        room.add_peer(None, None, PeerTx::new(tx, 1 << 20)).unwrap().peer_id
     }
 
     #[test]

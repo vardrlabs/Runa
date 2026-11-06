@@ -116,7 +116,7 @@ fn doc_update_frame(room_hex: &str, payload: &[u8]) -> Message {
     .iter()
     .copied()
     .chain(hex::decode(room_hex).unwrap())
-    .chain(7u32.to_be_bytes())
+    .chain(0u32.to_be_bytes())
     .chain([9u8, 9, 9, 9])
     .chain(1u32.to_be_bytes())
     .collect::<Vec<u8>>();
@@ -287,7 +287,7 @@ async fn late_joiner_syncs_from_log_and_snapshot_truncates() {
     .iter()
     .copied()
     .chain(hex::decode(&keys.room_id_hex).unwrap())
-    .chain(7u32.to_be_bytes())
+    .chain(0u32.to_be_bytes())
     .chain([9u8, 9, 9, 9])
     .chain(0u32.to_be_bytes())
     .collect::<Vec<u8>>();
