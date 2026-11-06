@@ -1024,6 +1024,8 @@ impl RoomRegistry {
         log_max_bytes: u64,
         auth_max: u32,
         max_peers: usize,
+        epoch: u32,
+        root_epoch: u32,
     ) -> Result<RestoreOutcome, RestoreError> {
         if let Some(n) = name {
             names::validate(n).map_err(|_| RestoreError::NameInvalid)?;
@@ -1072,6 +1074,7 @@ impl RoomRegistry {
         ));
         room.ttl_extension_secs
             .store(ttl_extension_secs.min(MAX_TTL_EXTENSION_SECS), Ordering::SeqCst);
+        room.restore_epochs(epoch, root_epoch);
         slot.insert(room.clone());
         Ok(RestoreOutcome::Restored(room))
     }

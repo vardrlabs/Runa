@@ -329,3 +329,47 @@ async fn purge_keeps_epoch_zero_after_the_room_has_stepped() {
     let purge = next_ft(&mut a, 0x13).await;
     assert_eq!(&purge[20..24], &[0, 0, 0, 0], "server-authored frames carry epoch 0");
 }
+
+#[tokio::test]
+async fn a_room_restored_from_a_ticket_keeps_its_epoch() {
+    use runa_server::runar::room::{Room, RoomClass, Ttl, TtlKind};
+    use runa_server::runar::ticket::{issue, RestartKey};
+    let key_bytes = [5u8; 32];
+    let mut cfg = cfg_with(30_000, 0);
+    cfg.restart_key = Some(RestartKey(key_bytes));
+    let s = spawn(cfg).await;
+
+    let auth = rand32();
+    let verifier: [u8; 32] = Sha256::digest(auth).into();
+    let id = rand16();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let old = Room::new(
+        id,
+        RoomClass::Unlisted,
+        now,
+        Ttl { kind: TtlKind::IdlePeers, secs: 3600 },
+        false,
+        Some(verifier),
+        65536,
+        3,
+        1,
+        rand16(),
+        None,
+        1 << 20,
+        5,
+        32,
+    );
+    old.restore_epochs(3, 0);
+    let ticket = issue(&RestartKey(key_bytes), &old, now).unwrap();
+    let r = reqwest::Client::new()
+        .post(format!("{s}/api/rooms/restore"))
+        .json(&json!({ "ticket": ticket }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 201);
+    let k = Keys { hex: hex::encode(id), auth };
+    let (_a, ack) = join_with(&s, &k, json!({})).await;
+    assert_eq!(ack["epoch"], 3);
+    assert_eq!(ack["root_epoch"], 0);
+}
