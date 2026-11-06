@@ -427,13 +427,27 @@ export class EpochCoordinator {
   }
 
   private async receiveHandover(header: Uint8Array, body: EpochKeyBody, from: MemberView, me: Uint8Array): Promise<void> {
+    const ring = this.d.keyring;
+    const cur = ring.current;
     if (!body.wraps.some((w) => eq(w.p, me))) {
+      // Its sender chose the confirmation, so a member holding the link could
+      // hand a newcomer secrets of its own with a confirmation to match. One
+      // that is not the room's is shown, and this member still sends its own.
+      if (body.to === cur.epoch && !confirmsEqual(body.confirm, cur.confirm)) {
+        this.d.status("refused");
+        return;
+      }
       // Someone has already looked after this newcomer.
       for (const w of body.wraps) this.handovers.delete(hex(w.p));
       return;
     }
-    const ring = this.d.keyring;
-    if (body.to <= ring.current.epoch || body.root !== ring.rootEpoch) return;
+    if (body.to === cur.epoch && body.root === ring.rootEpoch && !confirmsEqual(body.confirm, cur.confirm)) {
+      // Two handovers for this epoch disagree, so one of them was not the
+      // room's. The first one applied is kept, and the conflict is shown.
+      this.d.status("refused");
+      return;
+    }
+    if (body.to <= cur.epoch || body.root !== ring.rootEpoch) return;
     const blob = await this.unwrapFrom(header, body, from, me);
     if (!blob) {
       this.d.status("refused");

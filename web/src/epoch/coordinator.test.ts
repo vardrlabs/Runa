@@ -577,6 +577,89 @@ describe("EpochCoordinator", () => {
     expect(hub.epoch).toBe(0);
   });
 
+  /// A handover from `from` to `to` holding a secret that is not the room's,
+  /// with a confirmation that matches that secret.
+  async function bogusHandover(from: Peer, to: Peer, epoch: number): Promise<{ h: Uint8Array; body: Uint8Array }> {
+    const h = header(epoch);
+    const bogus = new Uint8Array(32).fill(0xee);
+    const fake = await stepKeys(to.keyring.current, bogus);
+    const key = await wrapKey(from.kx, to.kx.publicKeyRaw, ROOM, epoch, from.id, to.id);
+    const { iv, ct } = await sealWrap(key, h, bogus);
+    const body = await encodeEpochKey(
+      h,
+      { kind: "handover", from: epoch, to: epoch, root: 0, sender: from.id, roster: new Uint8Array(32), confirm: fake.confirm, wraps: [{ p: to.id, iv, ct }] },
+      from.identity,
+    );
+    return { h, body };
+  }
+
+  it("a bystander refuses a handover whose confirmation is not the room's, and hands over itself", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(1);
+    const d = await makePeer(hub);
+    arrive(hub, d);
+    await d.coord.joined(1);
+    // b holds the link and hands d secrets of its own making.
+    const { h, body } = await bogusHandover(b, d, 1);
+    await a.coord.receive(h, 1, b.id, body);
+    expect(a.statuses.at(-1)).toBe("refused");
+    // a still sends d the real keys.
+    hub.captured = [];
+    await a.coord.tick();
+    expect(hub.captured).toHaveLength(1);
+    const real = hub.captured[0];
+    hub.captured = null;
+    await d.coord.receive(real.h, 1, a.id, real.body);
+    expect(d.keyring.current.epoch).toBe(1);
+    expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
+  });
+
+  it("a bystander lets a matching handover stand in for its own", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    const d = await makePeer(hub);
+    arrive(hub, d);
+    hub.captured = [];
+    await a.coord.tick(); // a is first in line
+    const [fromA] = hub.captured;
+    hub.captured = null;
+    await b.coord.receive(fromA.h, 1, a.id, fromA.body);
+    expect(b.statuses).not.toContain("refused");
+    hub.captured = [];
+    hub.now += 60_000;
+    await b.coord.tick();
+    expect(hub.captured).toEqual([]);
+    hub.captured = null;
+  });
+
+  it("a newcomer flags a second handover that disagrees with the one it applied", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    const d = await makePeer(hub);
+    arrive(hub, d);
+    await d.coord.joined(1);
+    hub.captured = [];
+    await a.coord.tick();
+    const [real] = hub.captured;
+    hub.captured = null;
+    await d.coord.receive(real.h, 1, a.id, real.body);
+    expect(d.statuses.at(-1)).toBe("ok");
+    const { h, body } = await bogusHandover(b, d, 1);
+    await d.coord.receive(h, 1, b.id, body);
+    expect(d.statuses.at(-1)).toBe("refused");
+    expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
+  });
+
   it("never wraps for a member whose key-agreement key is signed but does not start with 0x04", async () => {
     const hub = new Hub();
     const [a, b, c, d] = [await makePeer(hub), await makePeer(hub), await makePeer(hub), await makePeer(hub)];
