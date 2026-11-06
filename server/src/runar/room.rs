@@ -89,6 +89,10 @@ pub struct PeerTx {
     /// This connection asked for the log index of every DOC_UPDATE relayed to
     /// it (amendment H).
     pub indexed: bool,
+    /// Set when the next ERROR frame queued for this connection is its last:
+    /// the writer closes the connection after sending it, the way it does
+    /// after a PURGE or RESTART_TICKET.
+    close_after_error: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PeerTx {
@@ -98,7 +102,19 @@ impl PeerTx {
             queued: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             max_bytes,
             indexed: false,
+            close_after_error: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// Queue `error` and close the connection once the writer has sent it.
+    pub fn send_final_error(&self, error: Bytes) -> Result<(), PeerBacklogged> {
+        self.close_after_error.store(true, Ordering::SeqCst);
+        self.try_send(error)
+    }
+
+    /// Whether the next ERROR frame this connection writes ends it.
+    pub fn closes_after_error(&self) -> bool {
+        self.close_after_error.load(Ordering::SeqCst)
     }
 
     /// Relay DOC_UPDATEs to this connection with their log index.
@@ -520,6 +536,24 @@ impl Room {
         let mut dead = Vec::new();
         for p in peers.iter() {
             if p.tx.try_send(outbound.clone()).is_err() {
+                dead.push(p.peer_id);
+            }
+        }
+        drop(peers);
+        for id in dead {
+            self.remove_peer(&id);
+        }
+    }
+
+    /// Send `error` to every connected peer that sent no key-agreement key and
+    /// close its connection after it (amendment J): such a client cannot be
+    /// handed the new epoch's key. Each closed connection leaves the roster
+    /// through its own teardown, which broadcasts PEER_LEAVE.
+    pub fn close_peers_without_kx(&self, error: &Bytes) {
+        let peers = self.peers.lock().unwrap();
+        let mut dead = Vec::new();
+        for p in peers.iter().filter(|p| p.kx.is_none()) {
+            if p.tx.send_final_error(error.clone()).is_err() {
                 dead.push(p.peer_id);
             }
         }

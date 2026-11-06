@@ -418,10 +418,24 @@ async fn run_connection(
         _ => None,
     };
 
+    // Amendment J: a client that sent no key-agreement key cannot be handed the
+    // key of a rotated room, and would write under a key someone who left holds.
+    if kx.is_none() && room.epoch() != room.root_epoch() {
+        let _ = sink.send(Message::Binary(error_frame(room_id, WireCode::ProtocolError))).await;
+        let _ = sink
+            .send(Message::Close(Some(axum::extract::ws::CloseFrame {
+                code: u16::from(WireCode::ProtocolError),
+                reason: "".into(),
+            })))
+            .await;
+        return Err(WireCode::ProtocolError);
+    }
+
     let (tx, mut rx) = mpsc::channel::<Bytes>(OUTBOUND_CAPACITY);
     let peer_tx = crate::runar::room::PeerTx::new(tx, cfg.max_queued_bytes_per_conn)
         .with_indexes(join.indexed);
     let queue_meter = peer_tx.meter();
+    let final_error = peer_tx.clone();
     let entry = match room.add_peer(session_pubkey.clone(), kx, peer_tx) {
         Ok(e) => e,
         Err(JoinError::Full) => {
@@ -561,6 +575,9 @@ async fn run_connection(
                     Some(bytes) => {
                         let is_purge = bytes.len() >= HEADER_LEN && bytes[3] == FT_PURGE;
                         let is_ticket = bytes.len() >= HEADER_LEN && bytes[3] == FT_RESTART_TICKET;
+                        let is_final_error = bytes.len() >= HEADER_LEN
+                            && bytes[3] == FT_ERROR
+                            && final_error.closes_after_error();
                         let n = bytes.len();
                         let sent = sink.send(Message::Binary(bytes)).await;
                         // Quota returns once the frame is off our hands.
@@ -577,6 +594,12 @@ async fn run_connection(
                         // the member comes back to the new process with it.
                         if is_ticket {
                             conn_ok = Err(WireCode::ServiceRestart);
+                            break;
+                        }
+                        // A client that cannot be handed the room's new key:
+                        // its ERROR 4005 was the last frame it gets.
+                        if is_final_error {
+                            conn_ok = Err(WireCode::ProtocolError);
                             break;
                         }
                     }
@@ -791,7 +814,11 @@ async fn process_frame(
         FT_EPOCH_KEY => {
             let now = std::time::Instant::now();
             match room.offer_epoch_key(header.epoch, now, state.cfg.epoch_min_interval) {
-                Offer::Advanced => room.broadcast_to_all(&frame_bytes, sender).await,
+                Offer::Advanced => {
+                    // Clients without key agreement cannot receive the new key.
+                    room.close_peers_without_kx(&error_frame(room.id, WireCode::ProtocolError));
+                    room.broadcast_to_all(&frame_bytes, sender).await
+                }
                 Offer::Handover => gjallarhorn::relay(room, &frame_bytes, sender).await,
                 Offer::Refused => {}
             }

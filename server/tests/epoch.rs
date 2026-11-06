@@ -128,15 +128,46 @@ async fn frames_of(ws: &mut Ws, ft: u8, ms: u64) -> Vec<Vec<u8>> {
     }
 }
 
+/// Joins with a well-formed dummy key-agreement key (the server checks lengths
+/// only), so the peer can be handed an epoch key. `extra` overrides any field.
 async fn join_with(server: &str, k: &Keys, extra: Value) -> (Ws, Value) {
+    let mut body = json!({"kx_pubkey": B64.encode(kx_pub()), "kx_sig": B64.encode([7u8; 64])});
+    for (key, v) in extra.as_object().unwrap() {
+        body[key] = v.clone();
+    }
+    join_bare(server, k, body).await
+}
+
+/// Joins with exactly the fields given: no key agreement unless `extra` has it.
+async fn join_bare(server: &str, k: &Keys, extra: Value) -> (Ws, Value) {
+    let mut ws = join_raw(server, k, extra).await;
+    let ack = next_ft(&mut ws, 0x02).await;
+    (ws, json_body(&ack))
+}
+
+/// Sends the JOIN and returns without waiting for the answer.
+async fn join_raw(server: &str, k: &Keys, extra: Value) -> Ws {
     let mut ws = connect(server, &k.hex).await;
     let mut body = json!({"auth_key": B64.encode(k.auth), "pubkey": B64.encode(rand32())});
     for (key, v) in extra.as_object().unwrap() {
         body[key] = v.clone();
     }
     ws.send(frame(&k.hex, 0x01, 0, body.to_string().as_bytes())).await.unwrap();
-    let ack = next_ft(&mut ws, 0x02).await;
-    (ws, json_body(&ack))
+    ws
+}
+
+/// The close code the server ends the connection with, skipping other frames.
+async fn close_code(ws: &mut Ws) -> u16 {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(5), ws.next())
+            .await
+            .expect("timeout waiting for a close")
+            .expect("stream ended without a close frame")
+            .unwrap();
+        if let Message::Close(Some(c)) = m {
+            return u16::from(c.code);
+        }
+    }
 }
 
 fn kx_pub() -> Vec<u8> {
@@ -306,7 +337,7 @@ async fn malformed_key_agreement_keys_are_dropped() {
     // 64 bytes is not an uncompressed point; a 63-byte signature is no signature.
     let (_a, _) = join_with(&s, &k, json!({"kx_pubkey": B64.encode([4u8; 64]), "kx_sig": B64.encode([1u8; 64])})).await;
     let (_b, _) = join_with(&s, &k, json!({"kx_pubkey": B64.encode(kx_pub()), "kx_sig": B64.encode([1u8; 63])})).await;
-    let (_c, ack) = join_with(&s, &k, json!({})).await;
+    let (_c, ack) = join_bare(&s, &k, json!({})).await;
     for entry in ack["roster"].as_array().unwrap() {
         assert!(entry.get("kx_pubkey").is_none(), "kept a malformed key: {entry}");
     }
@@ -372,4 +403,56 @@ async fn a_room_restored_from_a_ticket_keeps_its_epoch() {
     let (_a, ack) = join_with(&s, &k, json!({})).await;
     assert_eq!(ack["epoch"], 3);
     assert_eq!(ack["root_epoch"], 0);
+}
+
+#[tokio::test]
+async fn a_client_without_key_agreement_is_refused_a_rotated_room() {
+    let s = spawn(cfg_with(30_000, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    a.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    let _ = next_ft(&mut a, 0x20).await;
+
+    let mut old = join_raw(&s, &k, json!({})).await;
+    let err = json_body(&next_ft(&mut old, 0x30).await);
+    assert_eq!(err["code"], 4005);
+    assert_eq!(close_code(&mut old).await, 4005);
+
+    let (_c, ack) = join_with(&s, &k, json!({})).await;
+    assert_eq!(ack["roster"].as_array().unwrap().len(), 2, "the refused join was on the roster");
+    // Nobody was told the refused client had joined: a sees only c's PEER_JOIN
+    // (its own was skipped while waiting for the echo).
+    assert_eq!(frames_of(&mut a, 0x07, 300).await.len(), 1);
+}
+
+#[tokio::test]
+async fn a_client_without_key_agreement_still_joins_a_room_that_never_rotated() {
+    let s = spawn(cfg_with(30_000, 0)).await;
+    let k = create(&s).await;
+    let (_a, ack) = join_bare(&s, &k, json!({})).await;
+    assert_eq!(ack["epoch"], 0);
+    let (_b, ack) = join_bare(&s, &k, json!({})).await;
+    assert_eq!(ack["roster"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_client_without_key_agreement_is_closed_when_a_step_is_accepted() {
+    let s = spawn(cfg_with(30_000, 0)).await;
+    let k = create(&s).await;
+    let (mut a, _) = join_with(&s, &k, json!({})).await;
+    let (mut b, _) = join_with(&s, &k, json!({})).await;
+    let (mut old, _) = join_bare(&s, &k, json!({})).await;
+
+    a.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    assert_eq!(epoch_of(&next_ft(&mut a, 0x20).await), 1);
+    assert_eq!(epoch_of(&next_ft(&mut b, 0x20).await), 1);
+    let err = json_body(&next_ft(&mut old, 0x30).await);
+    assert_eq!(err["code"], 4005);
+    assert_eq!(close_code(&mut old).await, 4005);
+
+    // It left the roster, and the others were told.
+    let leaves = frames_of(&mut b, 0x08, 500).await;
+    assert_eq!(leaves.len(), 1);
+    let (_c, ack) = join_with(&s, &k, json!({})).await;
+    assert_eq!(ack["roster"].as_array().unwrap().len(), 3);
 }
