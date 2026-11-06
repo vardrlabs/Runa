@@ -486,7 +486,9 @@ the threat model's section on removing someone.
 *Who decides.* Every member present except the person being removed must
 approve: the UNANIMOUS policy of the shred machine, with the target left out of
 the count. "The target" is the named peer and any other connection in the
-roster holding the same signing key. Any one of them can stop it by refusing,
+roster holding the same signing key. Every approval names that key as well as
+the peer, so the server recognises all of those connections too. Any one of
+the members who must approve can stop it by refusing,
 and a request nobody settles fails at its deadline (60 seconds by default, at
 most an hour). The request also fails when its proposer or any member whose
 approval it needs leaves, and when the room's epoch changes during the vote,
@@ -515,7 +517,8 @@ replaces another's. Their plaintexts are canonical CBOR maps:
 ```
 EVICT_REQUEST { "type": "EVICT_REQUEST", "id": bstr(16), "epoch": u32,
                 "target": bstr(16)     peer id, all zero for a link change,
-                "targetKey": bstr      the target's signing key, empty for a link change,
+                "targetKey": bstr      the target's signing key as sent in its JOIN,
+                                       empty for a link change,
                 "verifier": bstr(32),
                 "roster": bstr(32)     SHA-256 of the canonical roster bytes,
                 "policy": "UNANIMOUS",
@@ -531,12 +534,20 @@ by the voter's session key over this fixed statement:
 
 ```
 "runa/v1/evict" || room_id (16) || id (16) || epoch (u32 BE)
-  || target peer id (16, zero for none) || voter peer id (16) || verifier (32)
+  || target peer id (16, zero for none)
+  || target key digest (32, zero for none)
+  || voter peer id (16) || verifier (32)
 ```
+
+The target key digest is SHA-256 of the request's `targetKey`: the target's
+signing key in the raw form it sent in its JOIN, 32 bytes for Ed25519 or the
+65-byte uncompressed point for P-256. A link change names neither, and both
+fields are all zero.
 
 A member accepts a request only from a member in its roster, at the epoch it
 holds, naming a target in its roster with the signing key the roster shows for
-it, with a roster hash equal to its own, and with a valid signature. It counts
+it, with a roster hash equal to its own, and with a valid signature over the
+digest of that key. It signs an approval only over that same digest. It counts
 an approval only from a member whose approval the request needs, and only once.
 A REJECT carries no signature: the relay's sender envelope already binds who
 sent it, and under UNANIMOUS any member can block by not answering. A cancel
@@ -547,7 +558,8 @@ under the header epoch the votes name. Its body is a clear part the server
 reads, then a tail it does not:
 
 ```
-id (16) || target (16, zero for none) || verifier (32) || salt (16)
+id (16) || target (16, zero for none) || target key digest (32, zero for none)
+  || verifier (32) || salt (16)
   || config_len (u32 BE) || config_blob || n (u8, 1 to 32)
   || n × ( voter peer id (16) || sig_len (u8, always 64) || sig (64) )
   || tail
@@ -569,25 +581,33 @@ frame's 32-byte header as AAD. The header's frame type keeps a commit's wraps
 apart from a step's. `sig` is the proposer's signature over
 `"runa/v1/evict-commit" || header (32) || clear part || the tail's CBOR without "sig"`.
 
-*Server rules.* The server reads the clear part and nothing after it. It checks
-every signature against the signing key that voter sent in its JOIN: Ed25519
-with strict verification, or ECDSA P-256 over SHA-256 in WebCrypto's 64-byte
-r||s form with a high s accepted, since WebCrypto does not normalise s. Then,
+*Server rules.* The server reads the clear part and nothing after it. It
+refuses a clear part that names a target peer but no key digest, or a digest
+but no peer. It rebuilds each voter's statement from the clear part, with the
+target's peer id and key digest exactly as the clear part gives them, and
+checks every signature against the signing key that voter sent in its JOIN:
+Ed25519 with strict verification, or ECDSA P-256 over SHA-256 in WebCrypto's
+64-byte r||s form with a high s accepted, since WebCrypto does not normalise s.
+Then,
 in one step with the room's epoch and peer list locked, the same lock as an
 EPOCH_KEY step, it requires the header epoch to equal the room's; the sender to
 be one of the voters; a request from the sender recorded within the last hour
-and a minute; voters to be distinct, connected, still holding the key they
-signed with, not the target, and connected before that request passed; and
-more voters than half of the connected members, other than the target, who
-were connected before that request passed. Connections opened after the
-request neither vote nor count. A named target that is no longer connected
-does not stop the commit. It also refuses a verifier that cannot be a
-SHA-256 output and a config larger than a new room's. If all of that holds, it
-replaces the verifier, salt and config, moves the room to the next epoch and
-makes that epoch its root, sends the target ERROR 4014 and closes its
-connection with 4014 if it is still connected, closes any connection without a
-key-agreement key as a step does, and relays the commit to every other member,
-its sender included.
+and a minute; the named target, if it is still connected, to hold the signing
+key whose digest the clear part names; voters to be distinct, connected, still
+holding the key they signed with, not the target, and connected before that
+request passed; and more voters than half of the connected members, other than
+the target, who were connected before that request passed. To the server the
+target is every connection whose signing key has the digest the clear part
+names, as well as the named peer: none of them may vote, and none counts
+toward that half. Connections opened after the request neither vote nor count.
+A named target that is no longer connected does not stop the commit, and a
+connection of the target's that is still open is recognised by its key. It
+also refuses a verifier that cannot be a SHA-256 output and a config larger
+than a new room's. If all of that holds, it replaces the verifier, salt and
+config, moves the room to the next epoch and makes that epoch its root, sends
+ERROR 4014 to every connection of the target's that is still open and closes
+each of them with 4014, closes any connection without a key-agreement key as a
+step does, and relays the commit to every other member, its sender included.
 Anything else is dropped without an answer; a proposer whose commit is not
 echoed within 10 seconds gives up. A commit is not held to the five-second
 spacing between steps, since a quorum of signatures already limits it, but it
@@ -605,11 +625,15 @@ applied the commit ignores. In a room of two, either member can remove the
 other, and whichever commit arrives first wins.
 
 *Members.* A member applies a commit only if, one at a time with every
-EPOCH_KEY it receives: the sender signed it and is one of the voters; its votes
-cover exactly the members the policy needed (the roster the request froze,
-without the target; or, for a member that never saw the request, its own roster
-without the target and itself), each with a valid signature; its own wrap
-opens; the way in
+EPOCH_KEY it receives: the sender signed it and is one of the voters; its
+target key digest is SHA-256 of the `targetKey` in the request it saw for
+that id, or, for a member that never saw the request, SHA-256 of the signing
+key its roster shows for the named peer if that peer is still listed; its
+votes cover exactly the members the policy needed (the roster the request
+froze, without every entry holding the target's signing key; or, for a member
+that never saw the request, its own roster without the named peer, without
+every entry whose signing key has the digest the commit names, and without
+itself), each with a valid signature; its own wrap opens; the way in
 derives the verifier and salt the clear part names and the `confirm` in the
 tail; and the new config opens under the new content key with the same expiry
 and security level. It then starts its keyring again at `root` from the new
@@ -624,10 +648,12 @@ offline at the commit, cannot follow: its next JOIN fails with 4001, and it
 needs the new link or passphrase from someone who was there.
 
 *The removed member.* Its client stops reconnecting on 4014 and says it was
-removed. A client that had reconnected under a new peer id before the commit
-gets no 4014; it sees the commit for the request that named its signing key,
-and stops and says it was removed in the same way. Its old link or passphrase
-now fails with 4001, like a wrong one.
+removed. Every connection still open under its signing key gets 4014, the
+named one and any it had opened again under a new peer id alike, since the
+server knows them by the key the votes name. A client that sees a commit whose
+target key digest is the digest of its own signing key stops and says it was
+removed in the same way, whether or not a 4014 reached it first. Its old link
+or passphrase now fails with 4001, like a wrong one.
 
 *Joining a re-rooted room.* JOIN_ACK's `root_epoch` is the epoch the current
 link opens. A client whose keys have not moved since it derived them treats

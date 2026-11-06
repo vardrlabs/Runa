@@ -226,7 +226,9 @@ What that buys, exactly:
 - **The removed person cannot come back with what they had.** Their old link
   or passphrase is refused like a wrong one, and their page says they were
   removed. Every connection holding their signing key is left out of the vote
-  and of the new link, as well as the one that was named. If someone sends
+  and of the new link, and closed, as well as the one that was named: every
+  vote names that key, so the server recognises those connections too. If
+  someone sends
   them the new one, they can come back, visibly.
 - **They cannot read what is written afterwards**, unless someone gives them
   the new link or passphrase, or a dishonest server helps them (below).
@@ -242,9 +244,11 @@ What that buys, exactly:
 - **Connections opened after a vote started are not counted.** The server
   checks that more than half agreed among the people who were connected when
   the request passed through it, so nobody can hold the vote down by opening
-  connections once it has begun. The person being removed could only inflate
-  the count by opening connections before anyone asked, and those show in the
-  room as extra people, who would then have to be asked too.
+  connections once it has begun. Connections the person being removed holds
+  under their own signing key are not counted at any time. They could only
+  inflate the count by opening connections under other keys before anyone
+  asked, and those show in the room as extra people, who would then have to be
+  asked too.
 - **In a room of two, either person can remove the other.** Whichever request
   reaches the server first wins.
 - **The room's fingerprint changes.** Anyone who compared it before should
@@ -254,8 +258,8 @@ Against the server:
 
 - **It checks the votes itself**, against the signing key each voter joined
   with, and changes nothing unless more than half of the people who were
-  connected when the request passed through it, apart from the one being
-  removed, signed. Members hold the vote to the
+  connected when the request passed through it, apart from every connection
+  holding the removed person's signing key, signed. Members hold the vote to the
   stricter rule that everyone signed. In exchange the server learns which
   connections voted to remove which, and when.
 - **It never sees the new link or passphrase.** Each member's copy is sealed
