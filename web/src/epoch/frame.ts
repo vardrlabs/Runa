@@ -35,7 +35,9 @@ export interface DecodedEpochKey {
 export const MAX_WRAPS = 32;
 export const MAX_HANDOVER_SECRETS = 8192;
 const MAX_CT = MAX_HANDOVER_SECRETS * 32 + 16;
-/// Largest legitimate body is one handover wrap of 8192 secrets, about 262 KB, plus overhead.
+/// Invariant: a handover has exactly one wrap (it is addressed to one newcomer), while a step
+/// carries up to 31 small wraps. The largest legitimate body is therefore one handover wrap of
+/// 8192 secrets, about 262 KB of ct, plus overhead.
 export const MAX_CBOR_LEN = 300_000;
 const SIG_LEN = 64;
 const SIG_DOMAIN = new TextEncoder().encode("runa/v1/epoch-key");
@@ -107,6 +109,7 @@ export function decodeEpochKey(bytes: Uint8Array): DecodedEpochKey | null {
   }
   if (o.root > o.to) return null;
   if (o.kind === "step" && o.to !== o.from + 1) return null;
+  if (o.kind === "handover" && wraps.length !== 1) return null;
   const body: EpochKeyBody = {
     kind: o.kind,
     from: o.from,

@@ -133,10 +133,20 @@ describe("EPOCH_KEY codec", () => {
     expect(MAX_CBOR_LEN).toBe(300_000);
   });
 
+  it("refuses a handover body with two wraps", async () => {
+    const id = await generateIdentity();
+    const w = { p: bytes(16, 5), iv: bytes(12, 6), ct: bytes(48, 7) };
+    const two = await encodeEpochKey(HEADER, body({ kind: "handover", from: 0, to: 3, wraps: [w, { ...w, p: bytes(16, 8) }] }), id);
+    expect(decodeEpochKey(two)).toBeNull();
+    const one = await encodeEpochKey(HEADER, body({ kind: "handover", from: 0, to: 3, wraps: [w] }), id);
+    expect(decodeEpochKey(one)).not.toBeNull();
+  });
+
   it("never throws on a well-sized body of arbitrary bytes", () => {
     fc.assert(
-      fc.property(fc.uint8Array({ maxLength: 600 }), fc.uint8Array({ minLength: 64, maxLength: 64 }), (c, sig) => {
-        decodeEpochKey(frame(c, sig));
+      fc.property(fc.uint8Array({ maxLength: 600 }), fc.uint8Array({ minLength: 64, maxLength: 64 }), (arb, sig) => {
+        // the first byte is fixed at 0xa8 so every run reaches cbor2.decode
+        decodeEpochKey(frame(Uint8Array.of(0xa8, ...arb), sig));
       }),
       { numRuns: 3000 },
     );

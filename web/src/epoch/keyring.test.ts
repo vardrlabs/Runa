@@ -127,6 +127,21 @@ describe("Keyring", () => {
     expect(b.current.epoch).toBe(3);
   });
 
+  it("stays consistent when a handover lands during a step", async () => {
+    const a = await ring();
+    const secrets: Uint8Array[] = [];
+    for (let i = 1; i <= 3; i++) {
+      const s = randomEpochSecret();
+      secrets.push(s);
+      await a.applyStep(i, s, (await stepKeys(a.current, s)).confirm);
+    }
+    const blob = a.secretsBlob();
+    const b = await ring();
+    const first = (await stepKeys(b.current, secrets[0])).confirm;
+    await Promise.all([b.applyStep(1, secrets[0], first), b.applyHandover(3, blob, a.current.confirm)]);
+    expect(b.secretsBlob().length).toBe((b.current.epoch - b.rootEpoch) * 32);
+  });
+
   it("is unusable after wipe", async () => {
     const r = await ring();
     const s = randomEpochSecret();
