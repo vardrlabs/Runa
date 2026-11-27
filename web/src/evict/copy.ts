@@ -26,6 +26,7 @@ export const EVICT_COPY = {
   reject: "Refuse",
   done: "Done",
   copy: "Copy",
+  askFirst: "You can ask the room something yourself first. This question waits until that dialog is closed.",
   newLinkTitle: "THIS ROOM HAS A NEW LINK",
   newPassTitle: "THIS ROOM HAS A NEW PASSPHRASE",
   newWayBody:
@@ -137,7 +138,7 @@ export function proposeErrorText(code: string, way?: WayKind): string {
     case "roster-changed":
       return "Someone joined or left while the request was being made. Try again.";
     case "busy":
-      return "Another request is already open in this room.";
+      return "This tab already has a request open, or eight requests are open in this room. Try again once one has finished.";
     case "not-joined":
     case "not-sent":
       return "This tab is not connected right now. Try again in a moment.";
@@ -154,7 +155,7 @@ export function ignoredText(reason: string, way?: WayKind): string {
   const request = `This tab ignored a request to remove someone or change the ${word}`;
   switch (reason) {
     case "busy":
-      return `${request}, because another one is already open.`;
+      return `${request}, because the person who sent it already has one open, or eight are open already.`;
     case "wrong-root":
       return `${request}, because it was not made under the room's current ${word}.`;
     case "roster-mismatch":

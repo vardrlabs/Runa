@@ -27,7 +27,8 @@ export interface ReRootView {
   removed: string | null;
 }
 
-/// A request is out and not yet settled: nothing new can be asked meanwhile.
+/// This tab's own request is out and not yet settled: it cannot ask again
+/// meanwhile. Other people's requests never stop it asking.
 export function evictInFlight(state: string): boolean {
   return state === "VOTING" || state === "APPROVED";
 }
@@ -132,8 +133,8 @@ export function EvictModal(props: {
     } catch {
       code = "failed";
     }
-    // The page may have closed the dialog meanwhile, for a vote prompt or
-    // because the tab was stranded; its state went with it.
+    // The page may have closed the dialog meanwhile, because the tab was
+    // stranded or the room's way in changed; its state went with it.
     if (!mounted.current) return;
     setBusy(false);
     // The typed passphrase goes whatever the outcome: it was handed over,
@@ -225,13 +226,19 @@ export function EvictModal(props: {
 /// What everyone else is asked. The person to be removed is not asked. It
 /// closes only by answering, like the shred vote, so Escape does nothing
 /// here; focus starts on Refuse, the choice that changes nothing.
+///
+/// It never stops the person asking the room themselves: the prompt covers
+/// the bar, so it offers the bar's two ways of asking as well. Either opens
+/// the ask dialog, and the page puts this prompt aside until that closes.
 export function EvictVotePrompt(props: {
   by: string;
   who: string | null;
   wayKind: WayKind;
   returnFocus?: FocusFallback;
   onDecide(choice: "APPROVE" | "REJECT"): void;
+  onAsk?(relink: boolean): void;
 }) {
+  const words = evictCopy(props.wayKind);
   const rejectRef = useRef<HTMLButtonElement>(null);
   useDialogFocus(rejectRef, props.returnFocus);
   return (
@@ -255,6 +262,17 @@ export function EvictVotePrompt(props: {
             {EVICT_COPY.approve}
           </button>
         </div>
+        {props.onAsk && (
+          <div role="group" aria-labelledby="evict-vote-ask" data-evict-ask="" style={{ marginTop: 16 }}>
+            <p id="evict-vote-ask" className="hint">
+              {EVICT_COPY.askFirst}
+            </p>
+            <div className="row" style={{ justifyContent: "flex-end" }}>
+              <button onClick={() => props.onAsk?.(false)}>{EVICT_COPY.removeButton}</button>
+              <button onClick={() => props.onAsk?.(true)}>{words.relinkButton}</button>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );

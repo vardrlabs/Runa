@@ -80,6 +80,68 @@ export interface MachineDeps {
   /// passphrase, or of the last re-root.
   root(): number;
   statement?(s: Statement, voter: Uint8Array): Uint8Array;
+  /// The record of request ids seen under this root, when several machines
+  /// share one: the coordinator runs one machine per open request, and a
+  /// request id is seen once by the member, not once by each vote. Left out,
+  /// the machine keeps its own.
+  seen?: SeenRequests;
+}
+
+/// Request ids a member received or made under the current root, with the
+/// proposal it froze for each, or null for one it refused. A commit for a
+/// proposal here is judged against it, even after the vote ended; a commit
+/// for any other id is one this member cannot place, and it never applies one
+/// of those. Bounded by `MAX_SEEN_REQUESTS` and emptied when the root moves; a
+/// key step leaves it as it is.
+export class SeenRequests {
+  private root = -1;
+  private ids = new Map<string, Proposal | null>();
+
+  /// `held` says whether a proposal belongs to a vote that is open now. Such
+  /// a proposal is never let go to make room.
+  constructor(
+    private rootOf: () => number,
+    private held: (p: Proposal) => boolean,
+  ) {}
+
+  private table(): Map<string, Proposal | null> {
+    const root = this.rootOf();
+    if (root !== this.root) {
+      this.root = root;
+      this.ids.clear();
+    }
+    return this.ids;
+  }
+
+  mark(id: Uint8Array, p: Proposal | null): void {
+    const table = this.table();
+    const key = hexOf(id);
+    if (!table.has(key) && table.size >= MAX_SEEN_REQUESTS) this.letOneGo(table);
+    table.set(key, p);
+  }
+
+  /// Lets go of the oldest refused id, or if there is none the oldest
+  /// proposal that no open vote holds. Refused ids cost a sender nothing to
+  /// make, so they never push a proposal out while one of them is left.
+  private letOneGo(table: Map<string, Proposal | null>): void {
+    let victim: string | null = null;
+    for (const [k, v] of table) {
+      if (v === null) {
+        victim = k;
+        break;
+      }
+      if (victim === null && !this.held(v)) victim = k;
+    }
+    if (victim !== null) table.delete(victim);
+  }
+
+  has(id: Uint8Array): boolean {
+    return this.table().has(hexOf(id));
+  }
+
+  get(id: Uint8Array): Proposal | null {
+    return this.table().get(hexOf(id)) ?? null;
+  }
 }
 
 export interface Proposal {
@@ -107,62 +169,32 @@ export class EvictMachine {
   private p: Proposal | null = null;
   /// Approvals by voter (hex), with their signatures, for the commit.
   private approvals = new Map<string, Uint8Array>();
-  /// Request ids this member received or made under the current root, with
-  /// the proposal it froze, or null for one it refused. A commit for a
-  /// proposal here is judged against it, even after a newer request replaced
-  /// it; a commit for any other id is one this member cannot place, and it
-  /// never applies one of those. Bounded by `MAX_SEEN_REQUESTS` and emptied
-  /// when the root moves; a key step leaves it as it is. It lives here, not in
-  /// the coordinator, because `commitSatisfies` is what decides which set a
-  /// commit is held to, and `open` is the one place a proposal is frozen.
-  private seenRoot = -1;
-  private seenIds = new Map<string, Proposal | null>();
+  /// The record of request ids seen under the current root (`SeenRequests`).
+  /// It lives with the machines, not in the coordinator alone, because
+  /// `commitSatisfies` is what decides which set a commit is held to, and
+  /// `open` is the one place a proposal is frozen. A machine on its own keeps
+  /// its own record, which never lets go of the proposal it holds now.
+  private seen: SeenRequests;
 
-  constructor(private d: MachineDeps) {}
-
-  private seenTable(): Map<string, Proposal | null> {
-    const root = this.d.root();
-    if (root !== this.seenRoot) {
-      this.seenRoot = root;
-      this.seenIds.clear();
-    }
-    return this.seenIds;
+  constructor(private d: MachineDeps) {
+    this.seen = d.seen ?? new SeenRequests(() => d.root(), (p) => p === this.p);
   }
 
   private markSeen(id: Uint8Array, p: Proposal | null): void {
-    const table = this.seenTable();
-    const key = hexOf(id);
-    if (!table.has(key) && table.size >= MAX_SEEN_REQUESTS) this.letOneGo(table);
-    table.set(key, p);
-  }
-
-  /// Lets go of the oldest refused id, or if there is none the oldest
-  /// proposal other than the one this member holds now. Refused ids cost a
-  /// sender nothing to make, so they never push a proposal out while one of
-  /// them is left.
-  private letOneGo(table: Map<string, Proposal | null>): void {
-    let victim: string | null = null;
-    for (const [k, v] of table) {
-      if (v === null) {
-        victim = k;
-        break;
-      }
-      if (victim === null && v !== this.p) victim = k;
-    }
-    if (victim !== null) table.delete(victim);
+    this.seen.mark(id, p);
   }
 
   /// Whether this member still holds a record of a request with this id
   /// under the current root, whatever became of it.
   wasSeen(id: Uint8Array): boolean {
-    return this.seenTable().has(hexOf(id));
+    return this.seen.has(id);
   }
 
   /// The proposal this member froze for that id under the current root, if
   /// it opened one and still holds it. Only a commit for one of these is ever
   /// applied.
   requestFor(id: Uint8Array): Proposal | null {
-    return this.seenTable().get(hexOf(id)) ?? null;
+    return this.seen.get(id);
   }
 
   private statementFor(s: Statement, voter: Uint8Array): Uint8Array {
@@ -250,7 +282,7 @@ export class EvictMachine {
     this.pastDeadline();
     // An id already received under this root is never opened again: a relayed
     // copy of a request this member refused would otherwise ask it again.
-    if (this.seenTable().has(hexOf(req.id))) return "busy";
+    if (this.seen.has(req.id)) return "busy";
     if (SETTLED.includes(this.state)) this.reset();
     // Received, so never judged later as a request this member did not see.
     this.markSeen(req.id, null);

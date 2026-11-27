@@ -4,6 +4,7 @@ import { EPOCH_OVERLAP_MS } from "./epoch/rotation";
 import { handleFromPubkey } from "./doc/awareness";
 import type { ReRooted } from "./evict/coordinator";
 import { KEY_STATUS_TEXT, keyStatusReporter, keyStatusText, Session } from "./session";
+import { hexOf } from "./evict/statement";
 import { toB64 } from "./transport/socket";
 
 /// What a Session's eviction wiring touches, built without a network. Each
@@ -108,7 +109,8 @@ interface SessionPrivates {
   forgetOldRoot(): Promise<void>;
   removedFromRoom(): void;
   evictRefused(reason: string): void;
-  evictStateChanged(state: string, reason?: string): void;
+  evictStateChanged(state: string, reason?: string, vote?: { id: string; mine: boolean }): void;
+  respondToEviction(id: string, choice: "APPROVE" | "REJECT"): Promise<void>;
   raiseEvictPrompt(p: { requestId: Uint8Array; proposerKey: Uint8Array; target: Uint8Array | null; targetKey: Uint8Array | null }): Promise<void>;
   proposeEviction(target: Uint8Array | null, passphrase?: string): Promise<string | null>;
   sealedConfig(): { ttl: { kind: string; secs: number }; ceilingOptout: boolean; level: string };
@@ -433,7 +435,9 @@ describe("what the session says about eviction frames", () => {
     const proposerKey = new Uint8Array(32).fill(5);
     const targetKey = new Uint8Array(32).fill(6);
     await session.raiseEvictPrompt({ requestId: new Uint8Array(16), proposerKey, target: new Uint8Array(16), targetKey });
-    expect(shown.prompts).toEqual([{ by: await handleFromPubkey(proposerKey), who: await handleFromPubkey(targetKey) }]);
+    expect(shown.prompts).toEqual([
+      { id: toB64(new Uint8Array(16)), by: await handleFromPubkey(proposerKey), who: await handleFromPubkey(targetKey) },
+    ]);
   });
 
   it("tells a tab left out of a re-root what happened without the tampering alarm", () => {
@@ -479,7 +483,8 @@ describe("what the session says about eviction frames", () => {
     const { s, session, shown } = fakeSession();
     const requestId = new Uint8Array(16).fill(3);
     const machine = { state: "VOTING", current: () => ({ request: { id: requestId } }) };
-    s.evict = { machine };
+    // Open and collecting answers: the one request the machine holds.
+    s.evict = { isVoting: (id: Uint8Array) => machine.state === "VOTING" && hexOf(machine.current().request.id) === hexOf(id) };
     const prompt = { requestId, proposerKey: new Uint8Array(32).fill(5), target: null, targetKey: null };
     const raising = session.raiseEvictPrompt(prompt);
     machine.state = "CANCELLED";
@@ -491,6 +496,30 @@ describe("what the session says about eviction frames", () => {
     // A different request open now is not the one asked about.
     await session.raiseEvictPrompt({ ...prompt, requestId: new Uint8Array(16).fill(4) });
     expect(shown.prompts).toHaveLength(1);
+  });
+});
+
+describe("answering one of several open votes (V1)", () => {
+  it("raises a prompt for each open request, naming it, and answers the request the prompt named", async () => {
+    const { s, session, shown } = fakeSession();
+    const first = new Uint8Array(16).fill(3);
+    const second = new Uint8Array(16).fill(4);
+    const vote = vi.fn(async () => undefined);
+    s.evict = { isVoting: () => true, vote };
+    const proposerKey = new Uint8Array(32).fill(5);
+    await session.raiseEvictPrompt({ requestId: first, proposerKey, target: null, targetKey: null });
+    await session.raiseEvictPrompt({ requestId: second, proposerKey, target: null, targetKey: null });
+    expect((shown.prompts as { id: string }[]).map((p) => p.id)).toEqual([toB64(first), toB64(second)]);
+    await session.respondToEviction(toB64(second), "REJECT");
+    expect(vote).toHaveBeenCalledWith(second, "REJECT");
+  });
+
+  it("passes on which request a state is about, and whether it is this tab's own", () => {
+    const { s, session } = fakeSession();
+    const states: unknown[][] = [];
+    (s.events as Record<string, unknown>).onEvictState = (...args: unknown[]) => states.push(args);
+    session.evictStateChanged("REJECTED", undefined, { id: "AAAA", mine: false });
+    expect(states).toEqual([["REJECTED", undefined, { id: "AAAA", mine: false }]]);
   });
 });
 

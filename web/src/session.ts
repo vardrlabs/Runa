@@ -283,17 +283,21 @@ export interface SessionEvents {
   /// states that may mean tampering.
   onKeyStatus?(message: string | null, alarming: boolean): void;
   /// Someone asks this member to agree to removing someone, or to changing
-  /// the link (amendment K). `who` is null for a link change.
+  /// the link (amendment K). `who` is null for a link change, and `id` names
+  /// the request, which the answer names in turn: several votes can be open
+  /// at once.
   ///
   /// Raised after the names are worked out, which awaits. The session does
-  /// not raise it for a vote that is no longer open by then, but a state can
-  /// still overtake it on the way to the page: a page that has already shown
-  /// a terminal state (REJECTED, EXPIRED, CANCELLED, FAILED, DONE) for the
-  /// vote ignores a prompt that comes after it. Answering one anyway is
-  /// harmless, since the coordinator refuses a vote for a closed request.
-  onEvictPrompt?(p: { by: string; who: string | null }): void;
-  /// Where a vote to remove someone or change the link stands.
-  onEvictState?(state: string, reason?: string): void;
+  /// not raise it for a vote that is no longer open by then. A page that has
+  /// already shown a terminal state (REJECTED, EXPIRED, CANCELLED, FAILED,
+  /// DONE) for that request ignores a prompt for it that comes after. Answering
+  /// one anyway is harmless, since the coordinator refuses a vote for a closed
+  /// request.
+  onEvictPrompt?(p: { id: string; by: string; who: string | null }): void;
+  /// Where a vote to remove someone or change the link stands. `vote` names
+  /// the request and says whether it is this tab's own; it is left out only
+  /// for a tab left out of a re-root with no vote open.
+  onEvictState?(state: string, reason?: string, vote?: { id: string; mine: boolean }): void;
   /// A request this member ignored, and why.
   onEvictIgnored?(reason: string): void;
   /// The room has a new link or passphrase, to show once.
@@ -659,7 +663,7 @@ export class Session {
       sealedConfig: () => session.sealedConfig(),
       applyReRoot: (r) => session.applyReRoot(r),
       prompt: (p) => void session.raiseEvictPrompt(p),
-      state: (st, reason) => session.evictStateChanged(st, reason),
+      state: (st, reason, vote) => session.evictStateChanged(st, reason, vote ? { id: toB64(vote.requestId), mine: vote.mine } : undefined),
       refused: (reason) => session.evictRefused(reason),
       leftOut: () => {
         session.reportKeyStatus("left-out");
@@ -939,8 +943,15 @@ export class Session {
     return this.evict.propose(victim, way);
   }
 
-  respondToEviction(choice: "APPROVE" | "REJECT"): Promise<void> {
-    return this.evict.vote(choice);
+  /// This member's answer to the request the prompt `id` showed.
+  respondToEviction(id: string, choice: "APPROVE" | "REJECT"): Promise<void> {
+    let requestId: Uint8Array;
+    try {
+      requestId = fromB64(id);
+    } catch {
+      return Promise.resolve();
+    }
+    return this.evict.vote(requestId, choice);
   }
 
   cancelEviction(): Promise<void> {
@@ -1064,31 +1075,25 @@ export class Session {
       const by = await handleFromPubkey(p.proposerKey);
       const who = p.targetKey ? await handleFromPubkey(p.targetKey) : null;
       // The vote may have ended during the awaits above.
-      if (this.evict && !this.voteStillOpen(p.requestId)) return;
-      this.events.onEvictPrompt?.({ by, who });
+      if (this.evict && !this.evict.isVoting(p.requestId)) return;
+      this.events.onEvictPrompt?.({ id: toB64(p.requestId), by, who });
     } catch {
       // A page that cannot show the prompt leaves the vote to its deadline.
     }
-  }
-
-  private voteStillOpen(requestId: Uint8Array): boolean {
-    const m = this.evict.machine;
-    const cur = m.current();
-    return m.state === "VOTING" && cur !== null && bytesEqual(cur.request.id, requestId);
   }
 
   /// Where a vote stands, from the evict coordinator. When it fails this
   /// tab's own commit, it reports FAILED with the commit's fault and then
   /// refuses the commit with the same reason, in the same task: that refusal
   /// is noted here as this tab's own.
-  private evictStateChanged(state: string, reason?: string): void {
+  private evictStateChanged(state: string, reason?: string, vote?: { id: string; mine: boolean }): void {
     this.ownCommitFailed = state === "FAILED" && reason?.startsWith("commit-") ? reason : null;
     if (this.ownCommitFailed !== null) {
       queueMicrotask(() => {
         this.ownCommitFailed = null;
       });
     }
-    this.events.onEvictState?.(state, reason);
+    this.events.onEvictState?.(state, reason, vote);
     if (state === "FAILED" && reason === "left-out") this.leftOutOfReRoot();
   }
 

@@ -24,7 +24,7 @@ import {
   type EvictRequest,
   type EvictVote,
 } from "./frame";
-import { COMMIT_WAIT_MS, EvictMachine, type EvictState } from "./machine";
+import { COMMIT_WAIT_MS, EvictMachine, SeenRequests, type EvictState, type Guard, type Proposal } from "./machine";
 import { decodeWayIn, deriveReRoot, encodeWayIn, wipeWayIn, type ReRootKeys, type WayIn } from "./reroot";
 import { bytesEqual as eq, hexOf, keyDigest, rosterDigest, voteStatement } from "./statement";
 
@@ -37,6 +37,13 @@ import { bytesEqual as eq, hexOf, keyDigest, rosterDigest, voteStatement } from 
 /// key update in the room, so no task here calls `exclusive` again and none
 /// waits for the network to answer. The wait for a commit's echo is a
 /// deadline checked in `tick`.
+///
+/// Several votes can be open at once, each in its own `EvictMachine` with its
+/// own frozen roster, deadline, approvals and commit wait. A vote, a cancel
+/// and a commit find their vote by request id. The machines share one record
+/// of the request ids seen under the root, so a request id is opened once by
+/// this member, whichever vote it would have been. This member has at most
+/// one request of its own open, so it holds at most one new way in.
 
 export const DEFAULT_DEADLINE_MS = 60_000;
 /// How long a proposer waits for its commit to come back from the server,
@@ -54,6 +61,11 @@ export const EARLY_HOLD_MS = 5_000;
 /// most `MAX_VOTES` votes, one per sender, and one cancel, and one sender has
 /// frames held for one id at a time, so no sender can fill the buffer alone.
 export const MAX_EARLY_IDS = 8;
+/// How many removal requests a member holds open at once, its own included.
+/// Each sender has at most one open here, and a request past either bound is
+/// refused as "busy". So nobody can keep everyone else from asking by keeping
+/// a request of their own open: theirs takes one place, not all of them.
+export const MAX_OPEN_REQUESTS = 8;
 
 export interface SealedConfig {
   ttl: { kind: string; secs: number };
@@ -80,6 +92,13 @@ export interface EvictPrompt {
   targetKey: Uint8Array | null;
 }
 
+/// Which vote a state is about: its request id, and whether it is this
+/// member's own request.
+export interface VoteRef {
+  requestId: Uint8Array;
+  mine: boolean;
+}
+
 export interface EvictDeps {
   roomId: Uint8Array;
   identity: Identity;
@@ -96,7 +115,9 @@ export interface EvictDeps {
   sealedConfig(): SealedConfig;
   applyReRoot(r: ReRooted): void;
   prompt(p: EvictPrompt): void;
-  state(s: EvictState, reason?: string): void;
+  /// `vote` is left out only when a commit left this member out and it had
+  /// no vote open to end.
+  state(s: EvictState, reason?: string, vote?: VoteRef): void;
   refused(reason: string): void;
   leftOut(): void;
   /// This tab holds the key a commit removed, and saw the commit anyway (a
@@ -120,6 +141,16 @@ interface Pending {
   sends: number;
 }
 
+/// One open vote: its machine, the last state handed to `deps.state` for it,
+/// so a state the machine reached on its own (a vote that ran past its
+/// deadline, say) is reported once, and whether it is this member's request.
+interface Vote {
+  id: Uint8Array;
+  machine: EvictMachine;
+  reported: EvictState;
+  mine: boolean;
+}
+
 /// Frames for one request id that came before the request did.
 interface Early {
   at: number;
@@ -133,7 +164,23 @@ function epochOfHeader(header: Uint8Array): number | null {
 }
 
 export class EvictCoordinator {
-  readonly machine: EvictMachine;
+  /// The open votes by request id (hex), in the order they opened. A vote is
+  /// dropped once it has ended and its ending has been reported, and every
+  /// vote ends when the root moves. A request being checked holds its place
+  /// here, still IDLE, while its checks await.
+  private votes = new Map<string, Vote>();
+  /// Every request id seen under the root, shared by every vote's machine.
+  private seen: SeenRequests;
+  /// A machine that never opens a vote. It checks commits against the shared
+  /// record, whether or not the vote they are for is still open.
+  private checker: EvictMachine;
+  /// The request a commit was applied for, so a vote or cancel for it still
+  /// in flight is ignored.
+  private doneId: Uint8Array | null = null;
+  /// The request this member opened last, so a commit applied for it after
+  /// its vote ended is still reported as DONE, as long as no newer request has
+  /// opened since.
+  private lastId: Uint8Array | null = null;
   /// The proposer's new way in, from its request until its commit is echoed
   /// or the vote ends.
   private pending: Pending | null = null;
@@ -146,26 +193,78 @@ export class EvictCoordinator {
   /// id, and the root they were held under.
   private early = new Map<string, Early>();
   private earlyRoot = -1;
-  /// The last state handed to `deps.state`, so a state the machine reached on
-  /// its own (a vote that ran past its deadline, say) is reported once.
-  private reported: EvictState = "IDLE";
   private dead = false;
 
   constructor(private d: EvictDeps) {
-    this.machine = new EvictMachine({
+    this.seen = new SeenRequests(
+      () => d.keyring.rootEpoch,
+      (p) => this.holds(p),
+    );
+    this.checker = this.newMachine();
+  }
+
+  private newMachine(): EvictMachine {
+    const d = this.d;
+    return new EvictMachine({
       roomId: d.roomId,
       me: () => d.me(),
       myKey: () => d.identity.publicKeyRaw,
       members: () => d.members(),
       now: () => d.now(),
       root: () => d.keyring.rootEpoch,
+      seen: this.seen,
     });
   }
 
-  /// True while a vote is open or this member's commit is in flight. Steps
+  /// Whether an open vote, or this member's commit kept for a late echo,
+  /// still needs this proposal: the shared record never lets go of one.
+  private holds(p: Proposal): boolean {
+    for (const v of this.votes.values()) if (v.machine.current() === p) return true;
+    return this.late !== null && eq(this.late.requestId, p.request.id);
+  }
+
+  /// True while any vote is open or this member's commit is in flight. Steps
   /// wait meanwhile.
   isOpen(): boolean {
-    return this.machine.isOpen() || this.pending !== null;
+    for (const v of this.votes.values()) if (v.machine.isOpen()) return true;
+    return this.pending !== null;
+  }
+
+  /// The ids of the votes open now, in the order they opened.
+  openRequests(): Uint8Array[] {
+    return [...this.votes.values()].filter((v) => v.machine.isOpen()).map((v) => v.id.slice());
+  }
+
+  /// Whether the vote on this request is open and still collecting answers.
+  isVoting(requestId: Uint8Array): boolean {
+    return this.votes.get(hexOf(requestId))?.machine.state === "VOTING";
+  }
+
+  /// The proposal this member froze for that request id under the current
+  /// root, if it opened one and still holds it.
+  requestFor(id: Uint8Array): Proposal | null {
+    return this.seen.get(id);
+  }
+
+  /// This member's own vote, if it has one open.
+  private ownVote(): Vote | null {
+    for (const v of this.votes.values()) if (v.mine) return v;
+    return null;
+  }
+
+  /// Whether a request from `sender` (this member, when it asks itself) is
+  /// over the bounds: that sender already has one open here, or as many are
+  /// open as a member holds. A request whose checks are still running counts.
+  private overBounds(sender: Uint8Array): boolean {
+    let n = 0;
+    for (const v of this.votes.values()) {
+      const m = v.machine;
+      if (!m.isOpen() && m.state !== "IDLE") continue;
+      n += 1;
+      const p = m.current();
+      if (p && eq(p.proposer, sender)) return true;
+    }
+    return n >= MAX_OPEN_REQUESTS;
   }
 
   /// No entry point rejects: a failure of any kind becomes `fallback`.
@@ -205,14 +304,19 @@ export class EvictCoordinator {
     this.say(() => this.d.refused(reason));
   }
 
-  /// Tells `deps.state` about the machine's state if it moved, and lets go of
-  /// the new way in once the vote is over without a commit.
-  private report(reason?: string): void {
-    if (!this.machine.isOpen() && this.pending) this.dropPending();
-    const s = this.machine.state;
-    if (s === this.reported) return;
-    this.reported = s;
-    if (s !== "IDLE") this.say(() => this.d.state(s, reason));
+  /// Tells `deps.state` about a vote's state if it moved, lets go of the new
+  /// way in once this member's own vote is over without a commit, and drops
+  /// a vote that has ended.
+  private report(v: Vote, reason?: string): void {
+    const m = v.machine;
+    if (v.mine && !m.isOpen() && this.pending && eq(this.pending.requestId, v.id)) this.dropPending();
+    const s = m.state;
+    if (s !== v.reported) {
+      v.reported = s;
+      if (s !== "IDLE") this.say(() => this.d.state(s, reason, { requestId: v.id.slice(), mine: v.mine }));
+    }
+    const key = hexOf(v.id);
+    if (!m.isOpen() && s !== "IDLE" && this.votes.get(key) === v) this.votes.delete(key);
   }
 
   /// Lets go of held frames that are too old or from under another root.
@@ -260,29 +364,39 @@ export class EvictCoordinator {
     return n;
   }
 
-  /// Replays what was held for a request the machine has just opened, in the
-  /// same queue task, through the machine's own checks.
-  private async replayEarly(id: Uint8Array): Promise<void> {
+  /// Replays what was held for a request a vote's machine has just opened,
+  /// in the same queue task, through the machine's own checks.
+  private async replayEarly(v: Vote): Promise<void> {
     this.pruneEarly();
+    const id = v.id;
     const key = hexOf(id);
     const e = this.early.get(key);
     if (!e) return;
     this.early.delete(key);
     if (e.cancel) {
-      const guard = this.machine.onCancel(id, e.cancel);
+      const guard = v.machine.onCancel(id, e.cancel);
       if (guard) this.refused(guard);
     }
     for (const { sender, vote } of e.votes) {
-      if (this.dead || this.machine.state !== "VOTING") return;
-      const guard = await this.machine.onVote(vote, sender);
+      if (this.dead || v.machine.state !== "VOTING") return;
+      const guard = await v.machine.onVote(vote, sender);
       if (guard) this.refused(guard);
     }
   }
 
-  private abandon(reason: string): void {
-    this.dropPending();
-    this.machine.fail();
-    this.report(reason);
+  /// Ends a vote that cannot go on, and lets go of the new way in if the vote
+  /// is this member's own.
+  private abandon(v: Vote, reason: string): void {
+    if (v.mine) this.dropPending();
+    v.machine.fail();
+    this.report(v, reason);
+  }
+
+  /// Ends this member's own vote, the one its new way in belongs to.
+  private abandonOwn(reason: string): void {
+    const v = this.ownVote();
+    if (v) this.abandon(v, reason);
+    else this.dropPending();
   }
 
   /// Ask the room to remove `target`, or nobody (a link change), with `way`
@@ -304,7 +418,9 @@ export class EvictCoordinator {
       if (this.dead) return "failed";
       const me = this.d.me()?.slice() ?? null;
       if (!me) return "not-joined";
-      if (this.isOpen()) return "busy";
+      // One request of its own at a time, and none past the bound on open
+      // requests; other members' open requests do not stop it asking.
+      if (this.pending !== null || this.overBounds(me)) return "busy";
       if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > MAX_DEADLINE_MS) return "failed";
       // The votes name the root, so a key step during the vote changes nothing.
       const root = this.d.keyring.rootEpoch;
@@ -342,29 +458,32 @@ export class EvictCoordinator {
       // Checked again after the last await: nothing above may have moved.
       const meNow = this.d.me();
       if (this.dead || !meNow || !eq(meNow, me)) return "failed";
-      if (this.isOpen() || this.d.keyring.rootEpoch !== root) return "busy";
+      if (this.pending !== null || this.overBounds(me) || this.d.keyring.rootEpoch !== root) return "busy";
       // Someone joined or left meanwhile: every member would refuse the
       // request's roster digest, so it is not sent.
       if (!eq(canonicalRosterBytes(this.d.members()), canonicalRosterBytes(members))) return "roster-changed";
-      this.machine.start(req, me, members, targetKeyDigest);
+      const machine = this.newMachine();
+      machine.start(req, me, members, targetKeyDigest);
+      const v: Vote = { id: id.slice(), machine, reported: "IDLE", mine: true };
+      this.votes.set(hexOf(id), v);
+      this.lastId = id.slice();
       this.pending = { requestId: id, root, way, keys, config, sentAt: null, sentEpoch: null, sends: 0 };
       kept = true;
-      this.reported = "IDLE";
       let sent = false;
       try {
         sent = await this.d.sendSealed(FT.EVICT_REQUEST, frame);
       } catch {
-        this.abandon("send-failed");
+        this.abandon(v, "send-failed");
         return "failed";
       }
       if (this.dead || this.pending?.requestId !== id) return "failed";
       if (!sent) {
-        this.abandon("not-sent");
+        this.abandon(v, "not-sent");
         return "not-sent";
       }
-      this.report();
+      this.report(v);
       // A room of two: the proposer's approval is all there is.
-      if (this.machine.state === "APPROVED") await this.commitNow();
+      if (machine.state === "APPROVED") await this.commitNow();
       return null;
     } finally {
       if (!kept) {
@@ -374,53 +493,59 @@ export class EvictCoordinator {
     }
   }
 
-  vote(choice: "APPROVE" | "REJECT"): Promise<void> {
-    return this.run(() => this.voteNow(choice), undefined);
+  /// This member's answer to the request `requestId`. An answer to a vote
+  /// that is not open here changes nothing.
+  vote(requestId: Uint8Array, choice: "APPROVE" | "REJECT"): Promise<void> {
+    return this.run(() => this.voteNow(requestId, choice), undefined);
   }
 
-  private async voteNow(choice: "APPROVE" | "REJECT"): Promise<void> {
-    const p = this.machine.current();
+  private async voteNow(requestId: Uint8Array, choice: "APPROVE" | "REJECT"): Promise<void> {
+    const key = hexOf(requestId);
+    const v = this.votes.get(key);
+    const p = v?.machine.current() ?? null;
     const me = this.d.me();
-    if (this.dead || !p || !me || this.machine.state !== "VOTING") return;
+    if (this.dead || !v || !p || !me || v.machine.state !== "VOTING") return;
     // The target is not asked, and the proposer's request already is its vote.
     if (eq(p.proposer, me) || !p.policySet.some((r) => eq(r.peerId, me))) return;
     // Already approved, before a key step or not: its vote stands.
-    if (this.machine.hasApproved(me)) return;
+    if (v.machine.hasApproved(me)) return;
     const r = p.request;
     if (choice === "REJECT") {
-      this.machine.rejectOwn();
-      this.report();
+      v.machine.rejectOwn();
+      this.report(v);
       await this.d.sendSealed(FT.EVICT_VOTE, encodeVote({ id: r.id, vote: "REJECT", sig: null }));
       return;
     }
     // The digest the machine took from the request's `targetKey`, which it
     // checked against this member's roster before the vote opened.
     const sig = await signPayload(this.d.identity, voteStatement(this.d.roomId, r.id, r.root, r.target, p.targetKeyDigest, me, r.verifier));
-    if (this.dead || this.machine.current() !== p || this.machine.state !== "VOTING") return;
-    this.machine.recordOwn(sig);
-    this.report();
-    if (this.machine.state !== "VOTING" && this.machine.state !== "APPROVED") return;
+    if (this.dead || this.votes.get(key) !== v || v.machine.current() !== p || v.machine.state !== "VOTING") return;
+    v.machine.recordOwn(sig);
+    this.report(v);
+    if (v.machine.state !== "VOTING" && v.machine.state !== "APPROVED") return;
     let sent = false;
     try {
       sent = await this.d.sendSealed(FT.EVICT_VOTE, encodeVote({ id: r.id, vote: "APPROVE", sig }));
     } catch {
       // Handled below.
     }
-    if (!sent && this.machine.current() === p && this.machine.isOpen()) this.abandon("not-sent");
+    if (!sent && this.votes.get(key) === v && v.machine.current() === p && v.machine.isOpen()) this.abandon(v, "not-sent");
   }
 
+  /// Withdraws this member's own request, the only one it can withdraw.
   cancel(): Promise<void> {
     return this.run(async () => {
-      const p = this.machine.current();
+      const v = this.ownVote();
+      const p = v?.machine.current() ?? null;
       const me = this.d.me();
-      if (this.dead || !p || !me || !eq(p.proposer, me) || !this.machine.isOpen() || this.pending?.sentAt != null) return;
+      if (this.dead || !v || !p || !me || !eq(p.proposer, me) || !v.machine.isOpen() || this.pending?.sentAt != null) return;
       // Whether it went out or not, the proposer ends its own vote; members
       // that never hear of it fail on their own deadline or commit wait.
       await this.d.sendSealed(FT.EVICT_CANCEL, encodeCancel({ id: p.request.id }));
-      if (this.dead || this.machine.current() !== p || !this.machine.isOpen()) return;
-      this.machine.cancel();
+      if (this.dead || this.votes.get(hexOf(v.id)) !== v || v.machine.current() !== p || !v.machine.isOpen()) return;
+      v.machine.cancel();
       this.dropPending();
-      this.report();
+      this.report(v);
     }, undefined);
   }
 
@@ -434,26 +559,40 @@ export class EvictCoordinator {
     if (frameType === FT.EVICT_REQUEST) {
       const req = decodeRequest(plaintext);
       if (!req) return this.refused("malformed");
-      // A vote that ran out, or whose root moved, is reported as such before
-      // a new request can replace it. Only a vote still collecting approvals:
-      // an approved one waiting on its commit is the session timer's to end,
-      // since the proposer's way in may still be kept for a late echo.
-      if (this.machine.state === "VOTING") this.report(this.machine.tick(this.d.now())?.reason);
+      // A vote that ran out, or whose root moved, is reported as such, and
+      // gives up its place, before a new request is counted against the
+      // bounds. Only votes still collecting approvals: an approved one
+      // waiting on its commit is the session timer's to end, since the
+      // proposer's way in may still be kept for a late echo.
+      for (const v of [...this.votes.values()]) if (v.machine.state === "VOTING") this.report(v, v.machine.tick(this.d.now())?.reason);
       // Another copy of a request this member already holds, open or settled,
       // asks nothing new.
-      if (this.machine.wasSeen(req.id)) return;
-      const guard = await this.machine.onRequest(req, sender);
-      if (guard) {
-        this.report();
-        return this.refused(guard);
+      if (this.seen.has(req.id)) return;
+      // One open request per sender, and a bound on all of them. Received,
+      // so never judged later as a request this member did not see.
+      if (this.overBounds(sender)) {
+        this.seen.mark(req.id, null);
+        return this.refused("busy");
       }
+      const key = hexOf(req.id);
+      const v: Vote = { id: req.id.slice(), machine: this.newMachine(), reported: "IDLE", mine: false };
+      // It holds its place while its checks await, so the bounds above still
+      // hold when it opens.
+      this.votes.set(key, v);
+      let guard: Guard | null = "malformed";
+      try {
+        guard = await v.machine.onRequest(req, sender);
+      } finally {
+        if (guard !== null && this.votes.get(key) === v) this.votes.delete(key);
+      }
+      if (guard) return this.refused(guard);
+      this.lastId = req.id.slice();
       // Votes and a cancel that overtook the request count now, before
       // anyone is asked: a cancelled or refused request asks nobody.
-      await this.replayEarly(req.id);
+      await this.replayEarly(v);
       if (this.dead) return;
-      this.reported = "IDLE";
-      this.report();
-      if (this.machine.current()?.request !== req || this.machine.state !== "VOTING") return;
+      this.report(v);
+      if (this.votes.get(key) !== v || v.machine.current()?.request !== req || v.machine.state !== "VOTING") return;
       // The person to be removed is not asked: the vote is about them. That
       // includes this tab under an earlier connection's peer id, which the
       // request names by its signing key.
@@ -469,23 +608,27 @@ export class EvictCoordinator {
     const id = v?.id ?? c?.id;
     if (!id) return this.refused("malformed");
     // A vote or cancel still in flight when the commit was applied.
-    const cur = this.machine.current();
-    if (cur && eq(cur.request.id, id) && this.machine.state === "DONE") return;
+    if (this.doneId && eq(this.doneId, id)) return;
     // One that overtook its request waits for it.
-    if (!this.machine.wasSeen(id)) return this.hold(id, sender, v);
+    if (!this.seen.has(id)) return this.hold(id, sender, v);
     // One for a request this member received but refused has nothing to
     // count toward, and is not shown as a refusal of its own.
-    if (!this.machine.requestFor(id)) return;
+    const placed = this.seen.get(id);
+    if (!placed) return;
+    const vote = this.votes.get(hexOf(id));
+    // One for a vote that has ended here counts toward nothing.
+    if (!vote) return this.refused(v || eq(placed.proposer, sender) ? "not-voting" : "cancel-not-from-proposer");
     if (v) {
-      const guard = await this.machine.onVote(v, sender);
+      const guard = await vote.machine.onVote(v, sender);
       if (this.dead) return;
-      this.report();
+      this.report(vote);
       if (guard) return this.refused(guard);
-      if (this.machine.state === "APPROVED" && this.pending && this.pending.sentEpoch === null) await this.commitNow();
+      const pend = this.pending;
+      if (vote.mine && vote.machine.state === "APPROVED" && pend && eq(pend.requestId, vote.id) && pend.sentEpoch === null) await this.commitNow();
       return;
     }
-    const guard = this.machine.onCancel(id, sender);
-    this.report();
+    const guard = vote.machine.onCancel(id, sender);
+    this.report(vote);
     if (guard) return this.refused(guard);
   }
 
@@ -496,7 +639,7 @@ export class EvictCoordinator {
     try {
       await this.buildAndSend();
     } catch {
-      this.abandon("commit-failed");
+      this.abandonOwn("commit-failed");
     }
   }
 
@@ -509,7 +652,8 @@ export class EvictCoordinator {
   /// the epoch moved while it was built is sent here too.
   private async resendIfStepped(): Promise<void> {
     const pend = this.pending;
-    if (this.dead || !pend || this.machine.state !== "APPROVED") return;
+    const own = pend ? this.votes.get(hexOf(pend.requestId)) : undefined;
+    if (this.dead || !pend || own?.machine.state !== "APPROVED") return;
     if (pend.sentEpoch === this.d.keyring.current.epoch) return;
     if (pend.sentAt !== null && pend.sends > MAX_COMMIT_RESENDS) return;
     await this.commitNow();
@@ -523,11 +667,13 @@ export class EvictCoordinator {
 
   private async buildAndSend(): Promise<void> {
     const pend = this.pending;
-    const p = this.machine.current();
+    const key = pend ? hexOf(pend.requestId) : "";
+    const v = pend ? this.votes.get(key) : undefined;
+    const p = v?.machine.current() ?? null;
     const me = this.d.me();
-    if (this.dead || !pend || !p || !me || this.machine.state !== "APPROVED") return;
+    if (this.dead || !pend || !v || !p || !me || v.machine.state !== "APPROVED") return;
     // The votes name the root: a re-root ended this vote, a step did not.
-    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon("root-moved");
+    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon(v, "root-moved");
     // The commit goes under the room's current epoch, and its tail names the
     // root one above it. Sent once at this epoch already: nothing to do.
     const epoch = this.d.keyring.current.epoch;
@@ -571,21 +717,21 @@ export class EvictCoordinator {
         verifier: p.request.verifier,
         salt: pend.way.salt,
         config: pend.config,
-        votes: this.machine.ballots(),
+        votes: v.machine.ballots(),
       },
       { root, sender: me.slice(), confirm: pend.keys.confirm, wraps },
       this.d.identity,
     );
     // Checked again after the awaits above.
-    if (this.dead || this.pending !== pend || this.machine.current() !== p || this.machine.state !== "APPROVED") return;
-    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon("root-moved");
+    if (this.dead || this.pending !== pend || this.votes.get(key) !== v || v.machine.current() !== p || v.machine.state !== "APPROVED") return;
+    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon(v, "root-moved");
     // A step landed while it was built: this one names an epoch the room has
     // left. The next look (`stepped`, or the timer) builds it again.
     if (this.d.keyring.current.epoch !== epoch) return;
     pend.sentAt ??= this.d.now();
     pend.sentEpoch = epoch;
     pend.sends += 1;
-    if (!this.d.sendSigned(header, body)) this.abandon("not-sent");
+    if (!this.d.sendSigned(header, body)) this.abandon(v, "not-sent");
   }
 
   receiveCommit(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): Promise<void> {
@@ -616,13 +762,14 @@ export class EvictCoordinator {
     if (this.dead || ring.current.epoch > epoch) return;
     if (epoch > ring.current.epoch) {
       // The room moved where this member cannot follow without the new way
-      // in: a member signed a commit for an epoch it has not reached. A vote
-      // it had open is over, and its own new way in, kept or not, goes.
+      // in: a member signed a commit for an epoch it has not reached. Every
+      // vote it had open is over, and its own new way in, kept or not, goes.
       this.dropPending();
       this.dropLate();
-      if (this.machine.isOpen()) {
-        this.machine.fail();
-        this.report("left-out");
+      for (const v of [...this.votes.values()]) {
+        if (!v.machine.isOpen()) continue;
+        v.machine.fail();
+        this.report(v, "left-out");
       }
       this.say(() => this.d.leftOut());
       return;
@@ -640,17 +787,17 @@ export class EvictCoordinator {
     // The request this member saw for that id, if it still holds it. Only a
     // commit for one of these is ever applied: in an honest room everyone
     // wrapped for approved, so saw the request.
-    const placed = this.machine.requestFor(clear.requestId);
+    const placed = this.seen.get(clear.requestId);
     // Also checks that the digest is SHA-256 of the key the request named
     // (or, for a request this member cannot place, of the named peer's roster
     // key).
-    if (!(await this.machine.commitSatisfies(claim))) return this.refused("commit-policy");
+    if (!(await this.checker.commitSatisfies(claim))) return this.refused("commit-policy");
     const holdsTargetKey = clear.targetKeyDigest !== null && eq(clear.targetKeyDigest, await keyDigest(this.d.identity.publicKeyRaw));
 
     // Everything above awaited: look again before acting on any of it.
     const meNow = this.d.me();
     if (this.dead || !meNow || !eq(meNow, me) || ring.current.epoch !== epoch) return;
-    if (this.machine.requestFor(clear.requestId) !== placed) return;
+    if (this.seen.get(clear.requestId) !== placed) return;
 
     // This connection is the one named, or this tab holds the key the votes
     // name (a connection opened again under a new peer id, say), so it was
@@ -710,7 +857,10 @@ export class EvictCoordinator {
       // A refusal of this member's own commit ends its vote, which nothing
       // else would, since its new way in is gone.
       const refuse = (reason: string): void => {
-        if (mine) this.abandon(reason);
+        if (mine) {
+          const own = this.votes.get(hexOf(clear.requestId));
+          if (own?.mine) this.abandon(own, reason);
+        }
         this.refused(reason);
       };
       keys ??= await deriveReRoot(way);
@@ -746,29 +896,42 @@ export class EvictCoordinator {
     }
   }
 
-  /// A commit re-rooted the room. The vote it was for is done; any other vote
-  /// still open here ends as one whose root moved, since it named the root the
-  /// room has left.
+  /// A commit re-rooted the room. The vote it was for is done; every other
+  /// vote still open here ends as one whose root moved, since it named the
+  /// root the room has left. A vote for that request that already ended here
+  /// is reported DONE too, if no newer request has opened since.
   private endVoteFor(requestId: Uint8Array): void {
-    const cur = this.machine.current();
-    if (cur && eq(cur.request.id, requestId)) {
-      this.machine.finish();
-      this.report();
-    } else if (this.machine.isOpen()) {
-      this.machine.fail();
-      this.report("root-moved");
+    this.doneId = requestId.slice();
+    const done = this.votes.get(hexOf(requestId));
+    if (!done && this.lastId && eq(this.lastId, requestId)) {
+      const mine = this.late !== null && eq(this.late.requestId, requestId);
+      this.say(() => this.d.state("DONE", undefined, { requestId: requestId.slice(), mine }));
+    }
+    for (const v of [...this.votes.values()]) {
+      if (v === done) {
+        v.machine.finish();
+        this.report(v);
+      } else if (v.machine.isOpen()) {
+        v.machine.fail();
+        this.report(v, "root-moved");
+      }
     }
   }
 
   /// The room's way in changed and this member holds no wrap it can use:
-  /// whatever vote it had open is over, and it needs the new way in from
+  /// every vote it had open is over, and it needs the new way in from
   /// someone who was there.
   private leftOutOfCommit(): void {
     this.dropPending();
     this.dropLate();
-    this.machine.fail();
-    this.reported = "IDLE";
-    this.report("left-out");
+    let said = false;
+    for (const v of [...this.votes.values()]) {
+      v.machine.fail();
+      v.reported = "IDLE";
+      this.report(v, "left-out");
+      said = true;
+    }
+    if (!said) this.say(() => this.d.state("FAILED", "left-out"));
     this.say(() => this.d.leftOut());
   }
 
@@ -807,8 +970,10 @@ export class EvictCoordinator {
   memberLeft(m: MemberView): Promise<void> {
     return this.run(async () => {
       if (this.dead) return;
-      const reason = this.machine.memberLeft(m.peerId);
-      if (reason) this.report(reason);
+      for (const v of [...this.votes.values()]) {
+        const reason = v.machine.memberLeft(m.peerId);
+        if (reason) this.report(v, reason);
+      }
     }, undefined);
   }
 
@@ -819,8 +984,10 @@ export class EvictCoordinator {
   rejoined(previous: Uint8Array): Promise<void> {
     return this.run(async () => {
       if (this.dead) return;
-      const reason = this.machine.memberLeft(previous);
-      if (reason) this.report(reason);
+      for (const v of [...this.votes.values()]) {
+        const reason = v.machine.memberLeft(previous);
+        if (reason) this.report(v, reason);
+      }
     }, undefined);
   }
 
@@ -841,12 +1008,16 @@ export class EvictCoordinator {
         this.dropLate();
         this.late = pend;
         this.pending = null;
-        this.machine.fail();
-        this.report("no-echo");
-        return;
+        const own = this.votes.get(hexOf(pend.requestId));
+        if (own) {
+          own.machine.fail();
+          this.report(own, "no-echo");
+        }
       }
-      const changed = this.machine.tick(now);
-      this.report(changed?.reason);
+      for (const v of [...this.votes.values()]) {
+        const changed = v.machine.tick(now);
+        this.report(v, changed?.reason);
+      }
       // A step this member applied without `stepped` reaching here.
       await this.resendIfStepped();
     }, undefined);
@@ -858,7 +1029,7 @@ export class EvictCoordinator {
     this.dropPending();
     this.dropLate();
     this.early.clear();
-    this.machine.reset();
-    this.reported = "IDLE";
+    for (const v of this.votes.values()) v.machine.reset();
+    this.votes.clear();
   }
 }

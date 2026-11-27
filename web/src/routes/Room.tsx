@@ -42,6 +42,7 @@ import {
   type ReRootView,
 } from "../ui/EvictModal";
 import { EVICT_COPY, evictCopy, evictStateText, ignoredText } from "../evict/copy";
+import { EMPTY_PROMPTS, MAX_ENDED_PROMPTS, promptAnswered, promptArrived, shownPrompt, voteEnded, type PromptQueue } from "../evict/prompts";
 import type { WayKind } from "../evict/reroot";
 import type { SecurityLevel } from "../security-level";
 import { plainWebSocketAllowed } from "../transport/origin";
@@ -118,8 +119,10 @@ function JoinableRoom(props: RoomProps) {
   const [connRefused, setConnRefused] = useState<string | null>(null);
   const [evictOpen, setEvictOpen] = useState<null | { relink: boolean }>(null);
   const [evictCandidates, setEvictCandidates] = useState<EvictCandidate[]>([]);
+  // Where this tab's own request stands, for the ask dialog.
   const [evictState, setEvictState] = useState<{ state: string; reason?: string }>({ state: "IDLE" });
-  const [evictPrompt, setEvictPrompt] = useState<{ by: string; who: string | null } | null>(null);
+  // Other people's requests waiting for an answer here, shown one at a time.
+  const [evictPrompts, setEvictPrompts] = useState<PromptQueue>(EMPTY_PROMPTS);
   // The new way in, held only while its notice is open: Done sets this back
   // to null, which drops the page's last reference to the string.
   const [reRoot, setReRoot] = useState<ReRootView | null>(null);
@@ -128,15 +131,14 @@ function JoinableRoom(props: RoomProps) {
   // need to know about the page is read from refs.
   const strandedRef = useRef<Stranded | null>(null);
   const evictOpenRef = useRef(false);
-  const evictPromptOpenRef = useRef(false);
   const shredOpenRef = useRef(false);
-  // Whether this tab asked or was asked in the vote that is open, so its
-  // ending can be said when the dialog is not on screen.
-  const evictInvolvedRef = useRef(false);
-  // Whether the open vote is this tab's own request, the only one its
-  // Cancel withdraws.
+  // The requests this tab was asked about, so each one's ending can be said
+  // when the ask dialog is not on screen. Bounded like the prompts' record.
+  const evictAskedRef = useRef<Set<string>>(new Set());
+  // Whether this tab's own request is out, the only one its Cancel
+  // withdraws, so its ending can be said when the dialog is not on screen.
   const evictMineRef = useRef(false);
-  // The last evict state reported, as the session's events see it.
+  // The last state of this tab's own request, as the session's events see it.
   const evictStateRef = useRef("IDLE");
   // The room's key as it stands: the link it was opened with, until a
   // re-root replaces it (amendment K).
@@ -173,9 +175,6 @@ function JoinableRoom(props: RoomProps) {
   useEffect(() => {
     shredOpenRef.current = shredOpen;
   }, [shredOpen]);
-  useEffect(() => {
-    evictPromptOpenRef.current = evictPrompt !== null;
-  }, [evictPrompt]);
 
   useEffect(() => {
     if (restartAt === null) return;
@@ -268,10 +267,10 @@ function JoinableRoom(props: RoomProps) {
     setStranded(why);
     editorRef.current?.updateOptions({ readOnly: true });
     evictOpenRef.current = false;
-    evictInvolvedRef.current = false;
+    evictAskedRef.current.clear();
     evictMineRef.current = false;
     setEvictOpen(null);
-    setEvictPrompt(null);
+    setEvictPrompts(EMPTY_PROMPTS);
     if (shredOpenRef.current) {
       try {
         sessionRef.current?.cancelShred();
@@ -401,34 +400,41 @@ function JoinableRoom(props: RoomProps) {
           onConnectionRefused: (message) => setConnRefused(message),
           onEvictPrompt: (p) => {
             // The prompt is raised after VOTING, once the handles are worked
-            // out, so the vote may already be over by the time it arrives.
-            if (strandedRef.current || !evictInFlight(evictStateRef.current)) return;
-            evictInvolvedRef.current = true;
-            // Never two dialogs at once: the ask dialog gives way to the vote.
-            if (evictOpenRef.current) {
-              evictOpenRef.current = false;
-              setEvictOpen(null);
+            // out, so the vote may already be over by the time it arrives:
+            // the queue drops a prompt whose vote it saw end. A prompt never
+            // closes the ask dialog; it waits behind it.
+            if (strandedRef.current) return;
+            const asked = evictAskedRef.current;
+            asked.add(p.id);
+            for (const id of asked) {
+              if (asked.size <= MAX_ENDED_PROMPTS) break;
+              asked.delete(id);
             }
-            setEvictPrompt(p);
+            setEvictPrompts((q) => promptArrived(q, p));
           },
-          // Raised once per state reached, in whatever order the vote takes:
-          // a proposer that gave up on its commit can still be let in by a
-          // late echo, which arrives as onReRooted after FAILED.
-          onEvictState: (state, reason) => {
-            evictStateRef.current = state;
-            setEvictState({ state, reason });
-            if (evictInFlight(state)) return;
-            setEvictPrompt(null);
+          // Raised once per state reached by each request, in whatever order
+          // the vote takes: a proposer that gave up on its commit can still be
+          // let in by a late echo, which arrives as onReRooted after FAILED.
+          onEvictState: (state, reason, vote) => {
+            const inFlight = evictInFlight(state);
+            // This tab's own request, or a left-out tab with nothing open,
+            // is what the ask dialog shows.
+            if (!vote || vote.mine) {
+              evictStateRef.current = state;
+              setEvictState({ state, reason });
+            }
+            if (inFlight) return;
+            if (vote && !vote.mine) setEvictPrompts((q) => voteEnded(q, vote.id));
             // The page is stranded by onLeftOut, which follows this; the
             // banner says what happened, so there is no toast as well.
             if (state === "FAILED" && reason === "left-out") {
-              evictInvolvedRef.current = false;
+              evictAskedRef.current.clear();
               evictMineRef.current = false;
               return;
             }
-            if (evictInvolvedRef.current && !evictOpenRef.current) announce(evictStateText(state, reason, wayKind));
-            evictInvolvedRef.current = false;
-            evictMineRef.current = false;
+            const involved = vote ? (vote.mine ? evictMineRef.current : evictAskedRef.current.delete(vote.id)) : false;
+            if (involved && !evictOpenRef.current) announce(evictStateText(state, reason, wayKind));
+            if (vote?.mine) evictMineRef.current = false;
           },
           onEvictIgnored: (reason) => announce(ignoredText(reason, wayKind)),
           onReRooted: (r) => {
@@ -444,10 +450,10 @@ function JoinableRoom(props: RoomProps) {
             setShredOpen(false);
             setShredPrompt(null);
             evictOpenRef.current = false;
-            evictInvolvedRef.current = false;
+            evictAskedRef.current.clear();
             evictMineRef.current = false;
             setEvictOpen(null);
-            setEvictPrompt(null);
+            setEvictPrompts(EMPTY_PROMPTS);
             evictStateRef.current = "IDLE";
             setEvictState({ state: "IDLE" });
             setReRoot({
@@ -653,11 +659,13 @@ function JoinableRoom(props: RoomProps) {
     );
   }, [props.roomIdHex, props.name]);
 
+  // A vote prompt on screen or waiting never stops this: opening the ask
+  // dialog puts every prompt aside until it closes.
   const openEvict = useCallback(async (relink: boolean) => {
     setMenuOpen(false);
-    if (strandedRef.current || evictPromptOpenRef.current) return;
+    if (strandedRef.current) return;
     const candidates = (await sessionRef.current?.evictCandidates()) ?? [];
-    if (strandedRef.current || evictPromptOpenRef.current) return;
+    if (strandedRef.current) return;
     setEvictCandidates(candidates);
     // What an earlier vote ended in is old news; one still open is not.
     if (!evictInFlight(evictStateRef.current)) {
@@ -683,6 +691,10 @@ function JoinableRoom(props: RoomProps) {
       ) ?? null,
     [],
   );
+
+  // The vote prompt on screen, if any: the oldest waiting, and none while the
+  // ask dialog is open.
+  const shown = shownPrompt(evictPrompts, evictOpen !== null);
 
   if (phase.kind === "missing-key") return <MissingKey />;
 
@@ -1164,18 +1176,18 @@ function JoinableRoom(props: RoomProps) {
             if (!session) return "not-joined";
             const code = await session.proposeEviction(target, passphrase);
             // The coordinator reports VOTING before the call returns, and
-            // only one request is open at a time, so an open vote now is
-            // this one. In a room with nobody else to agree it can already
-            // be over, and then there is nothing to withdraw.
+            // this tab has at most one request of its own open, so an open
+            // vote of its own now is this one. In a room with nobody else to
+            // agree it can already be over, and then there is nothing to
+            // withdraw.
             if (code === null && evictInFlight(evictStateRef.current)) {
               // The dialog cannot be cancelled while this runs, but the page
-              // can close it: a vote prompt arrived, or the tab was stranded.
-              // A request nobody is watching any more is withdrawn.
+              // can close it: the tab was stranded, or the room's way in
+              // changed. A request nobody is watching any more is withdrawn.
               if (!evictOpenRef.current) {
                 void session.cancelEviction().catch(() => undefined);
                 return code;
               }
-              evictInvolvedRef.current = true;
               evictMineRef.current = true;
             }
             return code;
@@ -1190,16 +1202,18 @@ function JoinableRoom(props: RoomProps) {
           }}
         />
       )}
-      {evictPrompt && (
+      {shown && (
         <EvictVotePrompt
-          by={evictPrompt.by}
-          who={evictPrompt.who}
+          key={shown.id}
+          by={shown.by}
+          who={shown.who}
           wayKind={wayKind}
           returnFocus={focusFallback}
           onDecide={(choice) => {
-            setEvictPrompt(null);
-            void sessionRef.current?.respondToEviction(choice);
+            setEvictPrompts((q) => promptAnswered(q, shown.id));
+            void sessionRef.current?.respondToEviction(shown.id, choice);
           }}
+          onAsk={(relink) => void openEvict(relink)}
         />
       )}
       {reRoot && (
