@@ -4,6 +4,7 @@ import {
   evictCopy,
   evictStateText,
   fingerprintLine,
+  othersEndedLine,
   proposeErrorText,
   removedLine,
   voteBody,
@@ -25,6 +26,8 @@ export interface ReRootView {
   passphrase: string | null;
   fingerprint: string;
   removed: string | null;
+  /// The commit also ended other requests this tab asked or was asked about.
+  othersEnded?: boolean;
 }
 
 /// This tab's own request is out and not yet settled: it cannot ask again
@@ -63,7 +66,7 @@ function useDialogFocus(first: RefObject<HTMLElement | null>, fallback?: FocusFa
 }
 
 /// Said while the new keys are made, when the dialog cannot be closed.
-const BUSY_TEXT = "This tab is making the new keys. Cancel works again once the request has gone out.";
+const BUSY_TEXT = "This tab is making the new keys. The dialog can be closed again once the request has gone out.";
 
 /// The new way in could not be shown: the room has moved, and the person is
 /// told so with nothing to copy.
@@ -75,16 +78,25 @@ function noWayText(way: WayKind): string {
 /// The request to remove someone or change the link (amendment K). Nothing
 /// is sent until "Ask the room"; for a shared room the new passphrase is
 /// typed or generated here, with the create form's strength check.
+///
+/// Once this tab's own request is out, the dialog shows where it stands.
+/// Close and Escape only close the dialog, so the person can answer someone
+/// else's request meanwhile, and the bar opens it again; "Withdraw request"
+/// is the one control that withdraws it, while it still collects answers.
 export function EvictModal(props: {
   candidates: EvictCandidate[];
   /// Open with nobody chosen: a link change.
   relink: boolean;
   wayKind: WayKind;
+  /// The state of this tab's own request, IDLE when it has none.
   state: string;
   stateReason?: string;
   returnFocus?: FocusFallback;
   onPropose(target: Uint8Array | null, passphrase: string): Promise<string | null>;
-  onCancel(): void;
+  /// Closes the dialog. An open request of this tab's stays open.
+  onClose(): void;
+  /// Withdraws this tab's own request, and closes the dialog.
+  onWithdraw(): void;
 }) {
   const words = evictCopy(props.wayKind);
   const [choice, setChoice] = useState<number>(props.relink || props.candidates.length === 0 ? -1 : 0);
@@ -105,7 +117,11 @@ export function EvictModal(props: {
     };
   }, []);
 
-  const locked = busy || evictInFlight(props.state);
+  const inFlight = evictInFlight(props.state);
+  const locked = busy || inFlight;
+  // A request still collecting answers can be withdrawn. Once everyone has
+  // agreed the commit is on its way, and nothing withdraws it.
+  const canWithdraw = !busy && props.state === "VOTING";
 
   // Disabling the button that had focus drops focus to the page in some
   // browsers and leaves it on the disabled button in others; either way,
@@ -143,16 +159,23 @@ export function EvictModal(props: {
     if (code) setError(proposeErrorText(code, props.wayKind));
   };
 
-  // While the new keys are made, Cancel and Escape do nothing: a request
-  // that goes out behind a closed dialog is one the person thinks they
-  // stopped. Escape belongs to this dialog only while focus is in it.
-  const cancel = () => {
+  // While the new keys are made, Cancel, Close and Escape do nothing: a
+  // request that goes out behind a closed dialog is one the person thinks
+  // they stopped. Escape belongs to this dialog only while focus is in it,
+  // and it never withdraws anything.
+  const close = () => {
     if (busy) return;
     setPassphrase("");
-    props.onCancel();
+    props.onClose();
   };
 
-  const stateText = props.state !== "IDLE" ? evictStateText(props.state, props.stateReason, props.wayKind) : "";
+  const withdraw = () => {
+    if (!canWithdraw) return;
+    setPassphrase("");
+    props.onWithdraw();
+  };
+
+  const stateText = props.state !== "IDLE" ? evictStateText(props.state, props.stateReason, props.wayKind, true) : "";
 
   return (
     <div className="modal-backdrop">
@@ -165,7 +188,7 @@ export function EvictModal(props: {
         onKeyDown={(e) => {
           if (e.key !== "Escape") return;
           e.stopPropagation();
-          cancel();
+          close();
         }}
       >
         <h2 id="evict-title" className="micro-label">
@@ -211,9 +234,14 @@ export function EvictModal(props: {
           </p>
         )}
         <div className="row" style={{ justifyContent: "flex-end" }}>
-          <button ref={cancelRef} disabled={busy} onClick={cancel}>
-            {EVICT_COPY.cancel}
+          <button ref={cancelRef} id={inFlight ? "evict-close" : undefined} disabled={busy} onClick={close}>
+            {inFlight ? EVICT_COPY.close : EVICT_COPY.cancel}
           </button>
+          {canWithdraw && (
+            <button id="evict-withdraw" onClick={withdraw}>
+              {EVICT_COPY.withdraw}
+            </button>
+          )}
           <button id="evict-propose" className="danger" disabled={locked} onClick={() => void submit()}>
             {busy ? EVICT_COPY.deriving : EVICT_COPY.propose}
           </button>
@@ -289,7 +317,7 @@ export function ReRootNotice(props: {
   onCopy(text: string): void;
   onDone(): void;
 }) {
-  const { link, passphrase, fingerprint, removed } = props.view;
+  const { link, passphrase, fingerprint, removed, othersEnded } = props.view;
   const secret = link || passphrase || null;
   const copyRef = useRef<HTMLButtonElement>(null);
   const doneRef = useRef<HTMLButtonElement>(null);
@@ -313,6 +341,11 @@ export function ReRootNotice(props: {
           </code>
         ) : null}
         {fingerprint && <p className="hint">{fingerprintLine(fingerprint)}</p>}
+        {othersEnded && (
+          <p className="hint" data-others-ended="">
+            {othersEndedLine(props.wayKind)}
+          </p>
+        )}
         <div className="row" style={{ justifyContent: "flex-end", marginTop: 12 }}>
           {secret && (
             <button ref={copyRef} onClick={() => props.onCopy(secret)}>

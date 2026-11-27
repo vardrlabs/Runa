@@ -22,6 +22,8 @@ export const EVICT_COPY = {
   propose: "Ask the room",
   deriving: "Deriving keys…",
   cancel: "Cancel",
+  close: "Close",
+  withdraw: "Withdraw request",
   approve: "Agree",
   reject: "Refuse",
   done: "Done",
@@ -82,9 +84,16 @@ export function fingerprintLine(fp: string): string {
   return `The room's fingerprint is now ${fp}. Compare it again with the others.`;
 }
 
+/// Said once, in the notice that shows the new way in, when the commit that
+/// moved the room also ended other requests this tab asked or was asked about.
+export function othersEndedLine(way?: WayKind): string {
+  return `Every other request that was open ended when the ${wayWord(way)} changed. You can ask again.`;
+}
+
 /// What the page says about where a vote stands, for each state the evict
-/// coordinator reports (and the reason it gives with FAILED).
-export function evictStateText(state: string, reason?: string, way?: WayKind): string {
+/// coordinator reports (and the reason it gives with FAILED). `mine` is set
+/// for this tab's own request.
+export function evictStateText(state: string, reason?: string, way?: WayKind, mine = false): string {
   switch (state) {
     case "VOTING":
       return "The request is waiting for everyone else to agree.";
@@ -93,7 +102,12 @@ export function evictStateText(state: string, reason?: string, way?: WayKind): s
     case "REJECTED":
       return "Someone refused, so nothing changed.";
     case "EXPIRED":
-      return "Not everyone answered in time, so nothing changed.";
+      // The others send nothing back when they set a request aside, so the
+      // proposer's tab cannot tell that apart from nobody answering. It says
+      // what may have happened, only for its own request.
+      return mine
+        ? "Not everyone answered in time, so nothing changed. Their tabs may have set it aside, because eight requests were already open in this room or you have one open in another tab. You can ask again once those have finished."
+        : "Not everyone answered in time, so nothing changed.";
     case "CANCELLED":
       return "The request was withdrawn, so nothing changed.";
     case "FAILED":
@@ -138,7 +152,7 @@ export function proposeErrorText(code: string, way?: WayKind): string {
     case "roster-changed":
       return "Someone joined or left while the request was being made. Try again.";
     case "busy":
-      return "This tab already has a request open, or eight requests are open in this room. Try again once one has finished.";
+      return "You already have a request open, maybe in another tab, or eight requests are open in this room. Try again once one has finished.";
     case "not-joined":
     case "not-sent":
       return "This tab is not connected right now. Try again in a moment.";

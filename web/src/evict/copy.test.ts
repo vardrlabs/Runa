@@ -6,6 +6,7 @@ import {
   fingerprintLine,
   ignoredText,
   proposeErrorText,
+  othersEndedLine,
   removedLine,
   voteBody,
   voteTitle,
@@ -44,6 +45,7 @@ function everyString(): string[] {
   for (const s of ["VOTING", "APPROVED", "REJECTED", "EXPIRED", "CANCELLED", "FAILED", "DONE"]) out.push(evictStateText(s));
   for (const r of FAIL_REASONS) out.push(evictStateText("FAILED", r));
   for (const c of PROPOSE_CODES) out.push(proposeErrorText(c));
+  out.push(evictStateText("EXPIRED", undefined, "link", true), othersEndedLine("link"), othersEndedLine("pass"));
   return out;
 }
 
@@ -69,6 +71,20 @@ describe("the eviction flow's words", () => {
 
   it("tell a tab that was left out of a link change that it needs the new one", () => {
     expect(evictStateText("FAILED", "left-out")).toMatch(/not given the new one/);
+  });
+
+  it("tell a person whose request could not open why it may not have, and only for their own (fourth final wave, M3)", () => {
+    expect(proposeErrorText("busy")).toMatch(/You already have a request open, maybe in another tab, or eight requests are open/);
+    const own = evictStateText("EXPIRED", undefined, "link", true);
+    expect(own).toMatch(/^Not everyone answered in time, so nothing changed\./);
+    expect(own).toMatch(/eight requests were already open in this room or you have one open in another tab/);
+    expect(evictStateText("EXPIRED")).toBe("Not everyone answered in time, so nothing changed.");
+    expect(ignoredText("busy")).toMatch(/the person who sent it already has one open/);
+  });
+
+  it("say once that the other open requests ended when the way in changed (fourth final wave, M4)", () => {
+    expect(othersEndedLine("link")).toBe("Every other request that was open ended when the link changed. You can ask again.");
+    expect(othersEndedLine("pass")).not.toMatch(/\blink\b/);
   });
 
   it("say that nothing changed when a request could not be sent", () => {
