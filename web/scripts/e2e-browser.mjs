@@ -793,12 +793,18 @@ async function main() {
     await waitForPreview(b, "still-here", "evict-b");
     if ((await copiedLink(b)) !== oldLink) throw new Error("[evict-b] after a refusal Copy link no longer gives the room's link");
 
-    // The removal. Alice asks again, Bob agrees.
+    // The removal. Alice asks again, Bob agrees. Someone opens the old link
+    // between the request and Bob's answer: they never saw the request, so
+    // nobody wraps the new link for them, and the commit leaves them out.
     await openAsk(a, "evict-a", "Remove someone", 3);
     options = await a.$$('input[name="evict-target"]');
     await options[2].check();
     await a.click("#evict-propose");
     await b.waitForSelector("#evict-approve", { timeout: 15_000 });
+    const n = await makeCopyingPage("evict-newcomer");
+    await gotoPage(n, "evict-newcomer", oldLink);
+    await n.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(n, "still-here", "evict-newcomer");
     await b.click("#evict-approve");
 
     const removedBanner = "You were removed from this room. The link you used no longer opens it.";
@@ -823,6 +829,16 @@ async function main() {
     // The removed tab: read-only document, Export, no room actions, quiet.
     await checkStranded(t, "evict-t", { banner: removedBanner, keeps: "still-here", way: "link" });
     if ((await previewOf(t)).includes("after-evict")) throw new Error("[evict-t] the removed tab still receives what is written");
+    // The tab that joined during the vote is left out, with no alarm, and
+    // stops like the removed one: it does not reconnect and sit in the room's
+    // list of people, where it would block every later vote.
+    const leftOutBanner = "The room's link changed, and this tab was not given the new one.";
+    await checkStranded(n, "evict-newcomer", { banner: leftOutBanner, keeps: "still-here", way: "link" });
+    if ((await previewOf(n)).includes("after-evict")) throw new Error("[evict-newcomer] the left-out tab still receives what is written");
+    const nAlarms = await n.$$eval('.banner[role="alert"], [role="status"]', (els) => els.map((e) => e.textContent));
+    if (nAlarms.some((x) => /key change|interfering|list of people|lost track/.test(x))) {
+      throw new Error(`[evict-newcomer] a tab left out by an honest commit showed a key alarm: ${nAlarms.join(" | ")}`);
+    }
 
     // The old link no longer opens the room: the server refuses it, and a
     // page opening it says the room is gone.
@@ -934,7 +950,7 @@ async function main() {
         throw new Error(`[${label}] showed a key alarm after an honest removal: ${alarms.join(" | ")}`);
       }
     }
-    for (const p of [a, b, c, d, t]) await p.close();
+    for (const p of [a, b, c, d, t, n]) await p.close();
 
     // The same removal in a shared room. Everything the page says names the
     // passphrase, never a link, and the new passphrase is generated in the
@@ -2353,6 +2369,7 @@ async function main() {
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
   console.log(`  removing someone: a refusal changes nothing; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  a tab that joined during the vote is left out with no alarm, keeps a read-only copy and stays off`);
   console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
   console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
   console.log(`  a shared room removes someone with a generated passphrase and never speaks of a link`);
