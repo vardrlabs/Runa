@@ -749,7 +749,8 @@ async function main() {
     await waitForPreview(t, "before-evict", "evict-t");
 
     // A refusal first. Bob has his own ask dialog open when Alice's request
-    // arrives: it gives way to the vote, so there is only ever one dialog.
+    // arrives: the vote prompt waits behind it and shows once Bob closes it,
+    // so there is only ever one dialog, and a prompt never stops Bob asking.
     const relinkLabel = await a.$$eval(".statusbar-actions button", (els) => els.map((el) => el.textContent.trim()));
     if (!relinkLabel.includes("Change link") || relinkLabel.includes("Change passphrase")) {
       throw new Error(`[evict-a] a private room's bar should offer "Change link": ${relinkLabel.join(", ")}`);
@@ -765,12 +766,26 @@ async function main() {
     let options = await a.$$('input[name="evict-target"]');
     await options[2].check();
     await a.click("#evict-propose");
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    await b.waitForTimeout(2000);
+    if (!(await b.$("#evict-title"))) throw new Error("[evict-b] a vote prompt closed the ask dialog");
+    if (await b.$("#evict-reject")) throw new Error("[evict-b] a vote prompt showed over the ask dialog");
+    await b.click('[role="dialog"] button:has-text("Cancel")');
     await b.waitForSelector("#evict-reject", { timeout: 15_000 });
     if (await b.$("#evict-title")) throw new Error("[evict-b] the ask dialog stayed open under the vote prompt");
-    const modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
+    let modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
     if (modals !== 1) throw new Error(`[evict-b] ${modals} modal dialogs at once`);
     const voteTitle = ((await b.textContent("#evict-vote-title")) ?? "").trim();
     if (voteTitle !== `REMOVE ${tHandle}?`) throw new Error(`[evict-b] the vote asks "${voteTitle}", expected to remove ${tHandle}`);
+    // The prompt offers the bar's ways of asking. Either opens the ask
+    // dialog and puts the prompt aside until it closes.
+    await b.click('[role="alertdialog"] [data-evict-ask] button:has-text("Remove someone")');
+    await b.waitForSelector("#evict-title", { timeout: 5000 });
+    if (await b.$("#evict-reject")) throw new Error("[evict-b] the vote prompt stayed on screen under the ask dialog");
+    modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
+    if (modals !== 1) throw new Error(`[evict-b] ${modals} modal dialogs at once with the ask dialog open`);
+    await b.click('[role="dialog"] button:has-text("Cancel")');
+    await b.waitForSelector("#evict-reject", { timeout: 5000 });
     await b.keyboard.press("Escape");
     await b.waitForTimeout(300);
     if (!(await b.$("#evict-reject"))) throw new Error("[evict-b] Escape closed the vote prompt without an answer");
@@ -793,14 +808,33 @@ async function main() {
     await waitForPreview(b, "still-here", "evict-b");
     if ((await copiedLink(b)) !== oldLink) throw new Error("[evict-b] after a refusal Copy link no longer gives the room's link");
 
-    // The removal. Alice asks again, Bob agrees. Someone opens the old link
-    // between the request and Bob's answer: they never saw the request, so
-    // nobody wraps the new link for them, and the commit leaves them out.
-    await openAsk(a, "evict-a", "Remove someone", 3);
+    // The removal. The third tab asks for a link change first and leaves it
+    // open: that does not stop anyone asking to remove them. Alice is shown
+    // the third tab's request, asks to remove them from that prompt, and Bob
+    // answers both, in the order they arrived. Agreeing to the link change
+    // keeps it open, since Alice has not answered it.
+    await openAsk(t, "evict-t", "Change link", 3);
+    await t.click("#evict-propose");
+    await t.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    for (const [label, page] of [["evict-a", a], ["evict-b", b]]) {
+      await page.waitForSelector("#evict-approve", { timeout: 15_000 });
+      const asked = ((await page.textContent("#evict-vote-title")) ?? "").trim();
+      if (asked !== "CHANGE THE LINK?") throw new Error(`[${label}] the first prompt asks "${asked}", expected the third tab's link change`);
+    }
+    await a.click('[role="alertdialog"] [data-evict-ask] button:has-text("Remove someone")');
+    await a.waitForSelector("#evict-title", { timeout: 5000 });
+    const removeLabels = await targetLabels(a);
+    if (removeLabels.length !== 3 || removeLabels[2] !== tHandle) throw new Error(`[evict-a] the ask dialog from the prompt offers ${removeLabels.join(" | ")}`);
     options = await a.$$('input[name="evict-target"]');
     await options[2].check();
     await a.click("#evict-propose");
-    await b.waitForSelector("#evict-approve", { timeout: 15_000 });
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    if ((await a.$$eval('[aria-modal="true"]', (els) => els.length)) !== 1) throw new Error("[evict-a] two dialogs at once after asking");
+    await b.click("#evict-approve");
+    await b.waitForSelector(`#evict-vote-title:has-text("REMOVE ${tHandle}?")`, { timeout: 15_000 });
+    // Someone opens the old link between the request and Bob's answer: they
+    // never saw the request, so nobody wraps the new link for them, and the
+    // commit leaves them out.
     const n = await makeCopyingPage("evict-newcomer");
     await gotoPage(n, "evict-newcomer", oldLink);
     await n.waitForSelector(".monaco-editor", { timeout: 30_000 });
@@ -817,6 +851,12 @@ async function main() {
     const fresh = parseLink(newLink, "evict-a");
     await closeReRootNotice(a);
     await closeReRootNotice(b);
+    // The third tab's link change ended with the old link: Alice's prompt for
+    // it, put aside while she asked, is gone, and nothing else waits.
+    await a.waitForTimeout(1000);
+    for (const [label, page] of [["evict-a", a], ["evict-b", b]]) {
+      if (await page.$("#evict-approve")) throw new Error(`[${label}] a prompt for a request that ended came back after the re-root`);
+    }
 
     // The two who stayed keep writing, each sees the other, and Copy link now
     // gives the new link.
@@ -2368,7 +2408,7 @@ async function main() {
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
-  console.log(`  removing someone: a refusal changes nothing; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person whose own request is open is removed anyway; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
   console.log(`  a tab that joined during the vote is left out with no alarm, keeps a read-only copy and stays off`);
   console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
   console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
