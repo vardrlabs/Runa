@@ -14,8 +14,8 @@ use crate::AppState;
 
 /// The only KDF parameters a room may be created with.
 ///
-/// They used to be a range — m_kib anywhere in 8192..=262144, t in 1..=10, p
-/// in 1..=4 — while `meta_unlisted` answered for a room that does not exist
+/// They used to be a range (m_kib anywhere in 8192..=262144, t in 1..=10, p
+/// in 1..=4) while `meta_unlisted` answered for a room that does not exist
 /// with these exact defaults. So a room created with anything else was
 /// distinguishable from a missing one by its own metadata, which is precisely
 /// the question that endpoint goes to some length not to answer: same shape,
@@ -24,7 +24,7 @@ use crate::AppState;
 ///
 /// The official client has only ever sent these three values, so pinning them
 /// costs nothing today and closes the gap. Widening the range again is a
-/// protocol decision, and it needs the ghost branch to widen with it — the
+/// protocol decision, and it needs the ghost branch to widen with it: the
 /// test below fails if the two ever drift apart.
 pub const KDF_M_KIB: u32 = 65536;
 pub const KDF_T: u32 = 3;
@@ -201,7 +201,7 @@ pub struct TtlBody {
 }
 
 /// Public so it can be fuzzed. The request validation is the interesting part
-/// of the create path — the JSON parse belongs to serde — and a fuzz target
+/// of the create path (the JSON parse belongs to serde), and a fuzz target
 /// cannot reach it while it is private.
 pub struct ValidParams {
     pub verifier_key: [u8; 32],
@@ -344,7 +344,7 @@ pub async fn create_named(
     }
 
     // The hard rule: a named room cannot exist without a
-    // passphrase-derived verifier — the name is public by construction,
+    // passphrase-derived verifier: the name is public by construction,
     // so the passphrase is the only key. Enforced at the API with a test.
     let Some(raw_name) = body.name.as_deref().map(names::normalize) else {
         return wire_code_response(StatusCode::BAD_REQUEST, WireCode::NameInvalid);
@@ -408,7 +408,7 @@ pub struct RestoreBody {
 /// is, under today's configuration, so a ticket cannot carry anything a create
 /// request could not.
 ///
-/// 201 restored, 200 already restored by another member — both mean "join
+/// 201 restored, 200 already restored by another member: both mean "join
 /// now". 400 and 410 mean the room is not coming back; 409 means its name was
 /// taken in the meantime; 429 and 503 are worth retrying.
 pub async fn restore_room(

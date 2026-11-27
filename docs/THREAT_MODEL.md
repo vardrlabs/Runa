@@ -48,13 +48,13 @@ protocol design inside that bundle helps.
 What can be done, and what RÚNA does:
 
 - Zero third-party script origins. No CDN, no analytics, no hosted fonts.
-- Strict CSP with `script-src 'self' 'wasm-unsafe-eval'` — scripts only from
+- Strict CSP with `script-src 'self' 'wasm-unsafe-eval'`: scripts only from
   this origin, WebAssembly allowed to compile because Argon2id needs it, `eval`
-  still forbidden — and Subresource Integrity on every asset.
+  still forbidden, and Subresource Integrity on every asset.
 - Trusted Types enforced, with the policy allow-list naming only `default` and
   the nine policies monaco-editor creates. **Honest limit:** the `default`
   policy's `createHTML` is a pass-through compatibility shim for Monaco's own
-  DOM writes — it is not a sanitiser. The control that protects document
+  DOM writes. It is not a sanitiser. The control that protects document
   content is `rehype-sanitize` in `web/src/render/pipeline.ts`. What the
   `default` policy does enforce is `createScriptURL`, which is restricted to
   same-origin URLs.
@@ -83,7 +83,7 @@ room's lifetime. It is not, however, the 96 bits a random-nonce scheme would
 give, and it is worth knowing which number the guarantee rests on. Widening the
 session id is a wire-format change and is deferred to a protocol revision.
 
-The counter never restarts within a session — a client that rebuilt its cipher
+The counter never restarts within a session: a client that rebuilt its cipher
 mid-connection would replay nonces, which is why JOIN_ACK re-labels the sender
 in place and is accepted only once per connection.
 
@@ -100,7 +100,7 @@ What consensus shred is actually good for:
 - Making the server's copy provably unrecoverable, since it never had keys.
 - Giving a group a clear, agreed, observable moment of "this is over."
 
-The UI says this in plain words at the moment of first use, once — not in a
+The UI says this in plain words at the moment of first use, once, not in a
 terms page nobody reads.
 
 ### And consensus is a guarantee against your peers, not against the server
@@ -110,7 +110,7 @@ the conclusion was not.
 
 A shred vote is a signed object, and each receiver checks the signature against
 the public key its roster holds for the claimed signer. That roster comes from
-the server — `JOIN_ACK` on joining, `PEER_JOIN` afterwards. A3 already says a
+the server: `JOIN_ACK` on joining, `PEER_JOIN` afterwards. A3 already says a
 malicious operator can "forge peers"; this is what that costs. Substitute your
 own key for every peer, sign a request and a vote from each, and you have a
 unanimous decision nobody took, which destroys the shared copy and runs the
@@ -119,7 +119,7 @@ wipe in every connected browser.
 It grants a hostile operator no capability they lacked. They hold the log and
 can drop it; they can disconnect everyone; they can refuse to relay. Destroying
 a room is something they could already do more simply. And confidentiality is
-untouched either way — the server never holds a key, so forging a vote reveals
+untouched either way: the server never holds a key, so forging a vote reveals
 nothing.
 
 What it means is narrower and worth being precise about. "Everyone must agree"
@@ -348,8 +348,8 @@ to the server, but browsers write the full URL into their history, and a
 browser with sync on copies that history to its vendor. So the client keeps
 the key out of the address bar (`web/src/keyhandoff.ts`):
 
-- A room opened from inside RÚNA — created on the front page, or joined by
-  pasting its link into Join — gets the key handed over in memory. It is
+- A room opened from inside RÚNA (created on the front page, or joined by
+  pasting its link into Join) gets the key handed over in memory. It is
   never in the address, so no history entry can carry it.
 - A room opened from a clicked link has the fragment removed by
   `history.replaceState` as the page starts. The browser may already have
@@ -412,7 +412,7 @@ server writing anything down. What makes that safe is what a ticket cannot do:
 
 - **It cannot open a room.** It recreates one with the verifier it had, so
   joining still takes the key. A leaked ticket lets its holder recreate an
-  empty room nobody can enter without the key — and only for ten minutes.
+  empty room nobody can enter without the key, and only for ten minutes.
 - **It cannot undo a shred.** Tickets are issued when the process stops, only
   for rooms still alive at that moment, so a room shredded before then has
   none. One shredded after it was brought back is a tombstone in the new

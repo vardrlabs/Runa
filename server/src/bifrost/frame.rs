@@ -135,7 +135,7 @@ mod tests {
     }
 
     /// The invariant `server/fuzz/fuzz_targets/frame_header.rs` asserts. It
-    /// only ran in a weekly cron — one that had never once succeeded — so it
+    /// only ran in a weekly cron, one that had never once succeeded, so it
     /// is checked here on every run as well.
     #[test]
     fn decode_encode_roundtrips_for_any_accepted_input() {

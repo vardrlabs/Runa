@@ -153,7 +153,7 @@ impl PeerTx {
     }
 
     /// Non-blocking. `Err` means the peer is not keeping up and should be
-    /// dropped — the same contract the raw channel's `try_send` had.
+    /// dropped, the same contract the raw channel's `try_send` had.
     pub fn try_send(&self, frame: Bytes) -> Result<(), PeerBacklogged> {
         let n = frame.len();
         if self.queued.fetch_add(n, Ordering::SeqCst) + n > self.max_bytes {
@@ -218,7 +218,7 @@ impl QueueMeter {
 /// *passphrases* pays 64 MiB of Argon2id per attempt in their own browser
 /// before they can even send one, and the window already caps them at five
 /// per minute. An escalating lockout would therefore buy almost nothing
-/// against an attacker — while handing anyone who knows a room id a way to
+/// against an attacker, while handing anyone who knows a room id a way to
 /// lock its actual occupants out for a quarter of an hour by failing auth on
 /// purpose. The window is per room, so that cost lands on the wrong people.
 /// Per-room authentication throttle, keyed by caller.
@@ -226,12 +226,12 @@ impl QueueMeter {
 /// It used to be one sliding window for the whole room, shared by everyone,
 /// and it consumed a slot on every attempt rather than only on failures. Five
 /// attempts a minute between all comers meant anybody who knew a room's name
-/// could spend them and keep every legitimate join failing — indefinitely, for
+/// could spend them and keep every legitimate join failing, indefinitely, for
 /// as long as they cared to. Named rooms are the exposed case by construction:
 /// the names are readable, shared and often guessable.
 ///
 /// That mattered more here than the shape of it suggests. Established sockets
-/// survive such an attack; reconnects do not, and reconnects are constant —
+/// survive such an attack; reconnects do not, and reconnects are constant:
 /// switching tabs, a laptop sleeping, a network blip. The symptom would have
 /// been "I got dropped and cannot get back in", which is also exactly what a
 /// wrong passphrase looks like.
@@ -244,7 +244,7 @@ impl QueueMeter {
 /// This does lower the whole-room brute-force ceiling: an attacker with many
 /// addresses now gets a budget per address. That is an acceptable trade here
 /// and only here, because the verifier is a SHA-256 over a 256-bit
-/// random-equivalent value — online guessing was never the threat the room
+/// random-equivalent value: online guessing was never the threat the room
 /// window was holding back, and the threat model says so in as many words.
 struct AuthGuard {
     per_caller: crate::heimdall::ratelimit::RateLimiter<String>,
@@ -429,7 +429,7 @@ struct PurgeAckSet {
     /// Quorum is measured against this, not against whoever happens to be
     /// connected when the last ack lands. Every peer wipes and disconnects
     /// immediately after acking, so a live-set comparison shrinks as the acks
-    /// arrive and is satisfied by whoever happens to ack last — which is one
+    /// arrive and is satisfied by whoever happens to ack last, which is one
     /// peer, not consensus. Freezing the cohort also denies the inverse
     /// attack: a hostile peer cannot shrink the denominator by dropping
     /// sockets, because the honest peers are already in the cohort and still
@@ -445,7 +445,7 @@ pub const MAX_PURGE_REQUEST_ID_LEN: usize = 128;
 /// How long a partial set of purge acks is kept. Every member acks the moment
 /// its own copy of the vote reaches a decision, and they all see the same
 /// votes at once, so a real set completes within a round trip or two. One
-/// still open after this is stale — a stray ack from a local timer, say — and
+/// still open after this is stale (a stray ack from a local timer, say), and
 /// kept longer it would hold a cohort that no longer matches the room over the
 /// next real decision.
 const PURGE_ACK_TTL: Duration = Duration::from_secs(30);
@@ -455,7 +455,7 @@ const PURGE_ACK_TTL: Duration = Duration::from_secs(30);
 const SHRED_REQUEST_WINDOW: Duration = Duration::from_secs(3600);
 
 /// A room may never be extended past this, no matter how many peers ask.
-/// Without it a single peer could pin a room — and its log — in memory
+/// Without it a single peer could pin a room, and its log, in memory
 /// forever by replaying TTL_EXTEND, which defeats the entire expiry model.
 pub const MAX_TTL_EXTENSION_SECS: u64 = 720 * 3600;
 
@@ -1016,7 +1016,7 @@ impl Room {
 
     /// Fan out a **server-authored** frame verbatim. PROTOCOL.md amendment C
     /// is explicit that JOIN_ACK, PEER_JOIN, PEER_LEAVE, PURGE, ERROR and
-    /// TTL_EXTEND are never enveloped — receivers read their JSON straight
+    /// TTL_EXTEND are never enveloped: receivers read their JSON straight
     /// out of the body. `broadcast` would prepend 16 sender bytes and make
     /// that JSON unparseable, so event frames must come through here.
     pub async fn broadcast_event(&self, frame: &Bytes, exclude: Option<[u8; 16]>) {
@@ -1329,7 +1329,7 @@ pub fn envelop(frame: &Bytes, sender: [u8; 16]) -> Bytes {
 /// envelope with the entry's log index added. The index is written by the
 /// server and is outside the AEAD; a client uses it only to decide what a
 /// snapshot may claim to cover. A server that lied about it could have a
-/// snapshot cover entries the client never saw, and those would be lost — no
+/// snapshot cover entries the client never saw, and those would be lost. That is no
 /// new power, since the server holds the log and can drop any entry anyway
 /// (amendment H).
 pub fn envelop_indexed(frame: &Bytes, sender: [u8; 16], index: u64) -> Bytes {
@@ -1449,8 +1449,8 @@ impl RoomRegistry {
     }
 
     /// Unlisted room ids are **server-assigned**. Letting the caller name the
-    /// id turned this endpoint into an existence oracle — 409 meant "that room
-    /// is live", 201 meant "it is not" — which undid the care taken to hide
+    /// id turned this endpoint into an existence oracle (409 meant "that room
+    /// is live", 201 meant "it is not"), which undid the care taken to hide
     /// exactly that on `/api/meta/id/{id}`. It also allowed squatting an id
     /// somebody else was about to use.
     #[allow(clippy::too_many_arguments)]
@@ -2050,7 +2050,7 @@ mod purge_ack_tests {
     }
 
     /// Reported shape: everyone votes to shred, someone opens the link during
-    /// the vote, every voter's page wipes itself — and the room stays up,
+    /// the vote, every voter's page wipes itself, and the room stays up,
     /// because the newcomer, who never saw the request, never acked.
     #[test]
     fn someone_who_joins_during_the_vote_cannot_stop_the_purge() {
@@ -2088,7 +2088,7 @@ mod purge_ack_tests {
         );
     }
 
-    /// A stray ack — a local timer running ahead, say — must not leave its
+    /// A stray ack (a local timer running ahead, say) must not leave its
     /// cohort waiting for the next real decision to complete it.
     #[test]
     fn a_partial_set_of_acks_goes_stale_quickly() {

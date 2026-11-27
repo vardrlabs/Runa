@@ -42,7 +42,7 @@ Encrypted body = `counter` (8 B BE) `||` AES-256-GCM output `||` tag (16 B).
 |---|---|---|---|
 | 0x01 | JOIN | C→S | JSON `{auth_key_b64? (32 B), session_pubkey_b64 (32 B), client_version, acks?, indexed?, heartbeat?, kx_pubkey?, kx_sig?}`; amendments E, G, H, J |
 | 0x02 | JOIN_ACK | S→C | JSON `{peer_id, epoch, log_len, base_index, has_snapshot, ttl, elapsed_secs, ceiling_optout, kdf:{alg,m,t,p,salt_b64}, config_blob?, roster:[{peer_id,pubkey_b64,joined_at_seq,kx_pubkey?,kx_sig?}], acks?, limits?:{max_frame_bytes,frames_per_sec,bytes_per_sec}, indexed?, heartbeat?, log_id, root_epoch}`; amendments E, G, H, I, J |
-| 0x03 | DOC_UPDATE | both | encrypted Yjs update, or one part of a split one — amendment E |
+| 0x03 | DOC_UPDATE | both | encrypted Yjs update, or one part of a split one; amendment E |
 | 0x04 | DOC_SYNC_REQ | C→S | JSON `{from_index}` (index form; state vectors leak clocks and are not used) |
 | 0x05 | DOC_SYNC_RESP | S→C | one or more encrypted entries: snapshot blob then tail |
 | 0x06 | AWARENESS | both | encrypted JSON presence `{h, k, l, c, d?}`: handle, colour index 0–5, cursor line and column, and an optional 16-hex document hash. Receivers ignore `h` and derive the handle from the sender's roster public key, clamp `k`, `l` and `c`, and discard any `d` that is not 16 hex characters. Not the y-protocols awareness format. |
@@ -51,16 +51,16 @@ Encrypted body = `counter` (8 B BE) `||` AES-256-GCM output `||` tag (16 B).
 | 0x09 | **DOC_ACK** | S→C | JSON `{ok, index?, epoch?}`, to the sender of each DOC_UPDATE, only if its JOIN asked; `epoch` only on a refusal for a stale epoch. Amendments E, J |
 | 0x10 | SHRED_REQUEST / SHRED_VOTE / SHRED_CANCEL (0x11, 0x12) | both | encrypted canonical-CBOR payload + Ed25519 signature over CBOR. No count fields exist anywhere. |
 | 0x13 | PURGE | S→C | JSON `{reason}` tombstone signal |
-| 0x14 | **PURGE_ACK** | C→S | JSON `{request_id}` — amendment A, below |
-| 0x15 | **RESTART_NOTICE** | S→C | JSON `{in_secs, handover}`: the process stops in this many seconds; `handover` says whether rooms will carry over — amendments F, I |
-| 0x16 | **RESTART_TICKET** | S→C | JSON `{ticket}`, sent as the process stops; the connection is then closed with 1012 — amendment I |
-| 0x17 | **PING** | C→S | JSON `{}`, only on a connection whose JOIN asked for `heartbeat` — amendment G |
+| 0x14 | **PURGE_ACK** | C→S | JSON `{request_id}`; amendment A, below |
+| 0x15 | **RESTART_NOTICE** | S→C | JSON `{in_secs, handover}`: the process stops in this many seconds; `handover` says whether rooms will carry over; amendments F, I |
+| 0x16 | **RESTART_TICKET** | S→C | JSON `{ticket}`, sent as the process stops; the connection is then closed with 1012; amendment I |
+| 0x17 | **PING** | C→S | JSON `{}`, only on a connection whose JOIN asked for `heartbeat`; amendment G |
 | 0x18 | **PONG** | S→C | JSON `{roster:[{peer_id,pubkey_b64,joined_at_seq,kx_pubkey?,kx_sig?}]}`; amendments G, J |
 | 0x20 | **EPOCH_KEY** | both | signed canonical-CBOR body holding one wrapped secret per recipient. The server reads only the header epoch; amendment J |
 | 0x23 | **EVICT_COMMIT** | both | a fixed binary clear part the server reads, then a signed CBOR tail it does not; amendment K |
 | 0x24 | **EVICT_REQUEST** / **EVICT_VOTE** / **EVICT_CANCEL** (0x25, 0x26) | both | encrypted canonical-CBOR payload, relayed like the SHRED frames; amendment K |
-| 0x22 | **TTL_EXTEND** | both | JSON `{add_secs}` C→S; server broadcasts `{added_by, add_secs, effective_secs, kind}` — amendment D |
-| 0x21 | **SNAPSHOT** | C→S | header ‖ `covers_up_to_index` u64 BE (8 B plaintext) ‖ encrypted blob — amendment B, below |
+| 0x22 | **TTL_EXTEND** | both | JSON `{add_secs}` C→S; server broadcasts `{added_by, add_secs, effective_secs, kind}`; amendment D |
+| 0x21 | **SNAPSHOT** | C→S | header ‖ `covers_up_to_index` u64 BE (8 B plaintext) ‖ encrypted blob; amendment B, below |
 | 0x30 | ERROR | S→C | JSON `{code}` |
 
 Error codes: 4001 AUTH_FAILED · 4002 RATE_LIMITED · 4003 ROOM_FULL ·
@@ -113,7 +113,7 @@ known limits.
 - DOC_SYNC_REQ `{from_index}`: if `from_index <= base_index` send latest
   snapshot (if any) followed by the full tail; else send tail from
   `from_index`. Responses are re-framed as encrypted blobs relayed verbatim
-  from stored log bytes — the server cannot decrypt or merge them.
+  from stored log bytes: the server cannot decrypt or merge them.
 - SNAPSHOT: record `covers_up_to_index`, drop log entries it supersedes,
   store the opaque snapshot bytes as the room's current snapshot. It verifies
   nothing and understands nothing.
@@ -135,7 +135,7 @@ known limits.
 - PURGE_ACK: mark requester as acked for `{request_id}`; when every currently
   connected socket has acked the same id, execute surtr purge. An ack counts
   only while the peer that sent it is still connected, and the ledger is
-  bounded (16 request ids, 128-byte ids, 5-minute expiry) — otherwise a peer
+  bounded (16 request ids, 128-byte ids, 5-minute expiry). Otherwise a peer
   could bank approvals from throwaway sockets, drop them to shrink the
   denominator, and purge a room the remaining occupants never voted on. There
   is no
@@ -149,13 +149,13 @@ and an encrypted ack could not be counted by a blind relay. Added 0x14 as an
 unencrypted one-field frame. The server purges only when every peer in the
 cohort has acked the same `request_id`, and nothing else can end a room early:
 an unacknowledged request leaves it intact. Acks are unauthenticated, which is
-acceptable because the quorum — not the individual ack — is the control, and
+acceptable because the quorum, not the individual ack, is the control, and
 the server holds no keys either way.
 
 The cohort is fixed when the first ack arrives: every connected peer, except
 anyone who joined after the most recent SHRED_REQUEST the server relayed
 (within the last hour). The request is never replayed, so a peer who arrives
-mid-vote can neither see it nor vote in it — and the voters' clients count
+mid-vote can neither see it nor vote in it, and the voters' clients count
 them out too, since the roster is frozen into the request. Counting them here
 meant one arrival mid-vote kept a room alive that every voter had shredded.
 The snapshot is the server's own, taken as the request passes through, so no
@@ -178,7 +178,7 @@ original_body`. These 16 bytes are written by the server, never inspected by
 it, and are consumed by receivers as an AAD input. Sync responses reuse the
 stored entry's original frame type; frame type 0x05 therefore stays reserved.
 Server-authored event frames (JOIN_ACK, PEER_JOIN, PEER_LEAVE, PURGE, ERROR,
-TTL_EXTEND, DOC_ACK, RESTART_NOTICE, RESTART_TICKET, PONG) are **never enveloped** — receivers read their JSON directly from
+TTL_EXTEND, DOC_ACK, RESTART_NOTICE, RESTART_TICKET, PONG) are **never enveloped**: receivers read their JSON directly from
 the body; only relayed peer ciphertext carries the sender envelope. These
 frames also carry epoch 0 by construction, so receivers must exempt them from
 the epoch-staleness check. Both invariants are pinned by tests in
@@ -194,11 +194,11 @@ cannot pin a room in memory indefinitely. The broadcast carries both
 `remaining_secs`: `add_secs` is a request, not a result, and a client that
 added its own request locally would drift past the real deadline once the
 clamp engaged. The clear-text form is acceptable because TTL is public
-scheduling information by design — the server must know it to enforce it.
+scheduling information by design: the server must know it to enforce it.
 
 **E · DOC_ACK (0x09), resending, and split updates.** DOC_UPDATE was
 fire-and-forget, so a client could not tell an update the server stored from
-one written into a connection that had already died — which a browser goes on
+one written into a connection that had already died, which a browser goes on
 reporting as open until TCP gives up, often for minutes. Edits typed in that
 window were lost, and nothing noticed.
 
@@ -227,8 +227,8 @@ window were lost, and nothing noticed.
 The server writes DOC_ACK straight to the sender's socket rather than through
 its outbound queue, so a queue full of log replay cannot cost a client its
 acks. An ack is not authenticated: a hostile server can acknowledge an update
-and then discard it. That is no new power — it holds the log and can drop
-anything — and it is the same exposure every relayed frame already has.
+and then discard it. That is no new power (it holds the log and can drop
+anything), and it is the same exposure every relayed frame already has.
 
 **F · RESTART_NOTICE (0x15).** Rooms live only in memory, so stopping the
 process ends every room, and a redeploy used to do that mid-session with no
@@ -244,7 +244,7 @@ restart that never comes, but it could end a room at any moment regardless.
 
 **G · PING (0x17) and PONG (0x18).** Acks (amendment E) cover a connection
 something is being sent on. One that died while nobody typed sent nothing that
-could go unacknowledged, so it was noticed at the next keystroke — and until
+could go unacknowledged, so it was noticed at the next keystroke, and until
 then the page showed the room as connected while everyone else's edits went
 nowhere.
 
@@ -263,7 +263,7 @@ nowhere.
 **H · Log indexes on relayed updates.** A snapshot tells the server which log
 index it covers, and the server discards everything below it. The client could
 only estimate that index from its own stored updates, which undercounts by
-every update anyone else wrote — and once a member with fewer of its own became
+every update anyone else wrote, and once a member with fewer of its own became
 the snapshotter, its estimate fell below the previous snapshot and the server
 refused it, since a snapshot may never move backwards. Compaction then stopped
 for the life of the room, and a long session filled its log until edits were
@@ -282,13 +282,13 @@ refused.
   unbroken run from zero, and sync requests resume from it.
 - The index is written by the server and is outside the AEAD. A server that
   lied about it could make a snapshot cover entries the client never saw, and
-  those would be lost — no new power, since it holds the log and can drop any
+  those would be lost. That is no new power, since it holds the log and can drop any
   entry anyway.
 
 **I · RESTART_TICKET (0x16), log ids, and rooms that outlive a restart.**
 Amendment F gave people a minute's warning before a restart ended their room.
-But the people in a room still hold everything that matters — the document
-and the key — so the room need not end at all. What stopped it coming back was
+But the people in a room still hold everything that matters, the document
+and the key, so the room need not end at all. What stopped it coming back was
 the new process: it had never heard of the room, and a client that could
 declare one into existence could squat any id or name, or bring back a room its
 members had shredded.

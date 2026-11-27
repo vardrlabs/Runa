@@ -75,7 +75,7 @@ impl AppState {
     /// Drop every per-client entry that no longer affects a decision: full
     /// buckets, expired blocks, refilled per-room join budgets. Before this,
     /// nothing was removed until a table reached its cap, which a quiet server
-    /// never does — so it held a pseudonym for everyone since boot.
+    /// never does, so it held a pseudonym for everyone since boot.
     pub fn forget_idle_clients(&self) {
         for limiter in [
             &self.auth_per_ip,
@@ -147,7 +147,7 @@ impl AppState {
     ///
     /// Issued at the very end, not with the warning: a room shredded during
     /// the countdown must not leave its members holding a way to bring it
-    /// back. Sent with backpressure rather than dropped on a full queue — a
+    /// back. Sent with backpressure rather than dropped on a full queue: a
     /// member who misses theirs can still rejoin once another has restored
     /// the room, but a room nobody got a ticket for is gone.
     pub async fn hand_over(&self) -> usize {

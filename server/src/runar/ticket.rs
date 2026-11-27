@@ -2,7 +2,7 @@
 //!
 //! Rooms live only in this process's memory, so replacing the process used to
 //! end every one of them. The people in a room still hold everything that
-//! matters — the document, and the key to it — but the new process would not
+//! matters, the document and the key to it, but the new process would not
 //! let them back in: it had never heard of the room, and a client that could
 //! simply declare one into existence could squat any id or name it liked, or
 //! bring back a room its members had shredded.
@@ -10,7 +10,7 @@
 //! A ticket is the old process vouching for a room at the moment it stopped:
 //! this room existed, it had not been shredded, and these were its settings.
 //! It is handed to every connected member just before their connection is
-//! closed, and the new process recreates the room from it — empty, since the
+//! closed, and the new process recreates the room from it, empty, since the
 //! server never held anything it could read, for the members to refill from
 //! their own copies.
 //!

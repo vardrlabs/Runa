@@ -25,13 +25,13 @@ jobs:
       # Three things this invocation has to get right, each hidden behind the
       # previous one:
       #   1. cargo-fuzz resolves targets at `<cwd>/fuzz/Cargo.toml`, so it runs
-      #      from the crate root — not from server/fuzz, which made it look for
+      #      from the crate root, not from server/fuzz, which made it look for
       #      server/fuzz/fuzz/Cargo.toml.
       #   2. The manifest needs `[package.metadata] cargo-fuzz = true`.
       #   3. `+nightly` is explicit because rust-toolchain.toml pins 1.98.0 at
       #      the repo root, and that pin overrides the nightly this job
       #      installs. cargo-fuzz needs -Z flags, so it fails without it.
-      # Seeds first. fuzz/corpus is gitignored, so every run starts empty —
+      # Seeds first. fuzz/corpus is gitignored, so every run starts empty,
       # and create_body has to get an input past
       # serde_json::from_slice::<CreateRoomBody> before it reaches anything
       # worth testing. Random bytes will not build a nested object with the

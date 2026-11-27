@@ -32,7 +32,7 @@ use crate::AppState;
 
 const JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 /// Slot count only. The real bound on a peer's outbound queue is
-/// `max_queued_bytes_per_conn`, enforced by `PeerTx` — 512 slots of
+/// `max_queued_bytes_per_conn`, enforced by `PeerTx`: 512 slots of
 /// `max_frame_bytes` each would be 128 MiB that nothing accounts for.
 const OUTBOUND_CAPACITY: usize = 512;
 
@@ -104,7 +104,7 @@ struct RosterJson {
 /// backlog so it can pace itself under them. Without this, a client coming
 /// back from a long outage with hundreds of queued edits sends them at once,
 /// trips the per-connection rate limit, is disconnected, reconnects, and sends
-/// them all again — forever.
+/// them all again, forever.
 #[derive(Serialize)]
 struct LimitsJson {
     max_frame_bytes: usize,
@@ -129,8 +129,8 @@ struct JoinAck {
     /// and compared the two directly, so every 24-hour room reported the
     /// server as contradicting its own config within seconds of being made.
     ///
-    /// With this the client reconstructs the total the server is claiming —
-    /// remaining plus elapsed — and compares like with like. It is sent rather
+    /// With this the client reconstructs the total the server is claiming,
+    /// remaining plus elapsed, and compares like with like. It is sent rather
     /// than derived from the client's own clock so that a difference between
     /// the two clocks cannot masquerade as tampering.
     elapsed_secs: u64,
@@ -426,8 +426,8 @@ async fn run_connection(
     room.auth_success(&ip);
     // Only guesses count against an address. Charging successful joins too
     // meant that the 31st connection in a minute from one office, school or
-    // carrier address — people reconnecting after a network blip, or after a
-    // restart — was refused with 4001, which is indistinguishable from "this
+    // carrier address (people reconnecting after a network blip, or after a
+    // restart) was refused with 4001, which is indistinguishable from "this
     // room does not exist" by design, and so was shown "this room is gone".
     state.auth_per_ip.refund(&ip, 1);
 
@@ -1001,7 +1001,7 @@ async fn process_frame(
                 };
                 // The server clamps extensions at a ceiling, so `add_secs` is
                 // a request, not a result. Clients must re-anchor on a value
-                // the server computed — otherwise the extender's local clock
+                // the server computed. Otherwise the extender's local clock
                 // drifts past the real deadline (and double-counts its own
                 // request on top of the broadcast).
                 let remaining = remaining_secs(room);
