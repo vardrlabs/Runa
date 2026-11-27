@@ -43,6 +43,18 @@ section — so this file is not documentation of the release, it is part of it.
   server thread. I could not make it happen: about 460,000 joins against a
   steady stream of edits never hit it. The reply now reads the log once.
 
+### Security
+
+- **url 2.5.9, clear of an advisory published in November 2026.**
+  RUSTSEC-2026-0592 is a stack overflow in `Url::origin()`: a `blob:` URL
+  nested thousands of times makes it call itself until the process aborts.
+  The server binary never contained the `url` crate. Only the test suite's
+  HTTP client pulls it in, so no released build could reach it. I cleared it
+  anyway, because the weekly advisory check on `main` had been failing on it
+  since 23 November, and that check has to be green to mean anything. The
+  bump brings `form_urlencoded` 1.2.3 with it, which the server does use to
+  read query strings.
+
 ## 0.5.4
 
 ### Security
