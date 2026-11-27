@@ -2,6 +2,7 @@ import * as cbor2 from "cbor2";
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { generateIdentity } from "../crypto/identity";
+import { MAX_PHRASE_LEN, MAX_WRAP_CT, encodeWayIn } from "./reroot";
 import { encodeHeader, FT, PROTOCOL_VERSION } from "../transport/frame";
 import {
   decodeCancel,
@@ -80,6 +81,8 @@ describe("EVICT_REQUEST", () => {
       request({ targetKey: new Uint8Array(40) }),
       request({ target: null, targetKey: new Uint8Array(32) }),
       request({ policy: "INITIATOR" as never }),
+      request({ policy: "MAJORITY" }),
+      request({ policy: "THRESHOLD" }),
     ]) {
       expect(decodeRequest(encodeRequest(bad))).toBeNull();
     }
@@ -183,13 +186,56 @@ describe("EVICT_COMMIT", () => {
     expect(decodeCommit(joined)).toBeNull();
   });
 
-  it("holds the vote count to 1..32 and every signature to 64 bytes", () => {
+  it("holds the vote count to 1..32 and every vote signature to 64 bytes", () => {
     expect(() => encodeClear(clear({ votes: [] }))).toThrow();
     const many = Array.from({ length: MAX_VOTES + 1 }, () => ({ voter: new Uint8Array(16), sig: new Uint8Array(64) }));
     expect(() => encodeClear(clear({ votes: many }))).toThrow();
-    const b = encodeClear(clear());
-    b[119 + 1 + 16] = 63;
-    expect(decodeCommit(new Uint8Array([...b, 0xa0]))).toBeNull();
+  });
+
+  it("refuses a signature length byte that is not 64 when nothing else is wrong", async () => {
+    const id = await generateIdentity();
+    const body = await encodeCommit(header(0), clear(), tail(), id);
+    expect(decodeCommit(body)).not.toBeNull();
+    const bad = body.slice();
+    expect(bad[119 + 1 + 16]).toBe(64);
+    bad[119 + 1 + 16] = 63;
+    expect(decodeCommit(bad)).toBeNull();
+  });
+
+  it("encodeClear checks the request id, the verifier and the salt", () => {
+    expect(() => encodeClear(clear({ requestId: new Uint8Array(15) }))).toThrow();
+    expect(() => encodeClear(clear({ verifier: new Uint8Array(33) }))).toThrow();
+    expect(() => encodeClear(clear({ salt: new Uint8Array(17) }))).toThrow();
+  });
+
+  it("carries a wrap of the largest way in, a maximum-length passphrase of three-byte characters", async () => {
+    const phrase = "\u20ac".repeat(MAX_PHRASE_LEN);
+    const plain = encodeWayIn({ kind: "pass", secret: new Uint8Array(32), salt: new Uint8Array(16), phrase });
+    const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+    const iv = new Uint8Array(12).fill(14);
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, plain as BufferSource));
+    expect(ct.length).toBe(MAX_WRAP_CT);
+    const id = await generateIdentity();
+    const t = tail({ wraps: [{ p: new Uint8Array(16).fill(13), iv, ct }] });
+    const d = decodeCommit(await encodeCommit(header(0), clear(), t, id));
+    expect(d).not.toBeNull();
+    expect(d!.tail.wraps[0].ct).toEqual(ct);
+  });
+
+  it("encodeCommit refuses a tail the decoder would refuse", async () => {
+    const id = await generateIdentity();
+    const w = { p: new Uint8Array(16).fill(13), iv: new Uint8Array(12).fill(14), ct: new Uint8Array(40) };
+    const bad: CommitTail[] = [
+      tail({ wraps: [{ ...w, ct: new Uint8Array(MAX_WRAP_CT + 1) }] }),
+      tail({ wraps: [{ ...w, ct: new Uint8Array(15) }] }),
+      tail({ wraps: [{ ...w, p: new Uint8Array(15) }] }),
+      tail({ wraps: [{ ...w, iv: new Uint8Array(13) }] }),
+      tail({ wraps: Array.from({ length: MAX_VOTES + 1 }, () => w) }),
+      tail({ sender: new Uint8Array(15) }),
+      tail({ confirm: new Uint8Array(17) }),
+      tail({ root: -1 }),
+    ];
+    for (const t of bad) await expect(encodeCommit(header(0), clear(), t, id)).rejects.toThrow();
   });
 
   it("never throws on arbitrary bytes", () => {

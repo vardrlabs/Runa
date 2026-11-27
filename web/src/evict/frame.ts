@@ -3,6 +3,7 @@ import { signPayload, verifyPayload, type Identity, type SignatureAlg } from "..
 import { concatBytes } from "../crypto/keys";
 import type { Wrap } from "../epoch/frame";
 import type { Policy } from "../shred/machine";
+import { MAX_WRAP_CT } from "./reroot";
 import { ZERO_KEY_DIGEST, ZERO_PEER } from "./statement";
 
 /// The EVICT frames of PROTOCOL.md amendment K. EVICT_REQUEST, EVICT_VOTE and
@@ -14,11 +15,9 @@ export const MAX_VOTES = 32;
 export const MAX_DEADLINE_MS = 3_600_000;
 export const MAX_CONFIG_LEN = 4096;
 export const SIG_LEN = 64;
-const MAX_WRAP_CT = 1024;
 const MAX_TAIL = 64 * 1024;
 const COMMIT_DOMAIN = new TextEncoder().encode("runa/v1/evict-commit");
 const EMPTY = new Uint8Array(0);
-const POLICIES: readonly string[] = ["UNANIMOUS", "MAJORITY", "THRESHOLD"];
 
 export interface EvictRequest {
   id: Uint8Array;
@@ -127,7 +126,7 @@ export function decodeRequest(bytes: Uint8Array): EvictRequest | null {
   if (!o || o.type !== "EVICT_REQUEST") return null;
   if (!isBytes(o.id, 16) || !isU32(o.epoch) || !isBytes(o.target, 16) || !isBytes(o.targetKey, 0, 65)) return null;
   if (!isBytes(o.verifier, 32) || !isBytes(o.roster, 32) || !isBytes(o.sig, SIG_LEN)) return null;
-  if (typeof o.policy !== "string" || !POLICIES.includes(o.policy)) return null;
+  if (o.policy !== "UNANIMOUS") return null;
   if (!isU32(o.deadline) || o.deadline > MAX_DEADLINE_MS) return null;
   const target = isZero(o.target) ? null : o.target;
   const keyLen = o.targetKey.length;
@@ -139,7 +138,7 @@ export function decodeRequest(bytes: Uint8Array): EvictRequest | null {
     targetKey: target ? o.targetKey : null,
     verifier: o.verifier,
     roster: o.roster,
-    policy: o.policy as Policy,
+    policy: o.policy,
     deadline: o.deadline,
     sig: o.sig,
   };
@@ -184,6 +183,7 @@ export function encodeClear(c: CommitClear): Uint8Array {
   if ((c.target === null) !== (c.targetKeyDigest === null)) throw new Error("a target is named by its peer id and its key");
   if (c.target && (c.target.length !== 16 || isZero(c.target))) throw new Error("malformed target");
   if (c.targetKeyDigest && (c.targetKeyDigest.length !== 32 || isZero(c.targetKeyDigest))) throw new Error("malformed key digest");
+  if (c.requestId.length !== 16 || c.verifier.length !== 32 || c.salt.length !== 16) throw new Error("malformed request id, verifier or salt");
   const len = new Uint8Array(4);
   new DataView(len.buffer).setUint32(0, c.config.length, false);
   const parts: Uint8Array[] = [
@@ -211,13 +211,29 @@ function signedBytes(header: Uint8Array, clearBytes: Uint8Array, unsigned: Uint8
   return concatBytes(COMMIT_DOMAIN, header, clearBytes, unsigned);
 }
 
+/// The checks on a tail's fields, shared by both directions so that the
+/// encoder never emits what a member's decoder refuses.
+function tailFieldsOk(tt: object): boolean {
+  const t = tt as Record<string, unknown>;
+  if (!isU32(t.root) || !isBytes(t.sender, 16) || !isBytes(t.confirm, 16)) return false;
+  if (!Array.isArray(t.wraps) || t.wraps.length > MAX_VOTES) return false;
+  return t.wraps.every((w) => {
+    if (typeof w !== "object" || w === null) return false;
+    const ww = w as Record<string, unknown>;
+    return isBytes(ww.p, 16) && isBytes(ww.iv, 12) && isBytes(ww.ct, 16, MAX_WRAP_CT);
+  });
+}
+
 export async function encodeCommit(header: Uint8Array, clear: CommitClear, tail: CommitTail, identity: Identity): Promise<Uint8Array> {
   if (header.length !== 32) throw new Error("header must be 32 bytes");
   const clearBytes = encodeClear(clear);
+  if (!tailFieldsOk(tail)) throw new Error("a commit's tail would be refused by its readers");
   const unsigned = cbor2.encode(tailShape(tail));
   const sig = await signPayload(identity, signedBytes(header, clearBytes, unsigned));
   if (sig.length !== SIG_LEN) throw new Error("unexpected signature length");
-  return concatBytes(clearBytes, cbor2.encode({ ...tailShape(tail), sig }));
+  const signed = cbor2.encode({ ...tailShape(tail), sig });
+  if (signed.length > MAX_TAIL) throw new Error("a commit's tail is too large");
+  return concatBytes(clearBytes, signed);
 }
 
 export function decodeCommit(body: Uint8Array): DecodedCommit | null {
@@ -256,16 +272,9 @@ export function decodeCommit(body: Uint8Array): DecodedCommit | null {
   const tailBytes = body.slice(off);
   if (tailBytes.length === 0 || tailBytes.length > MAX_TAIL) return null;
   const o = decodeMap(tailBytes);
-  if (!o || !isU32(o.root) || !isBytes(o.sender, 16) || !isBytes(o.confirm, 16) || !isBytes(o.sig, SIG_LEN)) return null;
-  if (!Array.isArray(o.wraps) || o.wraps.length > MAX_VOTES) return null;
-  const wraps: Wrap[] = [];
-  for (const w of o.wraps) {
-    if (typeof w !== "object" || w === null) return null;
-    const ww = w as Record<string, unknown>;
-    if (!isBytes(ww.p, 16) || !isBytes(ww.iv, 12) || !isBytes(ww.ct, 16, MAX_WRAP_CT)) return null;
-    wraps.push({ p: ww.p, iv: ww.iv, ct: ww.ct });
-  }
-  const tail: CommitTail = { root: o.root, sender: o.sender, confirm: o.confirm, wraps };
+  if (!o || !isBytes(o.sig, SIG_LEN) || !tailFieldsOk(o)) return null;
+  const wraps = (o.wraps as Wrap[]).map((w) => ({ p: w.p, iv: w.iv, ct: w.ct }));
+  const tail: CommitTail = { root: o.root as number, sender: o.sender as Uint8Array, confirm: o.confirm as Uint8Array, wraps };
   if (!sameBytes(cbor2.encode({ ...tailShape(tail), sig: o.sig }), tailBytes)) return null;
   return {
     clear: {

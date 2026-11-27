@@ -97,6 +97,20 @@ export function decodeWayIn(bytes: Uint8Array): WayIn | null {
   return w;
 }
 
+/// The AES-GCM tag every wrap's ciphertext carries after the sealed bytes.
+const GCM_TAG_LEN = 16;
+
+/// The longest ciphertext a wrap can hold: the largest way in `encodeWayIn`
+/// can produce, a passphrase of `MAX_PHRASE_LEN` code units of three bytes each
+/// in UTF-8, plus the tag. The commit's encoder and decoder both use this.
+export const MAX_WRAP_CT =
+  encodeWayIn({
+    kind: "pass",
+    secret: new Uint8Array(SECRET_LEN),
+    salt: new Uint8Array(SALT_LEN),
+    phrase: "\u20ac".repeat(MAX_PHRASE_LEN),
+  }).length + GCM_TAG_LEN;
+
 /// The new link's `#k=…&s=…`, or null for a passphrase.
 export function wayFragment(w: WayIn): string | null {
   return w.kind === "link" ? fragmentWithKey(w.secret, w.salt) : null;
