@@ -24,6 +24,10 @@ export const FT = {
   EPOCH_KEY: 0x20,
   TTL_EXTEND: 0x22,
   SNAPSHOT: 0x21,
+  EVICT_COMMIT: 0x23,
+  EVICT_REQUEST: 0x24,
+  EVICT_VOTE: 0x25,
+  EVICT_CANCEL: 0x26,
   ERROR: 0x30,
 } as const;
 
