@@ -37,9 +37,11 @@ export type LeaveReason = "proposer-left" | "voter-left";
 /// How long members wait for the commit once every approval is in.
 export const COMMIT_WAIT_MS = 15_000;
 
-/// How many request ids one member remembers in one epoch. Past it the oldest
-/// is let go, and from then until the epoch moves a commit for any id it
-/// cannot place is refused rather than judged as one it never saw.
+/// How many request ids one member remembers in one epoch. Past it one is let
+/// go: a refused id before a settled proposal, the oldest first, and never the
+/// proposal this member holds now. The record is best effort: a commit for an
+/// id it has let go of is checked as one this member never saw, and is never
+/// applied.
 export const MAX_SEEN_REQUESTS = 64;
 
 /// What a ballot signs. The eviction statement by default; Unit B (a room's
@@ -97,16 +99,16 @@ export class EvictMachine {
   private p: Proposal | null = null;
   /// Approvals by voter (hex), with their signatures, for the commit.
   private approvals = new Map<string, Uint8Array>();
-  /// Every request id this member received or made in the current epoch,
-  /// with the proposal it froze, or null for one it refused. A commit for one
-  /// of them is judged against that proposal and never as one this member
-  /// did not see, even after a newer request replaced it here. Bounded by
-  /// `MAX_SEEN_REQUESTS` and emptied when the epoch moves. It lives here, not
-  /// in the coordinator, because `commitSatisfies` is what decides which set
-  /// a commit is held to, and `open` is the one place a proposal is frozen.
+  /// Request ids this member received or made in the current epoch, with the
+  /// proposal it froze, or null for one it refused. A commit for a proposal
+  /// here is judged against it, even after a newer request replaced it; a
+  /// commit for any other id is one this member cannot place, and it never
+  /// applies one of those. Bounded by `MAX_SEEN_REQUESTS` and emptied when the
+  /// epoch moves. It lives here, not in the coordinator, because
+  /// `commitSatisfies` is what decides which set a commit is held to, and
+  /// `open` is the one place a proposal is frozen.
   private seenEpoch = -1;
   private seenIds = new Map<string, Proposal | null>();
-  private seenOverflowed = false;
 
   constructor(private d: MachineDeps) {}
 
@@ -115,7 +117,6 @@ export class EvictMachine {
     if (epoch !== this.seenEpoch) {
       this.seenEpoch = epoch;
       this.seenIds.clear();
-      this.seenOverflowed = false;
     }
     return this.seenIds;
   }
@@ -123,22 +124,35 @@ export class EvictMachine {
   private markSeen(id: Uint8Array, p: Proposal | null): void {
     const table = this.seenTable();
     const key = hexOf(id);
-    if (!table.has(key) && table.size >= MAX_SEEN_REQUESTS) {
-      const oldest = table.keys().next().value;
-      if (oldest !== undefined) table.delete(oldest);
-      this.seenOverflowed = true;
-    }
+    if (!table.has(key) && table.size >= MAX_SEEN_REQUESTS) this.letOneGo(table);
     table.set(key, p);
   }
 
-  /// Whether this member received or made a request with this id in the
-  /// current epoch, whatever became of it.
+  /// Lets go of the oldest refused id, or if there is none the oldest
+  /// proposal other than the one this member holds now. Refused ids cost a
+  /// sender nothing to make, so they never push a proposal out while one of
+  /// them is left.
+  private letOneGo(table: Map<string, Proposal | null>): void {
+    let victim: string | null = null;
+    for (const [k, v] of table) {
+      if (v === null) {
+        victim = k;
+        break;
+      }
+      if (victim === null && v !== this.p) victim = k;
+    }
+    if (victim !== null) table.delete(victim);
+  }
+
+  /// Whether this member still holds a record of a request with this id in
+  /// the current epoch, whatever became of it.
   wasSeen(id: Uint8Array): boolean {
-    return this.seenOverflowed || this.seenTable().has(hexOf(id));
+    return this.seenTable().has(hexOf(id));
   }
 
   /// The proposal this member froze for that id in the current epoch, if it
-  /// opened one.
+  /// opened one and still holds it. Only a commit for one of these is ever
+  /// applied.
   requestFor(id: Uint8Array): Proposal | null {
     return this.seenTable().get(hexOf(id)) ?? null;
   }
@@ -356,18 +370,16 @@ export class EvictMachine {
   /// valid signature, and nobody else; and whether it names the target's key
   /// as the request did (SHA-256 of `request.targetKey`). That holds for any
   /// request this member opened in the current epoch, not only the one open
-  /// now. A request it received but refused is never satisfied, and neither
-  /// is an id it cannot place once its record has overflowed. A member that
-  /// never saw the request requires the digest to be that of the key its
-  /// roster shows for the named target, if it is still listed, and checks
-  /// against its own roster without the named target, every entry whose key
-  /// has the commit's digest, and itself.
+  /// now. For an id it cannot place (never received, refused, or let go of)
+  /// it makes the checks of a member that never saw the request: the digest
+  /// is that of the key its roster shows for the named target, if it is still
+  /// listed, and the votes cover its own roster without the named target,
+  /// every entry whose key has the commit's digest, and itself. Passing those
+  /// only tells such a member that the room moved without it: `requestFor`
+  /// returns null for that id, and the caller never applies the commit.
   async commitSatisfies(c: Statement & { votes: Ballot[] }): Promise<boolean> {
     if ((c.target === null) !== (c.targetKeyDigest === null)) return false;
-    const table = this.seenTable();
-    const key = hexOf(c.id);
-    if (table.has(key) ? table.get(key) === null : this.seenOverflowed) return false;
-    const p = table.get(key) ?? null;
+    const p = this.requestFor(c.id);
     let set: RosterEntry[];
     if (p) {
       const sameTarget = p.request.target === null ? c.target === null : c.target !== null && eq(p.request.target, c.target);

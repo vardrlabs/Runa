@@ -17,8 +17,8 @@ import {
   type ReRooted,
   type SealedConfig,
 } from "./coordinator";
-import { decodeCommit, decodeRequest, decodeVote, encodeCancel, encodeCommit, encodeVote, MAX_VOTES } from "./frame";
-import { COMMIT_WAIT_MS, type EvictState } from "./machine";
+import { decodeCommit, decodeRequest, decodeVote, encodeCancel, encodeCommit, encodeRequest, encodeVote, MAX_VOTES, type EvictRequest } from "./frame";
+import { COMMIT_WAIT_MS, MAX_SEEN_REQUESTS, type EvictState } from "./machine";
 import { deriveReRoot, encodeWayIn, newLinkWayIn, type WayIn } from "./reroot";
 import { bytesEqual, hexOf, keyDigest } from "./statement";
 
@@ -806,8 +806,11 @@ describe("frames that arrive before their request (fix wave 1, A1)", () => {
     const [a, b, c] = peers;
     const junk = (): Uint8Array =>
       encodeVote({ id: crypto.getRandomValues(new Uint8Array(16)), vote: "APPROVE", sig: crypto.getRandomValues(new Uint8Array(64)) });
+    // One sender holds frames for one id at a time; many senders fill the bound.
     for (let i = 0; i < 100; i++) await b.ev.receiveFrame(FT.EVICT_VOTE, c.id, junk());
-    for (let i = 0; i < 20; i++) await b.ev.receiveFrame(FT.EVICT_CANCEL, c.id, encodeCancel({ id: crypto.getRandomValues(new Uint8Array(16)) }));
+    expect(b.ev.heldFrames()).toBe(1);
+    for (let i = 0; i < 20; i++) await b.ev.receiveFrame(FT.EVICT_VOTE, new Uint8Array(16).fill(0x60 + i), junk());
+    for (let i = 0; i < 20; i++) await b.ev.receiveFrame(FT.EVICT_CANCEL, new Uint8Array(16).fill(0x90 + i), encodeCancel({ id: crypto.getRandomValues(new Uint8Array(16)) }));
     expect(b.ev.heldFrames()).toBe(MAX_EARLY_IDS);
     expect(b.ev.isOpen()).toBe(false);
     hub.now += EARLY_HOLD_MS;
@@ -847,7 +850,7 @@ describe("a member that refused is never made to apply the commit (fix wave 1, A
   /// A proposes R1 against T. C approves; B refuses or never answers. A then
   /// sends R2, which replaces R1 in B's machine, and sends a commit for R1
   /// carrying every vote but B's.
-  async function scenario(how: "reject" | "unanswered", wrapForB: boolean) {
+  async function scenario(how: "reject" | "unanswered", wrapForB: boolean, flush = false) {
     const { hub, peers } = await room(4);
     const [a, b, c, t] = peers;
     const held = holdFrames(hub);
@@ -868,13 +871,25 @@ describe("a member that refused is never made to apply the commit (fix wave 1, A
       await a.ev.tick();
       expect(a.states.at(-1)).toBe("EXPIRED");
     }
+    const req = decodeRequest(r1.pt)!;
+    if (flush) {
+      // T, still a member, asks for a link change and cancels it, over and
+      // over, until B's record has let go of R1.
+      for (let i = 0; i < MAX_SEEN_REQUESTS && b.ev.machine.requestFor(req.id); i++) {
+        const at = held.length;
+        expect(await t.ev.propose(null, newLinkWayIn())).toBeNull();
+        await t.ev.cancel();
+        for (const f of held.slice(at)) await b.ev.receiveFrame(f.ft, t.id, f.pt);
+      }
+      expect(b.ev.machine.requestFor(req.id)).toBeNull();
+      expect(b.refusals).toEqual([]);
+    }
     const before = held.length;
     expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
     await b.ev.receiveFrame(held[before].ft, a.id, held[before].pt);
-    expect(b.prompts).toHaveLength(2);
+    expect(b.prompts.at(-1)!.requestId).toEqual(decodeRequest(held[before].pt)!.id);
     expect(b.ev.isOpen()).toBe(true);
 
-    const req = decodeRequest(r1.pt)!;
     const keys = await deriveReRoot(keep(copy));
     const config = await encryptRoomConfig(keys.contentKey, b.config.ttl, b.config.ceilingOptout, b.config.level);
     const h = header(FT.EVICT_COMMIT, 0);
@@ -911,6 +926,14 @@ describe("a member that refused is never made to apply the commit (fix wave 1, A
         expect(b.refusals).toEqual(["commit-policy"]);
         expect(b.applied).toHaveLength(0);
         expect(b.leftOut).toBe(0);
+        expect(b.keyring.rootEpoch).toBe(0);
+        expect(b.keyring.current.epoch).toBe(0);
+      });
+      it(`tells it it was left out once its record of the request is gone, after a ${how === "reject" ? "refusal" : "vote it never answered"}, ${wrapForB ? "with" : "without"} a wrap for it (fix wave 2, F1)`, async () => {
+        const b = await scenario(how, wrapForB, true);
+        expect(b.refusals).toEqual([]);
+        expect(b.leftOut).toBe(1);
+        expect(b.applied).toHaveLength(0);
         expect(b.keyring.rootEpoch).toBe(0);
         expect(b.keyring.current.epoch).toBe(0);
       });
@@ -1160,5 +1183,251 @@ describe("checks that a test pins (fix wave 1, B9)", () => {
     await b.ev.receiveCommit(h, 0, a.id, body);
     expect(b.applied).toHaveLength(0);
     expect(b.keyring.rootEpoch).toBe(0);
+  });
+});
+
+/// A commit built by hand from a request and the way in it named, with the
+/// votes and wraps a test chooses: what a proposer that deviates can send.
+async function forgeCommit(from: Peer, req: EvictRequest, way: WayIn, votes: { voter: Uint8Array; sig: Uint8Array }[], wrapFor: Peer[]) {
+  const keys = await deriveReRoot(keep(way));
+  const config = await encryptRoomConfig(keys.contentKey, from.config.ttl, from.config.ceilingOptout, from.config.level);
+  const h = header(FT.EVICT_COMMIT, req.epoch);
+  const wraps = [];
+  for (const p of wrapFor) {
+    const key = await wrapKey(from.kx, p.kx.publicKeyRaw, ROOM, req.epoch + 1, from.id, p.id);
+    wraps.push({ p: p.id, ...(await sealWrap(key, h, encodeWayIn(way))) });
+  }
+  const body = await encodeCommit(
+    h,
+    {
+      requestId: req.id,
+      target: req.target,
+      targetKeyDigest: req.targetKey ? await keyDigest(req.targetKey) : null,
+      verifier: req.verifier,
+      salt: way.salt,
+      config,
+      votes,
+    },
+    { root: req.epoch + 1, sender: from.id, confirm: keys.confirm, wraps },
+    from.identity,
+  );
+  return { h, body };
+}
+
+/// A well-formed request nobody signed, with a fresh id.
+const junkRequest = (): Uint8Array =>
+  encodeRequest({
+    id: crypto.getRandomValues(new Uint8Array(16)),
+    epoch: 0,
+    target: null,
+    targetKey: null,
+    verifier: crypto.getRandomValues(new Uint8Array(32)),
+    roster: crypto.getRandomValues(new Uint8Array(32)),
+    policy: "UNANIMOUS",
+    deadline: 60_000,
+    sig: crypto.getRandomValues(new Uint8Array(64)),
+  });
+
+describe("a member that cannot place a commit's request never applies it (fix wave 2, F1)", () => {
+  it("a member that never saw the request and is wrapped for anyway says it was left out and opens nothing", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, d, t] = peers;
+    const held = holdFrames(hub);
+    const way = newLinkWayIn();
+    const copy = keep(way);
+    await a.ev.propose(t.view(), way);
+    const req = decodeRequest(held[0].pt)!;
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await b.ev.vote("APPROVE");
+    const bVote = decodeVote(held[1].pt)!;
+    // Every vote d's own roster needs but d's, and a wrap for d all the same.
+    const { h, body } = await forgeCommit(
+      a,
+      req,
+      copy,
+      [
+        { voter: a.id, sig: req.sig },
+        { voter: b.id, sig: bVote.sig! },
+      ],
+      [b, d],
+    );
+    await d.ev.receiveCommit(h, 0, a.id, body);
+    expect(d.applied).toHaveLength(0);
+    expect(d.leftOut).toBe(1);
+    expect(d.refusals).toEqual([]);
+    expect(d.keyring.rootEpoch).toBe(0);
+    expect(d.keyring.current.epoch).toBe(0);
+  });
+
+  it("a member that never saw the request and holds the target's key says it was removed", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await b.ev.vote("APPROVE");
+    hub.dropCommits = true;
+    await a.ev.receiveFrame(held[1].ft, b.id, held[1].pt);
+    const { h, body } = hub.captured[0];
+    await t.ev.receiveCommit(h, 0, a.id, body);
+    expect(t.removedCount).toBe(1);
+    expect(t.leftOut).toBe(0);
+    expect(t.applied).toHaveLength(0);
+    expect(t.keyring.rootEpoch).toBe(0);
+  });
+});
+
+describe("the record of seen requests cannot be turned against the room (fix wave 2, F2)", () => {
+  for (const flooder of ["the target", "another member"] as const) {
+    it(`every member applies the real commit after a flood of junk requests from ${flooder}`, async () => {
+      const { hub, peers } = await room(4);
+      const [a, b, c, t] = peers;
+      expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+      await hub.flush();
+      const from = flooder === "the target" ? t : c;
+      for (let i = 0; i < MAX_SEEN_REQUESTS * 2; i++) {
+        const junk = junkRequest();
+        for (const p of [a, b, c, t]) await p.ev.receiveFrame(FT.EVICT_REQUEST, from.id, junk);
+      }
+      await b.ev.vote("APPROVE");
+      await c.ev.vote("APPROVE");
+      await hub.flush();
+      expect(hub.epoch).toBe(1);
+      for (const p of [a, b, c]) {
+        expect(p.refusals.filter((r) => r.startsWith("commit"))).toEqual([]);
+        expect(p.applied).toHaveLength(1);
+        expect(p.keyring.rootEpoch).toBe(1);
+        expect(p.states.at(-1)).toBe("DONE");
+      }
+    });
+  }
+});
+
+describe("fix wave 2, the Minors", () => {
+  it("a commit for an earlier request ends the newer vote as the epoch moving, not as done (Minor 1)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    hub.dropCommits = true;
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await c.ev.vote("APPROVE");
+    await hub.flush();
+    const { h, body } = hub.captured[0];
+    // a gives up on its echo; b and c on the commit.
+    hub.now += COMMIT_ECHO_MS;
+    await a.ev.tick();
+    hub.now += COMMIT_WAIT_MS - COMMIT_ECHO_MS;
+    for (const p of [b, c]) await p.ev.tick();
+    for (const p of [a, b, c]) expect(p.states.at(-1)).toBe("FAILED");
+    // c asks for a link change, and a and b open it.
+    expect(await c.ev.propose(null, newLinkWayIn())).toBeNull();
+    await hub.flush();
+    for (const p of [a, b, c]) expect(p.states.at(-1)).toBe("VOTING");
+    // Then the commit for the first request arrives after all.
+    hub.dropCommits = false;
+    hub.deliver(a, h, body);
+    await hub.flush();
+    for (const p of [a, b, c]) {
+      expect(p.applied).toHaveLength(1);
+      expect(p.keyring.rootEpoch).toBe(1);
+      expect(p.states.at(-1)).toBe("FAILED");
+      expect(p.states).not.toContain("DONE");
+    }
+  });
+
+  it("junk from one sender cannot push a real early frame from another out of the buffer (Minor 2)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    for (let i = 0; i < 100; i++) {
+      const v = encodeVote({ id: crypto.getRandomValues(new Uint8Array(16)), vote: "APPROVE", sig: crypto.getRandomValues(new Uint8Array(64)) });
+      await b.ev.receiveFrame(FT.EVICT_VOTE, t.id, v);
+    }
+    expect(b.ev.heldFrames()).toBe(1);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await c.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await c.ev.vote("REJECT");
+    // c's refusal reaches b before the request does.
+    await b.ev.receiveFrame(held[1].ft, c.id, held[1].pt);
+    expect(b.ev.heldFrames()).toBe(2);
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    expect(b.states.at(-1)).toBe("REJECTED");
+    expect(b.prompts).toHaveLength(0);
+  });
+
+  it("a target that refused the request as busy still says it was removed (Minor 3)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    // c asks for a link change that only t hears, then gives up on it.
+    await c.ev.propose(null, newLinkWayIn());
+    await t.ev.receiveFrame(held[0].ft, c.id, held[0].pt);
+    await c.ev.cancel();
+    const at = held.length;
+    await a.ev.propose(t.view(), newLinkWayIn());
+    const r1 = held[at];
+    for (const p of [b, c, t]) await p.ev.receiveFrame(r1.ft, a.id, r1.pt);
+    expect(t.refusals).toEqual(["busy"]);
+    hub.dropCommits = true;
+    for (const p of [b, c]) await p.ev.vote("APPROVE");
+    for (const f of held.slice(at + 1)) if (f.ft === FT.EVICT_VOTE) await a.ev.receiveFrame(f.ft, f.from.id, f.pt);
+    expect(hub.captured).toHaveLength(1);
+    const { h, body } = hub.captured[0];
+    await t.ev.receiveCommit(h, 0, a.id, body);
+    expect(t.removedCount).toBe(1);
+    expect(t.refusals).toEqual(["busy"]);
+    expect(t.applied).toHaveLength(0);
+    expect(t.keyring.rootEpoch).toBe(0);
+  });
+
+  it("a member the proposer's roster did not include is told it was left out, not refused (Minor 4)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, t, d] = peers;
+    const held = holdFrames(hub);
+    hub.peers = hub.peers.filter((p) => p !== d);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    // d's arrival reaches d before the request does.
+    hub.peers.push(d);
+    await d.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    expect(d.refusals).toEqual(["roster-mismatch"]);
+    hub.sealed = Hub.prototype.sealed;
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    expect(b.keyring.rootEpoch).toBe(1);
+    expect(d.leftOut).toBe(1);
+    expect(d.refusals).toEqual(["roster-mismatch"]);
+    expect(d.keyring.rootEpoch).toBe(0);
+  });
+
+  it("ignores a repeated copy of the request open now, or of one already settled, quietly (Minor 5)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    expect(b.refusals).toEqual([]);
+    expect(b.prompts).toHaveLength(1);
+    await b.ev.vote("REJECT");
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    expect(b.refusals).toEqual([]);
+    expect(b.prompts).toHaveLength(1);
+    expect(b.states).toEqual(["VOTING", "REJECTED"]);
+  });
+
+  it("reports a vote past its deadline as expired before a new request replaces it (Minor 6)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    await a.ev.propose(t.view(), newLinkWayIn(), 5_000);
+    await hub.flush();
+    hub.now += 5_000;
+    await a.ev.tick();
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(b.states).toEqual(["VOTING", "EXPIRED", "VOTING"]);
+    expect(b.prompts).toHaveLength(2);
   });
 });

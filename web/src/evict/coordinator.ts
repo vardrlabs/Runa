@@ -46,7 +46,8 @@ export const COMMIT_ECHO_MS = 10_000;
 /// request is usually a moment behind; anything older is let go.
 export const EARLY_HOLD_MS = 5_000;
 /// How many request ids early frames are held for at once. Each holds at
-/// most `MAX_VOTES` votes, one per sender, and one cancel.
+/// most `MAX_VOTES` votes, one per sender, and one cancel, and one sender has
+/// frames held for one id at a time, so no sender can fill the buffer alone.
 export const MAX_EARLY_IDS = 8;
 
 export interface SealedConfig {
@@ -218,6 +219,13 @@ export class EvictCoordinator {
   private hold(id: Uint8Array, sender: Uint8Array, vote: EvictVote | null): void {
     this.pruneEarly();
     const key = hexOf(id);
+    // A sender's newest frame replaces what it had held for any other id.
+    for (const [k, x] of this.early) {
+      if (k === key) continue;
+      x.votes = x.votes.filter((v) => !eq(v.sender, sender));
+      if (x.cancel && eq(x.cancel, sender)) x.cancel = null;
+      if (x.votes.length === 0 && !x.cancel) this.early.delete(k);
+    }
     let e = this.early.get(key);
     if (!e) {
       if (this.early.size >= MAX_EARLY_IDS) return;
@@ -410,6 +418,14 @@ export class EvictCoordinator {
     if (frameType === FT.EVICT_REQUEST) {
       const req = decodeRequest(plaintext);
       if (!req) return this.refused("malformed");
+      // A vote that ran out, or whose epoch moved, is reported as such before
+      // a new request can replace it. Only a vote still collecting approvals:
+      // an approved one waiting on its commit is the session timer's to end,
+      // since the proposer's way in may still be kept for a late echo.
+      if (this.machine.state === "VOTING") this.report(this.machine.tick(this.d.now())?.reason);
+      // Another copy of a request this member already holds, open or settled,
+      // asks nothing new.
+      if (this.machine.wasSeen(req.id)) return;
       const guard = await this.machine.onRequest(req, sender);
       if (guard) {
         this.report();
@@ -441,6 +457,9 @@ export class EvictCoordinator {
     if (cur && eq(cur.request.id, id) && this.machine.state === "DONE") return;
     // One that overtook its request waits for it.
     if (!this.machine.wasSeen(id)) return this.hold(id, sender, v);
+    // One for a request this member received but refused has nothing to
+    // count toward, and is not shown as a refusal of its own.
+    if (!this.machine.requestFor(id)) return;
     if (v) {
       const guard = await this.machine.onVote(v, sender);
       if (this.dead) return;
@@ -560,27 +579,41 @@ export class EvictCoordinator {
       verifier: clear.verifier,
       votes: clear.votes,
     };
+    // The request this member saw for that id, if it still holds it. Only a
+    // commit for one of these is ever applied: in an honest room everyone
+    // wrapped for approved, so saw the request.
+    const placed = this.machine.requestFor(clear.requestId);
     // Also checks that the digest is SHA-256 of the key the request named
-    // (or, for a member that never saw it, of the named peer's roster key).
+    // (or, for a request this member cannot place, of the named peer's roster
+    // key).
     if (!(await this.machine.commitSatisfies(claim))) return this.refused("commit-policy");
     const holdsTargetKey = clear.targetKeyDigest !== null && eq(clear.targetKeyDigest, await keyDigest(this.d.identity.publicKeyRaw));
 
     // Everything above awaited: look again before acting on any of it.
     const meNow = this.d.me();
     if (this.dead || !meNow || !eq(meNow, me) || ring.current.epoch !== epoch) return;
+    if (this.machine.requestFor(clear.requestId) !== placed) return;
 
     // This connection is the one named, or this tab holds the key the votes
     // name (a connection opened again under a new peer id, say), so it was
-    // removed whatever its peer id is now. The server closes such a
-    // connection with 4014; if it sees the commit anyway, it has no wrap,
-    // and says so itself.
+    // removed whatever its peer id is now, and whatever it made of the
+    // request. It says so only after the checks above, which hold the commit
+    // to the request it saw or, if it cannot place one, to its own roster.
+    // The server closes such a connection with 4014; if it sees the commit
+    // anyway, it has no wrap, and says so itself.
     if (holdsTargetKey || (clear.target !== null && eq(clear.target, me))) {
       this.dropPending();
       this.dropLate();
-      this.machine.finish();
+      this.endVoteFor(clear.requestId);
       this.say(() => this.d.removed());
       return;
     }
+
+    // A commit for a request this member never saw, refused, or no longer
+    // holds: the checks a member that never saw it can make passed, so the
+    // room's way in changed without it. No wrap is opened and the keyring is
+    // not touched.
+    if (!placed) return this.leftOutOfCommit();
 
     const pend = this.pending;
     const late = this.late;
@@ -602,13 +635,7 @@ export class EvictCoordinator {
         this.late = null;
       } else {
         way = await this.unwrap(header, dec, from, me);
-        if (!way) {
-          this.machine.fail();
-          this.reported = "IDLE";
-          this.report("left-out");
-          this.say(() => this.d.leftOut());
-          return;
-        }
+        if (!way) return this.leftOutOfCommit();
       }
       // A refusal of this member's own commit ends its vote, which nothing
       // else would, since its new way in is gone.
@@ -621,11 +648,10 @@ export class EvictCoordinator {
         return refuse("commit-keys");
       }
       if (!(await this.configMatches(clear.config, keys.contentKey))) return refuse("commit-config");
-      // The request named the target's key; a member that never saw it finds
-      // the roster entry whose key has the commit's digest, which is there
-      // until the target's PEER_LEAVE arrives.
-      const named = this.machine.requestFor(clear.requestId)?.request.targetKey ?? null;
-      const targetKey = !clear.targetKeyDigest ? null : named ? named.slice() : await this.keyWithDigest(clear.targetKeyDigest);
+      // The request named the target's key, and the commit's digest was
+      // checked against it.
+      const named = placed.request.targetKey;
+      const targetKey = clear.targetKeyDigest && named ? named.slice() : null;
       // The last look before the keyring changes: nothing below awaits except
       // the re-root itself, which checks the epoch again.
       const meLast = this.d.me();
@@ -639,8 +665,7 @@ export class EvictCoordinator {
       this.dropPending();
       this.dropLate();
       this.early.clear();
-      this.machine.finish();
-      this.report();
+      this.endVoteFor(clear.requestId);
       this.d.applyReRoot({ root: tail.root, way, keys, target: clear.target, targetKey });
       handed = true;
     } finally {
@@ -651,12 +676,28 @@ export class EvictCoordinator {
     }
   }
 
-  /// The signing key of a member whose key has this digest, if one is listed.
-  private async keyWithDigest(digest: Uint8Array): Promise<Uint8Array | null> {
-    for (const m of this.d.members()) {
-      if (m.pubkey && eq(await keyDigest(m.pubkey), digest)) return m.pubkey.slice();
+  /// A commit moved the room's epoch. The vote it was for is done; any other
+  /// vote still open here ends as one whose epoch moved, since it named the
+  /// epoch the room has left.
+  private endVoteFor(requestId: Uint8Array): void {
+    const cur = this.machine.current();
+    if (cur && eq(cur.request.id, requestId)) {
+      this.machine.finish();
+      this.report();
+    } else if (this.machine.isOpen()) {
+      this.machine.fail();
+      this.report("epoch-moved");
     }
-    return null;
+  }
+
+  /// The room's way in changed and this member holds no wrap it can use:
+  /// whatever vote it had open is over, and it needs the new way in from
+  /// someone who was there.
+  private leftOutOfCommit(): void {
+    this.machine.fail();
+    this.reported = "IDLE";
+    this.report("left-out");
+    this.say(() => this.d.leftOut());
   }
 
   private async unwrap(header: Uint8Array, dec: DecodedCommit, from: MemberView, me: Uint8Array): Promise<WayIn | null> {

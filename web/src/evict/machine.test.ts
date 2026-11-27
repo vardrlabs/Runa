@@ -614,7 +614,7 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
     expect(await m.commitSatisfies({ ...(await requestStatement(r1)), votes })).toBe(true);
   });
 
-  it("refuses a commit for a request it received but could not open", async () => {
+  it("does not place a request it received but could not open, and checks its commit as one it never saw", async () => {
     const room = await makeRoom(4);
     const [a, b, c, t] = room.people;
     const m = machineFor(room, b);
@@ -626,7 +626,12 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
       { voter: c.id, sig: theirs.sig },
       { voter: a.id, sig: await sign(a, theirs) },
     ];
-    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes })).toBe(false);
+    // The checks a member that never saw it makes pass, and nothing places it,
+    // so the coordinator never applies it.
+    expect(m.wasSeen(theirs.id)).toBe(true);
+    expect(m.requestFor(theirs.id)).toBeNull();
+    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes })).toBe(true);
+    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes: votes.slice(0, 1) })).toBe(false);
   });
 
   it("never opens the same request id twice in one epoch, and forgets the ids when the epoch moves", async () => {
@@ -641,27 +646,84 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
     room.epoch.value = 1;
     expect(await m.onRequest(await requestBy(room, a, t, { epoch: 1 }), a.id)).toBeNull();
   });
+});
 
-  it("keeps a bounded record, and once it has let go of one refuses every commit it cannot place", async () => {
+describe("the record of seen requests is best effort (fix wave 2, F2)", () => {
+  const idOf = (i: number, tag: number): Uint8Array => {
+    const id = new Uint8Array(16).fill(tag);
+    new DataView(id.buffer).setUint32(0, i + 1);
+    return id;
+  };
+  /// A well-formed request with a signature nobody made, as a hostile member
+  /// can send as many of as it likes.
+  const junk = async (room: Room, from: Person, i: number): Promise<EvictRequest> =>
+    ({ ...(await requestBy(room, from, null, { id: idOf(i, 0xee) })), sig: new Uint8Array(64).fill(5) });
+
+  it("never lets go of the proposal open now, however many requests arrive", async () => {
     const room = await makeRoom(4);
     const [a, b, c, t] = room.people;
     const m = machineFor(room, b);
-    // A request b never saw, signed by everyone but b: the never-saw path takes it.
+    const r1 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x51) });
+    expect(await m.onRequest(r1, a.id)).toBeNull();
+    for (let i = 0; i < MAX_SEEN_REQUESTS * 3; i++) expect(await m.onRequest(await junk(room, i % 2 ? t : c, i), t.id)).toBe("busy");
+    expect(m.requestFor(r1.id)?.request).toBe(r1);
+    m.recordOwn(await sign(b, r1));
+    const votes = [
+      { voter: a.id, sig: r1.sig },
+      { voter: b.id, sig: await sign(b, r1) },
+      { voter: c.id, sig: await sign(c, r1) },
+    ];
+    expect(await m.commitSatisfies({ ...(await requestStatement(r1)), votes })).toBe(true);
+  });
+
+  it("lets refused ids go before settled proposals, oldest first, and stays bounded", async () => {
+    const room = await makeRoom(4);
+    const [a, b, , t] = room.people;
+    const m = machineFor(room, b);
+    const s1 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x61) });
+    const s2 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x62) });
+    for (const s of [s1, s2]) {
+      expect(await m.onRequest(s, a.id)).toBeNull();
+      m.rejectOwn();
+    }
+    const n = MAX_SEEN_REQUESTS * 2;
+    // Signed by nobody, so refused, and recorded as refused.
+    for (let i = 0; i < n; i++) await m.onRequest(await junk(room, t, i), t.id);
+    expect(m.requestFor(s1.id)?.request).toBe(s1);
+    expect(m.requestFor(s2.id)?.request).toBe(s2);
+    expect(m.wasSeen(idOf(0, 0xee))).toBe(false);
+    expect(m.wasSeen(idOf(n - 1, 0xee))).toBe(true);
+    // Settled proposals go once no refused id is left, the oldest first, and
+    // never the one this member holds now.
+    for (let i = 0; i < MAX_SEEN_REQUESTS; i++) {
+      expect(await m.onRequest(await requestBy(room, a, t, { id: idOf(i, 0x70) }), a.id)).toBeNull();
+      m.rejectOwn();
+    }
+    expect(m.requestFor(s1.id)).toBeNull();
+    expect(m.wasSeen(idOf(n - 1, 0xee))).toBe(false);
+    expect(m.requestFor(idOf(MAX_SEEN_REQUESTS - 1, 0x70))).not.toBeNull();
+    let held = 0;
+    for (const id of [s1.id, s2.id, ...Array.from({ length: MAX_SEEN_REQUESTS }, (_, i) => idOf(i, 0x70))]) if (m.wasSeen(id)) held += 1;
+    expect(held).toBe(MAX_SEEN_REQUESTS);
+  });
+
+  it("checks a commit for an id it let go of as one it never saw, and never refuses it for overflowing", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const m = machineFor(room, b);
     const unseen = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0xfe) });
     const votes = [
       { voter: a.id, sig: unseen.sig },
       { voter: c.id, sig: await sign(c, unseen) },
     ];
     const st = await requestStatement(unseen);
-    expect(await m.commitSatisfies({ ...st, votes })).toBe(true);
-    for (let i = 0; i <= MAX_SEEN_REQUESTS; i++) {
-      const id = new Uint8Array(16);
-      new DataView(id.buffer).setUint32(0, i + 1);
-      const r = await requestBy(room, a, t, { id });
-      expect(await m.onRequest(r, a.id)).toBeNull();
+    for (let i = 0; i <= MAX_SEEN_REQUESTS * 2; i++) {
+      expect(await m.onRequest(await requestBy(room, a, t, { id: idOf(i, 0x80) }), a.id)).toBeNull();
       m.rejectOwn();
     }
-    expect(await m.commitSatisfies({ ...st, votes })).toBe(false);
+    expect(m.wasSeen(unseen.id)).toBe(false);
+    expect(m.requestFor(unseen.id)).toBeNull();
+    expect(await m.commitSatisfies({ ...st, votes })).toBe(true);
   });
 });
 
