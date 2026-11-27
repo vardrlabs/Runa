@@ -116,8 +116,8 @@ pub fn ttl_kind_name(kind: TtlKind) -> &'static str {
 /// A ticket for `room` as it stands. None for a room with no verifier, which
 /// nothing the server creates today lacks, and which could not be rejoined.
 pub fn issue(key: &RestartKey, room: &Room, now: u64) -> Option<String> {
-    let view = room.access_view();
-    let verifier = view.verifier.as_ref()?;
+    let (view, verifier) = room.ticket_access();
+    let verifier = verifier.as_ref()?;
     let body = Ticket {
         v: 1,
         id: hex::encode(room.id),

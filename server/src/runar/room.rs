@@ -310,7 +310,8 @@ struct Epochs {
     /// recent request. Kept per sender, so a request from someone else (the
     /// target, say) cannot move the cohort of a vote already open. Under this
     /// lock because `commit_eviction` reads it beside the epoch, and lock
-    /// order stays `epochs`, then `peers`.
+    /// order stays `epochs`, then `peers`. Only connected senders are kept
+    /// (`note_evict_request_at`).
     evict_opened: std::collections::HashMap<[u8; 16], (Instant, u64)>,
 }
 
@@ -318,8 +319,10 @@ struct Epochs {
 /// vote a client accepts (one hour), and a minute for the commit to follow.
 const EVICT_REQUEST_WINDOW: Duration = Duration::from_secs(3_660);
 
-/// At most this many senders' requests are remembered; the oldest goes first.
-/// Peer ids are per connection, so without a cap reconnects could grow it.
+/// The least number of senders' requests remembered. The real bound is the
+/// larger of this and the room's `max_peers`: only connected senders are
+/// kept, so a room never holds more than that and the cap never has to drop
+/// one of theirs.
 const MAX_EVICT_REQUESTS: usize = 64;
 
 impl Epochs {
@@ -327,19 +330,17 @@ impl Epochs {
         AccessView {
             epoch: self.state.epoch(),
             root_epoch: self.state.root_epoch(),
-            verifier: self.access.verifier.as_ref().map(|v| zeroize::Zeroizing::new(*v.expose_secret())),
             salt: self.access.salt,
             config_blob: self.access.config_blob.clone(),
         }
     }
 }
 
-/// One consistent reading of a room's way in, for JOIN_ACK and restart
-/// tickets. The verifier copy is zeroed when dropped.
+/// One consistent reading of a room's way in, for JOIN_ACK. It holds no
+/// verifier: a restart ticket reads that with `ticket_access`.
 pub struct AccessView {
     pub epoch: u32,
     pub root_epoch: u32,
-    pub verifier: Option<zeroize::Zeroizing<[u8; 32]>>,
     pub salt: [u8; 16],
     pub config_blob: Option<Bytes>,
 }
@@ -543,6 +544,14 @@ impl Room {
         self.epochs.lock().unwrap().view()
     }
 
+    /// The room's way in with its verifier, read under one lock, for a
+    /// restart ticket. The verifier copy is zeroed when dropped.
+    pub fn ticket_access(&self) -> (AccessView, Option<zeroize::Zeroizing<[u8; 32]>>) {
+        let epochs = self.epochs.lock().unwrap();
+        let verifier = epochs.access.verifier.as_ref().map(|v| zeroize::Zeroizing::new(*v.expose_secret()));
+        (epochs.view(), verifier)
+    }
+
     /// An EVICT_REQUEST from `sender` is being relayed (amendment K). Remember
     /// who could have seen it: everyone who joined before now.
     pub fn note_evict_request(&self, sender: [u8; 16]) {
@@ -554,9 +563,24 @@ impl Room {
         // peer is either counted here or joined after.
         let mut epochs = self.epochs.lock().unwrap();
         let seq = self.next_seq.load(Ordering::SeqCst);
+        // A commit counts only a request from its sender's own connection,
+        // and that connection is in the list until it closes, so a record of
+        // a sender who has gone can never be used again. Dropping those first
+        // keeps one sender's records from pushing out another's: the target
+        // holds the old link until the commit and could otherwise reconnect
+        // and ask until an honest request fell off the end. Lock order is
+        // `epochs`, then `peers`.
+        let connected: std::collections::HashSet<[u8; 16]> =
+            self.peers.lock().unwrap().iter().map(|p| p.peer_id).collect();
+        if !connected.contains(&sender) {
+            return;
+        }
+        let cap = MAX_EVICT_REQUESTS.max(self.max_peers);
         let opened = &mut epochs.evict_opened;
-        opened.retain(|_, (at, _)| now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW);
-        if !opened.contains_key(&sender) && opened.len() >= MAX_EVICT_REQUESTS {
+        opened.retain(|id, (at, _)| {
+            connected.contains(id) && now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW
+        });
+        if !opened.contains_key(&sender) && opened.len() >= cap {
             if let Some(oldest) = opened.iter().min_by_key(|(_, (at, _))| *at).map(|(k, _)| *k) {
                 opened.remove(&oldest);
             }
@@ -821,9 +845,14 @@ impl Room {
             let outbound = envelop(frame, sender);
             for p in peers.iter() {
                 if r.target.is_some_and(|t| t.covers(&p.peer_id, p.pubkey.as_deref())) {
-                    if p.tx.send_final_error(evicted_error.clone(), WireCode::Evicted).is_err() {
-                        dead.push(p.peer_id);
-                    }
+                    // Out of the room's list as soon as both locks drop, sent
+                    // or not: a connection waiting on its writer to drain must
+                    // not stay in the roster, count toward `max_peers`, sit in
+                    // a purge cohort or hold the next vote's floor down.
+                    // Dropping the room's `PeerTx` leaves the error queued, and
+                    // the writer still sends it and closes with 4014.
+                    let _ = p.tx.send_final_error(evicted_error.clone(), WireCode::Evicted);
+                    dead.push(p.peer_id);
                     continue;
                 }
                 if p.kx.is_none() && p.tx.send_final_error(kx_less_error.clone(), WireCode::ProtocolError).is_err() {
@@ -1983,6 +2012,10 @@ mod evict_tests {
     const ERR_KX_LESS: &[u8] = b"KX-LESS";
 
     fn room() -> Room {
+        room_for(32)
+    }
+
+    fn room_for(max_peers: usize) -> Room {
         Room::new(
             [5u8; 16],
             RoomClass::Unlisted,
@@ -1997,7 +2030,7 @@ mod evict_tests {
             Some(Bytes::from_static(b"old-config")),
             32 * 1024 * 1024,
             5,
-            32,
+            max_peers,
         )
     }
 
@@ -2313,5 +2346,105 @@ mod evict_tests {
         assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
         assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
         assert!(a.rx.try_recv().is_err(), "nothing of the refused commit is relayed");
+    }
+
+    #[tokio::test]
+    async fn a_commit_takes_every_connection_of_the_target_out_of_the_room_at_once() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let mut t0 = member(&r, 3, true);
+        let mut t = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        // Nothing has read its queue yet, and the target's two connections
+        // are already out of the room's list.
+        assert_eq!(r.peer_count(), 2);
+        let left: std::collections::HashSet<[u8; 16]> = r.roster().iter().map(|p| p.peer_id).collect();
+        assert_eq!(left, [a.id, b.id].into_iter().collect());
+        // The room has let go of their queues. Each still holds its error,
+        // and ends after it, which is what lets the connection close.
+        for m in [&mut t0, &mut t] {
+            let got = tokio::time::timeout(Duration::from_secs(5), m.rx.recv()).await.expect("the error arrives");
+            assert_eq!(&got.unwrap()[..], ERR_EVICTED);
+            assert_eq!(m.flag.get(), Some(WireCode::Evicted));
+            let end = tokio::time::timeout(Duration::from_secs(5), m.rx.recv()).await.expect("the queue ends");
+            assert!(end.is_none(), "the room still holds a sender for an evicted connection");
+        }
+        assert_eq!(a.rx.recv().await.unwrap().len(), 56);
+        // The connection's own removal later finds nothing to remove.
+        assert!(!r.remove_peer(&t.id));
+    }
+
+    #[test]
+    fn a_second_eviction_right_after_the_first_is_not_held_down_by_the_first_target() {
+        // A, B and T. T is removed, and before its connection has read its
+        // error A asks to remove B. Counted, T would make A's one signature
+        // half of two.
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let frame = Bytes::from(vec![0u8; 40]);
+        r.note_evict_request(a.id);
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        r.note_evict_request(a.id);
+        assert_eq!(commit(&r, &reroot(1, target(b.id, 2), &[(&a, 1)]), &frame, a.id), Ok(2));
+        assert_eq!(r.peer_count(), 1);
+        drop(t);
+    }
+
+    #[test]
+    fn a_target_that_keeps_reconnecting_cannot_flush_an_honest_request() {
+        // The target holds the old link until the commit, so it can open a
+        // connection, send an EVICT_REQUEST and leave, again and again.
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let start = Instant::now();
+        r.note_evict_request_at(a.id, start);
+        let rounds = MAX_EVICT_REQUESTS as u64 * 2;
+        for i in 1..=rounds {
+            let again = member(&r, 3, true);
+            r.note_evict_request_at(again.id, start + Duration::from_millis(i));
+            assert!(r.remove_peer(&again.id));
+        }
+        {
+            let epochs = r.epochs.lock().unwrap();
+            assert!(epochs.evict_opened.contains_key(&a.id), "the honest request was dropped");
+            // Only a and the last of the target's connections are remembered:
+            // records of senders who have gone are dropped first.
+            assert!(epochs.evict_opened.len() <= 2, "{} records kept", epochs.evict_opened.len());
+        }
+        let frame = Bytes::from(vec![0u8; 40]);
+        let rr = reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]);
+        assert_eq!(r.commit_eviction(&rr, start + Duration::from_secs(1), &frame, a.id, &frame, &frame), Ok(1));
+    }
+
+    #[test]
+    fn a_request_from_someone_not_connected_is_not_recorded() {
+        let r = room();
+        let a = member(&r, 1, true);
+        r.note_evict_request([0xEE; 16]);
+        r.note_evict_request(a.id);
+        let epochs = r.epochs.lock().unwrap();
+        assert!(!epochs.evict_opened.contains_key(&[0xEE; 16]));
+        assert!(epochs.evict_opened.contains_key(&a.id));
+    }
+
+    #[test]
+    fn a_room_larger_than_the_cap_keeps_every_connected_senders_request() {
+        let n = MAX_EVICT_REQUESTS + 16;
+        let r = room_for(n);
+        let start = Instant::now();
+        let members: Vec<Member> = (0..n).map(|i| member(&r, (i % 250) as u8, true)).collect();
+        for (i, m) in members.iter().enumerate() {
+            r.note_evict_request_at(m.id, start + Duration::from_millis(i as u64));
+        }
+        let epochs = r.epochs.lock().unwrap();
+        assert_eq!(epochs.evict_opened.len(), n);
+        assert!(epochs.evict_opened.contains_key(&members[0].id), "the oldest connected request was dropped");
     }
 }
