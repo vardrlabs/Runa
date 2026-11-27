@@ -331,6 +331,16 @@ export class RunaSocket {
   /// The room removed this member (amendment K). Said once, whether the
   /// ERROR or the close arrives first.
   private removed = false;
+  /// When this socket started sending under the keyring's current root, if
+  /// it got there by a re-root (amendment K). Once the overlap after it has
+  /// passed, a live update under an older root is not read.
+  private rootSince: number | null = null;
+  /// The log's length when this connection joined, from JOIN_ACK: a sync
+  /// response holds entries below it, and nothing relayed live does.
+  private joinLogLen = 0;
+  /// The sync response this connection asked for: the next log index it can
+  /// hold and the index it ends before. Its entries come in index order.
+  private replay: { next: number; end: number } | null = null;
 
   constructor(private opts: SocketOptions) {
     this.maxBackoffMs = opts.maxBackoffMs ?? 15_000;
@@ -366,6 +376,7 @@ export class RunaSocket {
     this.cipher = new FrameCipher(keys.contentKey, this.joined ? this.peerId : this.opts.identity.publicKeyRaw);
     this.epoch = epoch;
     this.switchedAt = performance.now();
+    if (epoch === this.opts.keyring.rootEpoch) this.rootSince = this.switchedAt;
     if (epoch >= this.roomEpoch) {
       this.roomEpoch = epoch;
       this.awaitingKeys = false;
@@ -413,6 +424,23 @@ export class RunaSocket {
     // disconnected.
     if (this.removed) return;
     this.abandonConnection();
+  }
+
+  /// A live DOC_UPDATE under a root the room has left, once the overlap after
+  /// the re-root has passed (amendment K). The person a re-root removed still
+  /// holds the old root's keys, and a server that will not enforce the
+  /// removal could relay what they write. Entries inside a sync response are
+  /// read under whatever key they were written with, as before.
+  private oldRootUpdate(frameEpoch: number, index: number | null): boolean {
+    if (frameEpoch >= this.opts.keyring.rootEpoch || this.rootSince === null) return false;
+    const overlap = this.opts.epochOverlapMs ?? EPOCH_OVERLAP_MS;
+    if (performance.now() - this.rootSince < overlap) return false;
+    const r = this.replay;
+    if (r && index !== null && index >= r.next && index < r.end) {
+      r.next = index + 1;
+      return false;
+    }
+    return true;
   }
 
   private isStale(frameEpoch: number): boolean {
@@ -482,6 +510,7 @@ export class RunaSocket {
   /// they are resent on the next connection.
   private connectionLost(): void {
     this.joined = false;
+    this.replay = null;
     this.generation += 1;
     this.inflight = [];
     this.stopLiveness();
@@ -692,6 +721,8 @@ export class RunaSocket {
       }
       this.joined = true;
       this.restartTicket = null;
+      this.replay = null;
+      this.joinLogLen = typeof ack.log_len === "number" && Number.isSafeInteger(ack.log_len) && ack.log_len >= 0 ? ack.log_len : 0;
       // Ahead of this member: a member must hand it the key. Behind: the
       // server has lost track of the room's rotations, and sending under an
       // older key would hand new writing to whoever left. Either way, hold.
@@ -888,6 +919,7 @@ export class RunaSocket {
           index = Number(i);
           body = body.slice(8);
         }
+        if (this.oldRootUpdate(header.epoch, index)) return;
         let taken: number[];
         try {
           const pt = await decryptEnvelope(key, bytes.slice(0, HEADER_LEN), senderId, body);
@@ -1281,6 +1313,9 @@ export class RunaSocket {
   }
 
   sendSyncRequest(fromIndex: number): void {
+    // Without indexes nothing tells a sync response from a live update; such a
+    // server predates re-roots.
+    if (this.indexed) this.replay = { next: Math.max(0, fromIndex), end: this.joinLogLen };
     this.rawSend(
       buildJsonFrame(FT.DOC_SYNC_REQ, this.opts.roomId, this.epoch, { from_index: fromIndex }),
     );

@@ -1015,3 +1015,61 @@ describe("eviction and re-roots (amendment K)", () => {
     expect(body.auth_key).toBe(toB64(new Uint8Array(32).fill(2)));
   });
 });
+
+describe("updates under the root a re-root left (amendment K)", () => {
+  async function reRooted(overlapMs: number, onDocUpdate: (s: Uint8Array, pt: Uint8Array) => void, ack: Record<string, unknown> = {}) {
+    const { socket, key, keyring } = await makeSocket({ epochOverlapMs: overlapMs, events: { onDocUpdate } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck(ack));
+    await sleep(0);
+    const content = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x51), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    const chain = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x52), "HKDF", false, ["deriveBits", "deriveKey"]);
+    expect(await keyring.reroot(1, content, chain)).not.toBeNull();
+    socket.adoptEpoch(1);
+    return { socket, ws, oldKey: key, newKey: content };
+  }
+
+  /// A frame as relayed to a connection that asked for indexes.
+  async function incomingIndexed(epoch: number, key: CryptoKey, plaintext: Uint8Array, index: number): Promise<Uint8Array> {
+    const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.DOC_UPDATE, roomId: ROOM, epoch, nonceSess: new Uint8Array(4), flags: 0 });
+    const env = await new FrameCipher(key, OTHER).encrypt(header, plaintext);
+    const i = new Uint8Array(8);
+    new DataView(i.buffer).setBigUint64(0, BigInt(index), false);
+    return concatBytes(header, OTHER, i, env);
+  }
+
+  it("still reads a live update under the old root inside the overlap", async () => {
+    const got: Uint8Array[] = [];
+    const { ws, oldKey } = await reRooted(60_000, (_s, pt) => got.push(pt));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 0, oldKey, text("written just before")));
+    await waitFor(() => got.length === 1);
+    expect(got[0]).toEqual(text("written just before"));
+  });
+
+  it("drops a live update under the old root once the overlap has passed, and still reads the new root", async () => {
+    const got: Uint8Array[] = [];
+    const { ws, oldKey, newKey } = await reRooted(0, (_s, pt) => got.push(pt));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 0, oldKey, text("from the removed person")));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 1, newKey, text("under the new root")));
+    await waitFor(() => got.length === 1);
+    // Given time to arrive, the old-root update is still not read.
+    await sleep(30);
+    expect(got).toEqual([text("under the new root")]);
+  });
+
+  it("still reads old-root entries inside a sync response after the overlap, and only those", async () => {
+    const got: Uint8Array[] = [];
+    const { socket, ws, oldKey } = await reRooted(0, (_s, pt) => got.push(pt), { indexed: true, log_len: 3 });
+    socket.sendSyncRequest(0);
+    for (let i = 0; i < 3; i++) ws.deliver(await incomingIndexed(0, oldKey, text(`entry ${i}`), i));
+    await waitFor(() => got.length === 3);
+    expect(got).toEqual([text("entry 0"), text("entry 1"), text("entry 2")]);
+    // Past what the log held when this connection joined, or an index the
+    // response has already passed: not part of the sync response.
+    ws.deliver(await incomingIndexed(0, oldKey, text("live, index 3"), 3));
+    ws.deliver(await incomingIndexed(0, oldKey, text("again, index 1"), 1));
+    await sleep(30);
+    expect(got).toHaveLength(3);
+  });
+});
