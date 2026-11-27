@@ -81,6 +81,15 @@ export function applySecurityLevel(
   }
 }
 
+/// The room's link changed (amendment K): the old key opens nothing now.
+/// The new one replaces it in memory, and in an everyday room in the tab's
+/// saved state too, so a refresh comes back in with it. A highest-security
+/// room keeps it in memory only, and drops any key the tab had saved.
+export function replaceRoomKey(roomIdHex: string, fragment: string, level: SecurityLevel): void {
+  current = { roomIdHex, fragment };
+  applySecurityLevel(roomIdHex, fragment, level);
+}
+
 /// The full shareable link, built from the key in memory rather than read
 /// from an address bar that no longer holds it.
 export function shareLink(roomIdHex: string, fragment: string): string {

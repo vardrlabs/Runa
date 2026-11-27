@@ -221,6 +221,7 @@ function JoinableRoom(props: RoomProps) {
           authKey,
           contentKey,
           chainKey,
+          wayKind: args.passMaterial ? "pass" : "link",
           insecureAllowed: plainWebSocketAllowed(window.location),
           restoreRoom: (ticket) => api.restoreRoom(ticket),
         },

@@ -96,6 +96,41 @@ describe("where an unlisted room's key goes", () => {
     const { shareLink } = await load();
     expect(shareLink(ID, KEY)).toBe(`${location.origin}/r/${ID}${KEY}`);
   });
+
+  it("keeps the new key after the room's link changes, in an everyday room", async () => {
+    const NEW = "#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&s=BBBBBBBBBBBBBBBBBBBBBB";
+    const first = await load();
+    first.openUnlistedRoom(ID, KEY);
+    first.applySecurityLevel(ID, KEY, "everyday");
+    first.replaceRoomKey(ID, NEW, "everyday");
+    expect(first.takeRoomKey(ID)).toBe(NEW);
+    expect(JSON.stringify(history.state)).not.toContain(KEY);
+    expect(location.href).not.toContain("#k=");
+    const second = await load();
+    expect(second.takeRoomKey(ID)).toBe(NEW);
+  });
+
+  it("keeps the new key in memory only, in a highest-security room", async () => {
+    const NEW = "#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&s=BBBBBBBBBBBBBBBBBBBBBB";
+    const first = await load();
+    first.openUnlistedRoom(ID, KEY);
+    first.replaceRoomKey(ID, NEW, "highest");
+    expect(first.takeRoomKey(ID)).toBe(NEW);
+    expect(history.state).toBeNull();
+    const second = await load();
+    expect(second.takeRoomKey(ID)).toBeUndefined();
+  });
+
+  it("drops the old key a highest-security room's tab had saved, when the link changes", async () => {
+    const NEW = "#k=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&s=BBBBBBBBBBBBBBBBBBBBBB";
+    const first = await load();
+    first.openUnlistedRoom(ID, KEY);
+    first.applySecurityLevel(ID, KEY, "everyday");
+    first.replaceRoomKey(ID, NEW, "highest");
+    expect(history.state).toBeNull();
+    const second = await load();
+    expect(second.takeRoomKey(ID)).toBeUndefined();
+  });
 });
 
 describe("which level a member applies", () => {
