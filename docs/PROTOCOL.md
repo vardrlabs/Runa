@@ -511,19 +511,22 @@ does not stop it: the room still moves to the new way in, and a connection the
 target opens again is never given it.
 
 Several requests can be open at once. A member holds at most one open request
-from each sender and at most eight in all, its own included, and refuses a
-request past either bound as busy. It may make a request while other members'
-requests are open, as long as none of its own is, and it may vote on others'
-requests while its own is open. Each request is its own vote, with its own
+from each signing key and at most eight in all, its own included, and refuses a
+request past either bound as busy. The bound is by signing key, not by
+connection: several connections under one key share one place, whichever of
+them sent the request. It may make a request while other members' requests are
+open, as long as no request from its own signing key is, and it may vote on
+others' requests while its own is open. Each request is its own vote, with its own
 frozen roster, deadline, approvals and wait for the commit, and everything above
 holds for each of them; a vote, a cancel and a commit are matched to their
 request by its id. A commit moves the root, so it ends every other open request
 the way a re-root ends a vote, and a proposer wipes the new way in it kept for a
 request that ended. A member that approved two requests applies whichever commit
 the server relays first; the other then names a root the room has left and is
-refused. So a target that keeps a request of its own open, or opens and cancels
-requests in a loop, takes one place at each member and cannot stop anyone else's
-request; it can only make prompts come and go. The target can still block its
+refused. So a target that keeps a request of its own open, from one connection
+or from several under its signing key, or opens and cancels requests in a loop,
+takes one place at each member and cannot stop anyone else's request; it can
+only make prompts come and go. The target can still block its
 own removal another way: a connection it opened under another signing key before
 the request is a member whose approval is needed like any other, so it can
 refuse or leave, and eight such identities can fill every place a member holds.
@@ -764,8 +767,9 @@ stops its connection and does not reconnect, as a removed one does, keeps its
 document on screen read-only, and refuses to propose; a restart carry-over
 does not bring it back. A member's record of the requests it saw is bounded:
 it lets go of requests it did not open before settled ones, the oldest first,
-never of the vote open now, and of all of them when the root moves. A step
-leaves that record and the open vote as they are.
+never of a request whose vote is open, nor of the proposer's own commit kept
+for a late echo, and of all of them when the root moves. A step leaves that
+record and the open votes as they are.
 
 *The removed member.* Its client stops reconnecting on 4014 and says it was
 removed. Every connection still open under its signing key gets 4014, the

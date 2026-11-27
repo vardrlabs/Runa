@@ -177,8 +177,10 @@ What that buys is narrow, so here it is exactly:
   back without a gap for as long as they keep asking. A request is withdrawn
   only when the person who asked cancels it, so a vote that is refused, runs
   out or fails holds key changes for the whole 150 seconds. If someone leaves
-  during a hold, the key changes within about 15 seconds of the hold ending,
-  so a member can let a person who left read on for that long. Any member
+  during a hold, the key changes within about 15 seconds of the hold ending
+  and of the last open request ending, since the people in the room also hold
+  their own key changes while any request is open, so a member can let a
+  person who left read on for that long. Any member
   could already pass them the new key itself.
 - **A tab opened before key rotation existed is kept out once the key has
   changed.** It cannot be handed a new key, so the server refuses it with a
@@ -291,12 +293,15 @@ What that buys, exactly:
   before the server has noted it.
 
   Their own requests don't let them block it. A member holds several requests
-  open at once, at most one from each person and eight in all, so a request of
-  theirs takes one place and anyone else can still ask to remove them. If they
-  keep a request of their own open, or open and cancel requests in a loop, what
-  they get is prompts that appear and disappear for everyone else, and key
-  changes held back within the limits above. The room can see it happening,
-  because the same person keeps asking.
+  open at once, at most one from each signing key and eight in all, so their
+  requests take one place however many tabs they open under their key, and
+  anyone else can still ask to remove them. Someone whose own request is open
+  can still answer everyone else's. If they keep a request of their own open,
+  or open and cancel requests in a loop, what they get is prompts that appear
+  and disappear for everyone else, and key changes held back for as long as
+  they keep a request open, because the people in the room hold their own key
+  changes while any request is open, whatever the server's limits. The room
+  can see it happening, because the same person keeps asking.
 
   A member who is determined to stay can still block their own removal, and it
   doesn't depend on timing. They can join under a second identity before anyone
