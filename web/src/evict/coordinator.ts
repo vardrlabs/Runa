@@ -44,6 +44,10 @@ import { bytesEqual as eq, hexOf, keyDigest, rosterDigest, voteStatement } from 
 /// of the request ids seen under the root, so a request id is opened once by
 /// this member, whichever vote it would have been. This member has at most
 /// one request of its own open, so it holds at most one new way in.
+///
+/// Open requests are bounded by signing key, not by connection: one person's
+/// tabs each have a peer id of their own, but they share one key, so they
+/// share one place.
 
 export const DEFAULT_DEADLINE_MS = 60_000;
 /// How long a proposer waits for its commit to come back from the server,
@@ -62,9 +66,10 @@ export const EARLY_HOLD_MS = 5_000;
 /// frames held for one id at a time, so no sender can fill the buffer alone.
 export const MAX_EARLY_IDS = 8;
 /// How many removal requests a member holds open at once, its own included.
-/// Each sender has at most one open here, and a request past either bound is
-/// refused as "busy". So nobody can keep everyone else from asking by keeping
-/// a request of their own open: theirs takes one place, not all of them.
+/// Each signing key has at most one open here, whichever of its connections
+/// sent it, and a request past either bound is refused as "busy". So nobody
+/// can keep everyone else from asking by keeping requests of their own open,
+/// from one tab or from many: theirs take one place, not all of them.
 export const MAX_OPEN_REQUESTS = 8;
 
 export interface SealedConfig {
@@ -143,12 +148,16 @@ interface Pending {
 
 /// One open vote: its machine, the last state handed to `deps.state` for it,
 /// so a state the machine reached on its own (a vote that ran past its
-/// deadline, say) is reported once, and whether it is this member's request.
+/// deadline, say) is reported once, whether it is this member's request, and
+/// the signing key its proposer holds in the roster this member froze (this
+/// member's own key for its own request). A request still being checked
+/// holds the key the roster showed for its sender when it arrived.
 interface Vote {
   id: Uint8Array;
   machine: EvictMachine;
   reported: EvictState;
   mine: boolean;
+  key: Uint8Array | null;
 }
 
 /// Frames for one request id that came before the request did.
@@ -252,17 +261,19 @@ export class EvictCoordinator {
     return null;
   }
 
-  /// Whether a request from `sender` (this member, when it asks itself) is
-  /// over the bounds: that sender already has one open here, or as many are
-  /// open as a member holds. A request whose checks are still running counts.
-  private overBounds(sender: Uint8Array): boolean {
+  /// Whether a request from a sender holding `key` (this member's own key,
+  /// when it asks itself) is over the bounds: a request from that key is
+  /// already open here, from whichever connection, or as many are open as a
+  /// member holds. A request whose checks are still running counts. A sender
+  /// the roster shows no key for is held to the second bound only; its
+  /// request is refused as an unknown proposer anyway.
+  private overBounds(key: Uint8Array | null): boolean {
     let n = 0;
     for (const v of this.votes.values()) {
       const m = v.machine;
       if (!m.isOpen() && m.state !== "IDLE") continue;
       n += 1;
-      const p = m.current();
-      if (p && eq(p.proposer, sender)) return true;
+      if (key && v.key && eq(v.key, key)) return true;
     }
     return n >= MAX_OPEN_REQUESTS;
   }
@@ -420,7 +431,8 @@ export class EvictCoordinator {
       if (!me) return "not-joined";
       // One request of its own at a time, and none past the bound on open
       // requests; other members' open requests do not stop it asking.
-      if (this.pending !== null || this.overBounds(me)) return "busy";
+      const myKey = this.d.identity.publicKeyRaw;
+      if (this.pending !== null || this.overBounds(myKey)) return "busy";
       if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > MAX_DEADLINE_MS) return "failed";
       // The votes name the root, so a key step during the vote changes nothing.
       const root = this.d.keyring.rootEpoch;
@@ -458,13 +470,13 @@ export class EvictCoordinator {
       // Checked again after the last await: nothing above may have moved.
       const meNow = this.d.me();
       if (this.dead || !meNow || !eq(meNow, me)) return "failed";
-      if (this.pending !== null || this.overBounds(me) || this.d.keyring.rootEpoch !== root) return "busy";
+      if (this.pending !== null || this.overBounds(myKey) || this.d.keyring.rootEpoch !== root) return "busy";
       // Someone joined or left meanwhile: every member would refuse the
       // request's roster digest, so it is not sent.
       if (!eq(canonicalRosterBytes(this.d.members()), canonicalRosterBytes(members))) return "roster-changed";
       const machine = this.newMachine();
       machine.start(req, me, members, targetKeyDigest);
-      const v: Vote = { id: id.slice(), machine, reported: "IDLE", mine: true };
+      const v: Vote = { id: id.slice(), machine, reported: "IDLE", mine: true, key: myKey.slice() };
       this.votes.set(hexOf(id), v);
       this.lastId = id.slice();
       this.pending = { requestId: id, root, way, keys, config, sentAt: null, sentEpoch: null, sends: 0 };
@@ -568,14 +580,16 @@ export class EvictCoordinator {
       // Another copy of a request this member already holds, open or settled,
       // asks nothing new.
       if (this.seen.has(req.id)) return;
-      // One open request per sender, and a bound on all of them. Received,
-      // so never judged later as a request this member did not see.
-      if (this.overBounds(sender)) {
+      // One open request per signing key, whichever connection sent it, and
+      // a bound on all of them. Received, so never judged later as a request
+      // this member did not see.
+      const senderKey = this.d.members().find((m) => eq(m.peerId, sender))?.pubkey?.slice() ?? null;
+      if (this.overBounds(senderKey)) {
         this.seen.mark(req.id, null);
         return this.refused("busy");
       }
       const key = hexOf(req.id);
-      const v: Vote = { id: req.id.slice(), machine: this.newMachine(), reported: "IDLE", mine: false };
+      const v: Vote = { id: req.id.slice(), machine: this.newMachine(), reported: "IDLE", mine: false, key: senderKey };
       // It holds its place while its checks await, so the bounds above still
       // hold when it opens.
       this.votes.set(key, v);
@@ -586,6 +600,9 @@ export class EvictCoordinator {
         if (guard !== null && this.votes.get(key) === v) this.votes.delete(key);
       }
       if (guard) return this.refused(guard);
+      // From here the key is the one the frozen roster lists for the proposer.
+      const frozen = v.machine.current()?.policySet.find((r) => eq(r.peerId, sender))?.pubkey;
+      if (frozen) v.key = frozen.slice();
       this.lastId = req.id.slice();
       // Votes and a cancel that overtook the request count now, before
       // anyone is asked: a cancelled or refused request asks nobody.

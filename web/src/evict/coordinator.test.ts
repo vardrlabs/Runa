@@ -2122,3 +2122,135 @@ describe("several removal votes open at once (third final wave, V1)", () => {
     for (const p of [a, b, c, d]) expect(p.keyring.rootEpoch).toBe(1);
   });
 });
+
+describe("one open request from each signing key (fourth final wave, I1)", () => {
+  /// Another tab of the same person: its own connection and peer id, under
+  /// the signing key `of` holds.
+  const twin = async (hub: Hub, of: Peer): Promise<Peer> => {
+    const seq = nextSeq++;
+    const { content, chain } = await rootKeys();
+    const p = new Peer(hub, new Uint8Array(16).fill(seq), seq, of.identity, await generateKx(), await Keyring.fromRoot(0, content, chain));
+    p.keyHex = of.keyHex;
+    hub.peers.push(p);
+    return p;
+  };
+  const openVotes = (p: Peer): number => (p.ev as unknown as { votes: Map<string, unknown> }).votes.size;
+
+  it("refuses a second request from another connection under the same key as busy", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , x] = peers;
+    const x2 = await twin(hub, x);
+    const held = holdFrames(hub);
+    expect(await x.ev.propose(null, newLinkWayIn())).toBeNull();
+    expect(await x2.ev.propose(null, newLinkWayIn())).toBeNull();
+    for (const f of held.splice(0)) if (f.from !== a) await a.ev.receiveFrame(f.ft, f.from.id, f.pt);
+    expect(a.prompts).toHaveLength(1);
+    expect(a.refusals).toEqual(["busy"]);
+    expect(openVotes(a)).toBe(1);
+  });
+
+  it("eight tabs under one key hold one place, and another member's request still opens", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, x] = peers;
+    const tabs = [x];
+    for (let i = 0; i < 7; i++) tabs.push(await twin(hub, x));
+    const held = holdFrames(hub);
+    for (const tab of tabs) expect(await tab.ev.propose(null, newLinkWayIn())).toBeNull();
+    for (const f of held.splice(0)) await a.ev.receiveFrame(f.ft, f.from.id, f.pt);
+    expect(openVotes(a)).toBe(1);
+    expect(a.refusals).toEqual(Array(7).fill("busy"));
+    // Seven places are still free: b's request opens, and a can ask too.
+    expect(await b.ev.propose(null, newLinkWayIn())).toBeNull();
+    for (const f of held.splice(0)) if (f.from === b) await a.ev.receiveFrame(f.ft, f.from.id, f.pt);
+    expect(openVotes(a)).toBe(2);
+    expect(a.prompts).toHaveLength(2);
+    expect(await a.ev.propose(null, newLinkWayIn())).toBeNull();
+    expect(a.refusals).toEqual(Array(7).fill("busy"));
+  });
+
+  it("refuses a request from another of its own tabs while its own is open", async () => {
+    const { hub, peers } = await room(3);
+    const [, , x] = peers;
+    const x2 = await twin(hub, x);
+    const held = holdFrames(hub);
+    expect(await x.ev.propose(null, newLinkWayIn())).toBeNull();
+    expect(await x2.ev.propose(null, newLinkWayIn())).toBeNull();
+    for (const f of held.splice(0)) if (f.from === x2) await x.ev.receiveFrame(f.ft, f.from.id, f.pt);
+    expect(x.refusals).toEqual(["busy"]);
+    expect(x.prompts).toHaveLength(0);
+    expect(openVotes(x)).toBe(1);
+  });
+
+  it("will not ask while a request from another of its own tabs is open here", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , x] = peers;
+    const x2 = await twin(hub, x);
+    expect(await x.ev.propose(null, newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(x2.prompts).toHaveLength(1);
+    const way = newLinkWayIn();
+    expect(await x2.ev.propose(null, way)).toBe("busy");
+    expect(way.secret.every((v) => v === 0)).toBe(true);
+    // Another member's open request never stops it asking.
+    await x.ev.cancel();
+    await hub.flush();
+    expect(await a.ev.propose(null, newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(await x2.ev.propose(null, newLinkWayIn())).toBeNull();
+  });
+});
+
+describe("the record of seen requests keeps what an open vote or a late echo needs (fourth final wave, M1)", () => {
+  /// t asks and withdraws `n` link changes, each one placed at every member.
+  const churn = async (hub: Hub, t: Peer, n: number): Promise<void> => {
+    for (let i = 0; i < n; i++) {
+      expect(await t.ev.propose(null, newLinkWayIn())).toBeNull();
+      await hub.flush();
+      await t.ev.cancel();
+      await hub.flush();
+    }
+  };
+
+  it("applies a removal's commit after many requests were opened and withdrawn while it was open", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    await churn(hub, t, MAX_SEEN_REQUESTS + 6);
+    const id = b.prompts.find((x) => x.target !== null)!.requestId;
+    for (const p of [b, c]) await p.ev.vote(id, "APPROVE");
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    expect(t.removed).toBe(true);
+    for (const p of [a, b, c]) {
+      expect(p.leftOut).toBe(0);
+      expect(p.applied).toHaveLength(1);
+      expect(p.keyring.rootEpoch).toBe(1);
+    }
+  });
+
+  it("applies its own commit echoed late after many requests were opened and withdrawn meanwhile", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    hub.dropCommits = true;
+    expect(await a.ev.propose(null, newLinkWayIn())).toBeNull();
+    await hub.flush();
+    for (const p of [b, c, t]) await answer(p, "APPROVE");
+    await hub.flush();
+    expect(hub.captured).toHaveLength(1);
+    hub.now += COMMIT_ECHO_MS;
+    await a.ev.tick();
+    expect(a.log).toContainEqual(expect.objectContaining({ s: "FAILED", reason: "no-echo", mine: true }));
+    await churn(hub, t, MAX_SEEN_REQUESTS + 6);
+    hub.dropCommits = false;
+    const [sent] = hub.captured;
+    hub.deliver(sent.from, sent.h, sent.body);
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    for (const p of [a, b, c, t]) {
+      expect(p.leftOut).toBe(0);
+      expect(p.applied).toHaveLength(1);
+      expect(p.keyring.rootEpoch).toBe(1);
+    }
+  });
+});
