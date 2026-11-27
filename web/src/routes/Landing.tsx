@@ -44,7 +44,7 @@ export function Landing() {
 
       {/* Two cards rather than a stacked list: the choice is binary, and side
           by side it costs one row instead of two. Only the selected card
-          carries its explanation — the unselected one does not need to argue
+          carries its explanation. The unselected one does not need to argue
           its case, and the height it saves is what keeps this on one screen. */}
       <div className="classes" role="radiogroup" aria-label="Room type">
         <label className={`class-card${cls === "unlisted" ? " is-on" : ""}`}>
@@ -71,7 +71,7 @@ export function Landing() {
 
       <p className="class-detail">
         {cls === "unlisted" ? (
-          <>Nobody can find it by guessing. Send the whole link — everything
+          <>Nobody can find it by guessing. Send the whole link: everything
           after the <span className="mono">#</span> is the key.</>
         ) : (
           <>Reachable at <span className="mono">{window.location.host}/copper-lantern</span>,
@@ -172,7 +172,7 @@ function joinHint(t: JoinTarget): string {
     case "private-no-key":
       return t.damaged
         ? "The key after the # looks cut short. Copy the whole link again."
-        : "That is a private room without its key — the part after the # in the link. Ask for the whole link.";
+        : "That is a private room without its key, the part after the # in the link. Ask for the whole link.";
     case "named":
       return t.elsewhere
         ? `The shared room “${t.name}” on ${t.elsewhere}. You will need its passphrase.`
@@ -194,7 +194,7 @@ function ExpiryPicker({ onChange }: { onChange: (ttl: TtlBody) => void }) {
           <option key={p.label} value={JSON.stringify(p.value)}>{p.label}</option>
         ))}
         <option value={JSON.stringify({ kind: "none", secs: 0 })}>
-          No expiry — until shredded, or left empty and unedited for 12 hours
+          No expiry: until shredded, or left empty and unedited for 12 hours
         </option>
       </select>
     </div>
@@ -202,7 +202,7 @@ function ExpiryPicker({ onChange }: { onChange: (ttl: TtlBody) => void }) {
 }
 
 /// Chosen by whoever makes the room, sealed in its encrypted config, and so
-/// applied for everyone who opens it — a source does not have to know the
+/// applied for everyone who opens it: a source does not have to know the
 /// setting exists to be covered by it.
 function SecurityPicker({
   value,
@@ -217,8 +217,8 @@ function SecurityPicker({
     <div className="field">
       <label className="micro-label" htmlFor="security">SECURITY</label>
       <select id="security" value={value} onChange={(e) => onChange(e.target.value as SecurityLevel)}>
-        <option value="everyday">Everyday — a refresh keeps you in the room</option>
-        <option value="highest">Highest security — the key is never stored</option>
+        <option value="everyday">Everyday: a refresh keeps you in the room</option>
+        <option value="highest">Highest security: the key is never stored</option>
       </select>
       <p className="hint">
         {kind === "private"
@@ -297,7 +297,7 @@ function NamedForm() {
     }
     const v = estimatePassphrase(passphrase);
     // Was `!v.dicewareWords || !v.ok`, which refused every passphrase that
-    // was not a run of lowercase words — including anything a password
+    // was not a run of lowercase words, including anything a password
     // manager generates, which is stronger than the diceware it insisted on.
     // Strength is the bar; the shape of it is not.
     if (!v.ok) {
@@ -310,8 +310,8 @@ function NamedForm() {
     try {
       const finalName = suffixOn ? name : name.replace(/-[0-9a-f]{4}$/, "");
       // Ask first. Creating the room is what finally checks the name, but the
-      // key derivation in front of it is the slowest step on this page —
-      // seconds on a phone — so a taken name used to cost that whole wait and
+      // key derivation in front of it is the slowest step on this page
+      // (seconds on a phone), so a taken name used to cost that whole wait and
       // then an error about the passphrase. The server still decides: this
       // only saves the wait, and if the lookup itself fails, creation goes
       // ahead and the server refuses the name there.
@@ -384,7 +384,7 @@ function NamedForm() {
         />
         <span className="hint">
           Add a few random characters to the end. Without them, someone could
-          guess the address and see that a room exists — they still could not
+          guess the address and see that a room exists. They still could not
           read it without the passphrase.
         </span>
       </label>

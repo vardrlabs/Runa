@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type RefObject } from "react";
 import {
   EVICT_COPY,
+  evictCopy,
   evictStateText,
   fingerprintLine,
   proposeErrorText,
@@ -9,6 +10,7 @@ import {
   voteTitle,
 } from "../evict/copy";
 import { PassphraseField } from "./PassphraseField";
+import type { WayKind } from "../evict/reroot";
 
 export interface EvictCandidate {
   peerId: Uint8Array;
@@ -30,16 +32,40 @@ export function evictInFlight(state: string): boolean {
   return state === "VOTING" || state === "APPROVED";
 }
 
+/// Where focus goes when a dialog closes and the control that opened it is
+/// no longer on screen, such as a menu item in a menu that has folded away.
+export type FocusFallback = () => HTMLElement | null;
+
+const onScreen = (el: HTMLElement): boolean => el.isConnected && el.getClientRects().length > 0;
+
 /// Moves focus into a dialog when it opens and gives it back to whatever had
-/// it when the dialog closes, as the shred dialog does.
-function useDialogFocus(first: RefObject<HTMLElement | null>): void {
+/// it when the dialog closes, as the shred dialog does. When that control is
+/// gone or hidden, focus goes to `fallback` instead of the page body.
+function useDialogFocus(first: RefObject<HTMLElement | null>, fallback?: FocusFallback): void {
+  const fallbackRef = useRef(fallback);
+  fallbackRef.current = fallback;
   useEffect(() => {
     const back = document.activeElement instanceof HTMLElement ? document.activeElement : null;
     first.current?.focus();
     return () => {
-      if (back && back.isConnected) back.focus();
+      if (back && onScreen(back)) {
+        back.focus();
+        return;
+      }
+      const other = fallbackRef.current?.();
+      if (other && onScreen(other)) other.focus();
     };
   }, [first]);
+}
+
+/// Said while the new keys are made, when the dialog cannot be closed.
+const BUSY_TEXT = "This tab is making the new keys. Cancel works again once the request has gone out.";
+
+/// The new way in could not be shown: the room has moved, and the person is
+/// told so with nothing to copy.
+function noWayText(way: WayKind): string {
+  const word = way === "pass" ? "passphrase" : "link";
+  return `This room's ${word} changed, and this tab could not show the new one. Ask someone who is still in the room for it.`;
 }
 
 /// The request to remove someone or change the link (amendment K). Nothing
@@ -49,12 +75,14 @@ export function EvictModal(props: {
   candidates: EvictCandidate[];
   /// Open with nobody chosen: a link change.
   relink: boolean;
-  wayKind: "link" | "pass";
+  wayKind: WayKind;
   state: string;
   stateReason?: string;
+  returnFocus?: FocusFallback;
   onPropose(target: Uint8Array | null, passphrase: string): Promise<string | null>;
   onCancel(): void;
 }) {
+  const words = evictCopy(props.wayKind);
   const [choice, setChoice] = useState<number>(props.relink || props.candidates.length === 0 ? -1 : 0);
   // Held here only while the dialog is open; closing it unmounts this
   // component and drops the string.
@@ -62,25 +90,24 @@ export function EvictModal(props: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const cancelRef = useRef<HTMLButtonElement>(null);
-  // In a ref so the key listener is added once: re-adding it on every render
-  // is harmless, but the focus effect must not run again while someone types.
-  const onCancelRef = useRef(props.onCancel);
-  onCancelRef.current = props.onCancel;
   const mounted = useRef(true);
 
-  useDialogFocus(cancelRef);
+  useDialogFocus(cancelRef, props.returnFocus);
 
   useEffect(() => {
     mounted.current = true;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancelRef.current();
-    };
-    document.addEventListener("keydown", onKey);
     return () => {
       mounted.current = false;
-      document.removeEventListener("keydown", onKey);
     };
   }, []);
+
+  // Disabling the button that had focus drops focus to the page; once the
+  // request has gone out, it comes back to Cancel.
+  useEffect(() => {
+    if (busy) return;
+    const active = document.activeElement;
+    if (!active || active === document.body) cancelRef.current?.focus();
+  }, [busy]);
 
   const locked = busy || evictInFlight(props.state);
   const submit = async () => {
@@ -88,28 +115,56 @@ export function EvictModal(props: {
     setError(null);
     setBusy(true);
     const target = choice >= 0 ? (props.candidates[choice]?.peerId ?? null) : null;
-    const code = await props.onPropose(target, passphrase);
-    // Argon2id takes seconds, and the dialog may have closed meanwhile.
+    let code: string | null;
+    try {
+      code = await props.onPropose(target, passphrase);
+    } catch {
+      code = "failed";
+    }
+    // The page may have closed the dialog meanwhile, for a vote prompt or
+    // because the tab was stranded; its state went with it.
     if (!mounted.current) return;
     setBusy(false);
-    if (code) setError(proposeErrorText(code));
-    else setPassphrase("");
+    // The typed passphrase goes whatever the outcome: it was handed over,
+    // and a refused one is typed or generated again.
+    setPassphrase("");
+    if (code) setError(proposeErrorText(code, props.wayKind));
   };
 
-  const stateText = props.state !== "IDLE" ? evictStateText(props.state, props.stateReason) : "";
+  // While the new keys are made, Cancel and Escape do nothing: a request
+  // that goes out behind a closed dialog is one the person thinks they
+  // stopped. Escape belongs to this dialog only while focus is in it.
+  const cancel = () => {
+    if (busy) return;
+    setPassphrase("");
+    props.onCancel();
+  };
+
+  const stateText = props.state !== "IDLE" ? evictStateText(props.state, props.stateReason, props.wayKind) : "";
 
   return (
     <div className="modal-backdrop">
-      <div className="modal" role="dialog" aria-modal="true" aria-labelledby="evict-title">
+      <div
+        className="modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="evict-title"
+        aria-busy={busy}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape") return;
+          e.stopPropagation();
+          cancel();
+        }}
+      >
         <h2 id="evict-title" className="micro-label">
-          {EVICT_COPY.title}
+          {words.title}
         </h2>
         <p className="hint">{props.wayKind === "pass" ? EVICT_COPY.explainPass : EVICT_COPY.explainLink}</p>
         <fieldset disabled={locked} style={{ border: 0, padding: 0, margin: "14px 0" }}>
           <div role="radiogroup" aria-labelledby="evict-title">
             <label className="row checkbox-row">
               <input type="radio" name="evict-target" checked={choice === -1} onChange={() => setChoice(-1)} />
-              <span>{EVICT_COPY.nobody}</span>
+              <span>{words.nobody}</span>
             </label>
             {props.candidates.map((c, i) => (
               <label className="row checkbox-row" key={i}>
@@ -128,6 +183,11 @@ export function EvictModal(props: {
             />
           )}
         </fieldset>
+        {busy && (
+          <p className="hint" role="status">
+            {BUSY_TEXT}
+          </p>
+        )}
         {stateText && (
           <p className="micro-label" role="status">
             {stateText}
@@ -139,7 +199,7 @@ export function EvictModal(props: {
           </p>
         )}
         <div className="row" style={{ justifyContent: "flex-end" }}>
-          <button ref={cancelRef} onClick={props.onCancel}>
+          <button ref={cancelRef} disabled={busy} onClick={cancel}>
             {EVICT_COPY.cancel}
           </button>
           <button id="evict-propose" className="danger" disabled={locked} onClick={() => void submit()}>
@@ -157,10 +217,12 @@ export function EvictModal(props: {
 export function EvictVotePrompt(props: {
   by: string;
   who: string | null;
+  wayKind: WayKind;
+  returnFocus?: FocusFallback;
   onDecide(choice: "APPROVE" | "REJECT"): void;
 }) {
   const rejectRef = useRef<HTMLButtonElement>(null);
-  useDialogFocus(rejectRef);
+  useDialogFocus(rejectRef, props.returnFocus);
   return (
     <div className="modal-backdrop">
       <div
@@ -171,9 +233,9 @@ export function EvictVotePrompt(props: {
         aria-describedby="evict-vote-body"
       >
         <h2 id="evict-vote-title" className="micro-label">
-          {voteTitle(props.who)}
+          {voteTitle(props.who, props.wayKind)}
         </h2>
-        <p id="evict-vote-body">{voteBody(props.by, props.who)}</p>
+        <p id="evict-vote-body">{voteBody(props.by, props.who, props.wayKind)}</p>
         <div className="row" style={{ justifyContent: "flex-end", marginTop: 12 }}>
           <button id="evict-reject" ref={rejectRef} onClick={() => props.onDecide("REJECT")}>
             {EVICT_COPY.reject}
@@ -189,34 +251,46 @@ export function EvictVotePrompt(props: {
 
 /// The new link or passphrase, shown once to each member who stays. It is
 /// the only time the page shows it, so only Done closes it: an Escape
-/// pressed by habit would lose it for good.
-export function ReRootNotice(props: { view: ReRootView; onCopy(text: string): void; onDone(): void }) {
+/// pressed by habit would lose it for good. When the session could give
+/// neither, the notice says the way in changed and offers nothing to copy.
+export function ReRootNotice(props: {
+  view: ReRootView;
+  wayKind: WayKind;
+  returnFocus?: FocusFallback;
+  onCopy(text: string): void;
+  onDone(): void;
+}) {
   const { link, passphrase, fingerprint, removed } = props.view;
+  const secret = link || passphrase || null;
   const copyRef = useRef<HTMLButtonElement>(null);
-  useDialogFocus(copyRef);
+  const doneRef = useRef<HTMLButtonElement>(null);
+  useDialogFocus(secret ? copyRef : doneRef, props.returnFocus);
+  const isLink = link ? true : passphrase ? false : props.wayKind === "link";
   return (
     <div className="modal-backdrop">
       <div className="modal" role="dialog" aria-modal="true" aria-labelledby="reroot-title">
         <h2 id="reroot-title" className="micro-label">
-          {link ? EVICT_COPY.newLinkTitle : EVICT_COPY.newPassTitle}
+          {isLink ? EVICT_COPY.newLinkTitle : EVICT_COPY.newPassTitle}
         </h2>
         {removed && <p>{removedLine(removed)}</p>}
-        <p>{EVICT_COPY.newWayBody}</p>
+        {secret ? <p>{EVICT_COPY.newWayBody}</p> : <p>{noWayText(props.wayKind)}</p>}
         {link ? (
           <code className="mono" data-new-link="" style={{ wordBreak: "break-all" }}>
             {link}
           </code>
-        ) : (
+        ) : passphrase ? (
           <code className="mono" data-new-passphrase="" style={{ wordBreak: "break-all" }}>
             {passphrase}
           </code>
-        )}
+        ) : null}
         {fingerprint && <p className="hint">{fingerprintLine(fingerprint)}</p>}
         <div className="row" style={{ justifyContent: "flex-end", marginTop: 12 }}>
-          <button ref={copyRef} onClick={() => props.onCopy(link ?? passphrase ?? "")}>
-            {EVICT_COPY.copy}
-          </button>
-          <button id="reroot-done" className="primary" onClick={props.onDone}>
+          {secret && (
+            <button ref={copyRef} onClick={() => props.onCopy(secret)}>
+              {EVICT_COPY.copy}
+            </button>
+          )}
+          <button id="reroot-done" ref={doneRef} className="primary" onClick={props.onDone}>
             {EVICT_COPY.done}
           </button>
         </div>
