@@ -290,23 +290,27 @@ What that buys, exactly:
   out and stops. That needs blind timing, because nobody sees a request
   before the server has noted it.
 
-  A member who is determined to stay can still block their own removal, in
-  two ways, and neither depends on timing. They can keep a request of their
-  own open. A member answers one request at a time, so while theirs is open
-  nobody else's can start, and a modified client can send a new one the
-  moment the last one ends. The room can see it happening, because the same
-  person keeps asking. Or they can join under a second identity before anyone
+  Their own requests don't let them block it. A member holds several requests
+  open at once, at most one from each person and eight in all, so a request of
+  theirs takes one place and anyone else can still ask to remove them. If they
+  keep a request of their own open, or open and cancel requests in a loop, what
+  they get is prompts that appear and disappear for everyone else, and key
+  changes held back within the limits above. The room can see it happening,
+  because the same person keeps asking.
+
+  A member who is determined to stay can still block their own removal, and it
+  doesn't depend on timing. They can join under a second identity before anyone
   asks. That second identity is a member, its approval is needed, and it can
   refuse or leave. Neither identity can then be removed without the other's
-  approval. A copy of another member's public key works the same way, and it
-  looks like that member's second tab. So removal by unanimous vote works
-  against someone who isn't running a modified client and hasn't prepared a
-  second identity, and it doesn't work against a member who is determined to
-  stay. What a removal guarantees once it lands is unchanged: the removed
-  person's old link or passphrase no longer opens the room, and nothing
-  written afterwards reaches them. Changing the link while the unwanted person
-  isn't connected is affected by neither route, because someone who isn't
-  connected has no vote.
+  approval, and eight identities can each keep a request open and fill every
+  place a member holds. A copy of another member's public key works the same
+  way, and it looks like that member's second tab. So removal by unanimous vote
+  works against someone who hasn't prepared a second identity, and it doesn't
+  work against a member who is determined to stay. What a removal guarantees
+  once it lands is unchanged: the removed person's old link or passphrase no
+  longer opens the room, and nothing written afterwards reaches them. Changing
+  the link while the unwanted person isn't connected isn't affected by any of
+  this, because someone who isn't connected has no vote.
 - **Someone being removed cannot dodge it by reconnecting: a new connection is
   not given the new link.** The room changes its link whether or not they are
   still connected, and only the people who approved receive the new one.

@@ -500,20 +500,34 @@ signature names the room's root epoch. An EPOCH_KEY step does not end a vote,
 on a member or on the server: a step does not move the root, and a member that
 approved before a step does not vote again. While a request's hold is open the
 server applies no step (the hold, below), and honest members hold their own
-steps until the vote ends. A step that leaves a member without a wrap still
-ends a vote that needs that member, because the member joins again to be
+steps while any request is open. A step that leaves a member without a wrap
+still ends a vote that needs that member, because the member joins again to be
 handed the key and the vote fails when its old connection leaves. Under the
 hold that can happen only with a step applied before the request passed, or
 once the hold has ended or when the request started none; a request made after
 everyone the step left out has joined again can go ahead. A server that does
 not hold steps lets the target end every vote this way. The target leaving
 does not stop it: the room still moves to the new way in, and a connection the
-target opens again is never given it. The target can still block its own
-removal in two ways: a member answers one request at a time, so a target that
-keeps a request of its own open keeps every other request from being asked,
-and a connection it opened under another signing key before the request is a
-member whose approval is needed like any other, so it can refuse or leave. The
-threat model states what follows from this.
+target opens again is never given it.
+
+Several requests can be open at once. A member holds at most one open request
+from each sender and at most eight in all, its own included, and refuses a
+request past either bound as busy. It may make a request while other members'
+requests are open, as long as none of its own is, and it may vote on others'
+requests while its own is open. Each request is its own vote, with its own
+frozen roster, deadline, approvals and wait for the commit, and everything above
+holds for each of them; a vote, a cancel and a commit are matched to their
+request by its id. A commit moves the root, so it ends every other open request
+the way a re-root ends a vote, and a proposer wipes the new way in it kept for a
+request that ended. A member that approved two requests applies whichever commit
+the server relays first; the other then names a root the room has left and is
+refused. So a target that keeps a request of its own open, or opens and cancels
+requests in a loop, takes one place at each member and cannot stop anyone else's
+request; it can only make prompts come and go. The target can still block its
+own removal another way: a connection it opened under another signing key before
+the request is a member whose approval is needed like any other, so it can
+refuse or leave, and eight such identities can fill every place a member holds.
+The threat model states what follows from this.
 
 *The new way in.* The proposer makes it before asking. For a private room it is
 a new 32-byte link secret and a new 16-byte salt. For a shared-name room it is a
