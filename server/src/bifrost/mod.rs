@@ -17,13 +17,15 @@ use tokio::time::timeout;
 
 use crate::bifrost::frame::*;
 use crate::runar::epoch::Admit;
+use crate::heimdall::verifier;
+use crate::runar::evict;
 use crate::runar::room::{PeerKx, TtlKind};
 use crate::error::WireCode;
 use crate::gjallarhorn;
 use crate::heimdall::ratelimit::RateLimiter;
 use crate::runar::log::LogEntry;
 use crate::runar::room::{
-    JoinError, PurgeAckStatus, Room, RoomState,
+    JoinError, PurgeAckStatus, ReRoot, Room, RoomState,
 };
 use crate::surtr;
 use crate::AppState;
@@ -554,6 +556,13 @@ async fn run_connection(
             inbound = stream.next() => {
                 match inbound {
                     Some(Ok(Message::Binary(data))) => {
+                        // This connection's last frame is queued (ERROR 4005
+                        // or 4014): nothing it sends now is acted on, so a
+                        // peer the room has just removed cannot slip one
+                        // more edit in under the epoch it held.
+                        if final_error.get().is_some() {
+                            continue;
+                        }
                         if data.len() > cfg.max_frame_bytes {
                             conn_ok = Err(WireCode::FrameTooLarge);
                             break;
@@ -667,7 +676,15 @@ async fn run_connection(
 fn carries_ciphertext(frame_type: u8) -> bool {
     matches!(
         frame_type,
-        FT_DOC_UPDATE | FT_SNAPSHOT | FT_AWARENESS | FT_SHRED_REQUEST | FT_SHRED_VOTE | FT_SHRED_CANCEL
+        FT_DOC_UPDATE
+            | FT_SNAPSHOT
+            | FT_AWARENESS
+            | FT_SHRED_REQUEST
+            | FT_SHRED_VOTE
+            | FT_SHRED_CANCEL
+            | FT_EVICT_REQUEST
+            | FT_EVICT_VOTE
+            | FT_EVICT_CANCEL
     )
 }
 
@@ -689,6 +706,12 @@ async fn process_frame(
     }
     if data.len() < HEADER_LEN {
         return Err(Some(WireCode::ProtocolError));
+    }
+    // A connection the room has removed (an eviction takes it out of the peer
+    // list at once) can still be reading while its last error drains. Nothing
+    // it sends is relayed, logged or applied.
+    if !room.peers.lock().unwrap().iter().any(|p| p.peer_id == sender) {
+        return Ok(());
     }
     let frame_bytes = Bytes::copy_from_slice(data);
 
@@ -863,6 +886,78 @@ async fn process_frame(
                 room.note_shred_request();
             }
             gjallarhorn::relay(room, &frame_bytes, sender).await;
+            Ok(())
+        }
+
+        // Amendment K: sealed under the room's content key and relayed like
+        // the shred frames. The server reads none of it; it only notes when a
+        // request passed, and the commit is where it checks the votes.
+        FT_EVICT_REQUEST | FT_EVICT_VOTE | FT_EVICT_CANCEL => {
+            // Before relaying, as for SHRED_REQUEST: who could see this
+            // request is the cohort its sender's commit is counted against.
+            if header.frame_type == FT_EVICT_REQUEST {
+                room.note_evict_request(sender);
+            }
+            gjallarhorn::relay(room, &frame_bytes, sender).await;
+            Ok(())
+        }
+
+        // Amendment K. Every refusal is silent, like a refused step: a
+        // proposer whose commit is not echoed gives up on its own.
+        FT_EVICT_COMMIT => {
+            let Ok(clear) = evict::parse_commit(&data[HEADER_LEN..]) else {
+                return Ok(());
+            };
+            if clear.config_blob.len() > state.cfg.max_config_blob_bytes
+                || !verifier::plausible_verifier(&clear.new_verifier)
+            {
+                return Ok(());
+            }
+            // Signatures are checked outside the room's locks, against the
+            // keys the voters joined with. `commit_eviction` then checks,
+            // under the locks, that the epoch they name is still the room's
+            // and every voter is still connected with that key.
+            let roster = room.roster();
+            let mut voters = Vec::with_capacity(clear.votes.len());
+            for v in &clear.votes {
+                let Some(key) = roster.iter().find(|p| p.peer_id == v.voter).and_then(|p| p.pubkey.clone()) else {
+                    return Ok(());
+                };
+                // The statement names the target's peer id and key digest
+                // exactly as the clear part gives them; the room then treats
+                // every connection holding that key as the target.
+                let msg = evict::statement(
+                    &room.id,
+                    &clear.request_id,
+                    header.epoch,
+                    clear.target.as_ref(),
+                    &v.voter,
+                    &clear.new_verifier,
+                );
+                if !evict::verify_vote(&key, &msg, &v.sig) {
+                    return Ok(());
+                }
+                voters.push((v.voter, key));
+            }
+            let reroot = ReRoot {
+                at_epoch: header.epoch,
+                target: clear.target,
+                voters,
+                verifier: clear.new_verifier,
+                salt: clear.new_salt,
+                config_blob: (!clear.config_blob.is_empty()).then(|| Bytes::copy_from_slice(clear.config_blob)),
+            };
+            match room.commit_eviction(
+                &reroot,
+                std::time::Instant::now(),
+                &frame_bytes,
+                sender,
+                &error_frame(room.id, WireCode::Evicted),
+                &error_frame(room.id, WireCode::ProtocolError),
+            ) {
+                Ok(epoch) => tracing::info!(epoch, "room re-rooted by an eviction or link change"),
+                Err(why) => tracing::debug!(?why, "eviction commit refused"),
+            }
             Ok(())
         }
 
