@@ -637,6 +637,7 @@ async fn an_evicted_connection_gets_its_error_and_4014_after_the_room_lets_it_go
     room.note_evict_request(a_id);
     let rr = runa_server::runar::room::ReRoot {
         at_epoch: 0,
+        root: 0,
         target: Some(runa_server::runar::evict::Target {
             peer_id: t_id,
             key_digest: runa_server::runar::evict::key_digest(&t_key),

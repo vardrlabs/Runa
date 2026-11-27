@@ -194,6 +194,31 @@ fn ttl_json(room: &Room) -> TtlJson {
     TtlJson { kind, secs: remaining_secs(room) }
 }
 
+/// How many EVICT_COMMIT vote signatures one connection may have verified
+/// per second, on average: one full commit's worth.
+const VOTE_CHECKS_PER_SEC: u32 = evict::MAX_VOTES as u32;
+
+/// The most it may have verified at once: four full commits, which is a
+/// proposer's first send and the three times it may send the commit again
+/// after a step (amendment K), all inside a second.
+const VOTE_CHECKS_BURST: u32 = 4 * evict::MAX_VOTES as u32;
+
+/// A connection's budget for vote signatures (review I1). Each signature
+/// costs up to about 160 microseconds for P-256, and a commit carries up to
+/// 32 of them, so without a budget one connection could keep a worker busy
+/// at the frame rate. A commit is charged one token per vote, after the cheap
+/// checks pass and before any signature is verified, and one the budget
+/// cannot pay for is dropped without an answer, like any refused commit.
+/// Counting signatures rather than commits lets an honest proposer send its
+/// commit again at once after a step, which a one-commit-per-second limit
+/// would refuse.
+fn vote_budget() -> RateLimiter<()> {
+    let window = Duration::from_secs(u64::from(VOTE_CHECKS_BURST / VOTE_CHECKS_PER_SEC));
+    // Room for more keys than the one it holds, so the table is never full
+    // and `RateLimiter::evict` never runs on it.
+    RateLimiter::new(VOTE_CHECKS_BURST, window, 2)
+}
+
 struct ConnLimits {
     frames: RateLimiter<()>,
     bytes: RateLimiter<()>,
@@ -548,6 +573,7 @@ async fn run_connection(
     // whole room log, so letting them queue turns one small frame into an
     // unbounded fan-out of spawned tasks and egress.
     let sync_slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let vote_budget = vote_budget();
     // Frames answering this connection's own requests: DOC_ACK and PONG.
     let mut direct: Vec<Bytes> = Vec::new();
 
@@ -571,7 +597,7 @@ async fn run_connection(
                             conn_ok = Err(WireCode::RateLimited);
                             break;
                         }
-                        match process_frame(&state, &room, peer_id, &data, &sync_slot, caps, &mut direct).await {
+                        match process_frame(&state, &room, peer_id, &data, &sync_slot, &vote_budget, caps, &mut direct).await {
                             Ok(()) => {}
                             Err(Some(code)) => { conn_ok = Err(code); break; }
                             Err(None) => {}
@@ -689,12 +715,14 @@ fn carries_ciphertext(frame_type: u8) -> bool {
 }
 
 /// Returns Ok on handled, Err(Some(code)) to close, Err(None) silently ignored.
+#[allow(clippy::too_many_arguments)]
 async fn process_frame(
     state: &AppState,
     room: &std::sync::Arc<Room>,
     sender: [u8; 16],
     data: &[u8],
     sync_slot: &std::sync::Arc<tokio::sync::Semaphore>,
+    vote_budget: &RateLimiter<()>,
     caps: Caps,
     direct: &mut Vec<Bytes>,
 ) -> Result<(), Option<WireCode>> {
@@ -806,6 +834,17 @@ async fn process_frame(
                 .ok()
                 .and_then(|v| v.get("from_index").and_then(|x| x.as_u64()))
                 .unwrap_or(0);
+            // The permit caps this at one replay per connection, and is taken
+            // before the log is cloned: without it, a peer could fire sync
+            // requests at the frame limit and have the server clone the whole
+            // log for each one, even while a replay is still running.
+            let Ok(permit) = sync_slot.clone().try_acquire_owned() else {
+                return Ok(());
+            };
+            // Cloned before `sender_for` sees the sender live, so the chunk
+            // holds nothing written after a commit that removed it. A
+            // connection that is closing never gets here twice: its reader
+            // skips every frame once its last error is queued.
             let chunk = {
                 let log = room.log.read().unwrap();
                 log.tail_from(from_index)
@@ -814,12 +853,6 @@ async fn process_frame(
                 // Spawn off the connection's critical path so `send().await`
                 // exerts real backpressure; the select loop is free to drain
                 // rx concurrently because process_frame has already returned.
-                // The permit caps this at one replay per connection: without
-                // it, a peer could fire sync requests at the frame limit and
-                // have the server clone and push the whole log for each one.
-                let Ok(permit) = sync_slot.clone().try_acquire_owned() else {
-                    return Ok(());
-                };
                 tokio::spawn(async move {
                     let _permit = permit;
                     if let Some(snapshot) = chunk.snapshot {
@@ -889,34 +922,45 @@ async fn process_frame(
             {
                 return Ok(());
             }
+            // Every cheap check first, under the room's locks: the header
+            // epoch, the sender among the voters, its recorded request, and
+            // the voters distinct and exactly its cohort. A frame that fails
+            // one costs no signature work. This also gives the room's root,
+            // which every vote names, and each voter's signing key.
+            let now = std::time::Instant::now();
+            let voter_ids: Vec<[u8; 16]> = clear.votes.iter().map(|v| v.voter).collect();
+            let Ok((root, voters)) = room.admit_commit(header.epoch, clear.target, &voter_ids, sender, now) else {
+                return Ok(());
+            };
+            // Then the work is paid for: one token per signature, from this
+            // connection's own budget (`VOTE_CHECKS_PER_SEC`).
+            if !vote_budget.check_n(&(), voters.len() as u32) {
+                return Ok(());
+            }
             // Signatures are checked outside the room's locks, against the
-            // keys the voters joined with. `commit_eviction` then checks,
-            // under the locks, that the epoch they name is still the room's
-            // and every voter is still connected with that key.
-            let roster = room.roster();
-            let mut voters = Vec::with_capacity(clear.votes.len());
-            for v in &clear.votes {
-                let Some(key) = roster.iter().find(|p| p.peer_id == v.voter).and_then(|p| p.pubkey.clone()) else {
-                    return Ok(());
-                };
+            // keys the voters joined with. `commit_eviction` then checks
+            // everything again under the locks, the root among it, and that
+            // every voter is still connected with that key.
+            for (v, (_, key)) in clear.votes.iter().zip(&voters) {
                 // The statement names the target's peer id and key digest
                 // exactly as the clear part gives them; the room then treats
                 // every connection holding that key as the target.
                 let msg = evict::statement(
                     &room.id,
                     &clear.request_id,
-                    header.epoch,
+                    root,
                     clear.target.as_ref(),
                     &v.voter,
                     &clear.new_verifier,
                 );
-                if !evict::verify_vote(&key, &msg, &v.sig) {
+                room.count_vote_check();
+                if !evict::verify_vote(key, &msg, &v.sig) {
                     return Ok(());
                 }
-                voters.push((v.voter, key));
             }
             let reroot = ReRoot {
                 at_epoch: header.epoch,
+                root,
                 target: clear.target,
                 voters,
                 verifier: clear.new_verifier,
@@ -925,7 +969,7 @@ async fn process_frame(
             };
             match room.commit_eviction(
                 &reroot,
-                std::time::Instant::now(),
+                now,
                 &frame_bytes,
                 sender,
                 &error_frame(room.id, WireCode::Evicted),
@@ -1124,7 +1168,7 @@ mod closing_sender_tests {
         let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
         let mut direct = Vec::new();
         let caps = Caps { acks: true, heartbeat: true };
-        let _ = process_frame(state, r, sender, data, &slot, caps, &mut direct).await;
+        let _ = process_frame(state, r, sender, data, &slot, &vote_budget(), caps, &mut direct).await;
     }
 
     fn drain(p: &mut Peer) -> Vec<Bytes> {
@@ -1138,6 +1182,7 @@ mod closing_sender_tests {
     fn commit(r: &Room, sender: [u8; 16], voters: &[(&Peer, u8)], target: Option<Target>) -> u32 {
         let rr = ReRoot {
             at_epoch: r.epoch(),
+            root: r.root_epoch(),
             target,
             voters: voters.iter().map(|(p, n)| (p.id, key(*n))).collect(),
             verifier: hash_auth_key(&[0x22; 32]),
@@ -1258,6 +1303,47 @@ mod closing_sender_tests {
         assert_nothing_lands(&s, &r, k.id, &mut [&mut a, &mut b]).await;
     }
 
+    /// Review I1: a connection pays one token per vote before any signature
+    /// is verified. Each of these commits passes the cheap checks and stops
+    /// at its first signature, which is bad, and is charged for both votes:
+    /// the burst of 128 tokens pays for 64 of them, and the 200 frames sent
+    /// here, far faster than the budget refills, get little more than that.
+    #[tokio::test]
+    async fn a_connection_pays_for_the_signatures_its_commits_ask_for() {
+        let s = state();
+        let r = room();
+        let a = peer(&r, 1, true);
+        let b = peer(&r, 2, true);
+        r.note_evict_request(a.id);
+        let mut new_verifier = [0u8; 32];
+        for (i, x) in new_verifier.iter_mut().enumerate() {
+            *x = i as u8 + 1;
+        }
+        let clear = evict::CommitClear {
+            request_id: [9; 16],
+            target: None,
+            new_verifier,
+            new_salt: [3; 16],
+            config_blob: b"",
+            votes: vec![evict::Vote { voter: a.id, sig: [0; 64] }, evict::Vote { voter: b.id, sig: [0; 64] }],
+            tail: &[],
+        };
+        let mut body = evict::encode_clear(&clear);
+        body.extend_from_slice(b"tail");
+        let data = frame(FT_EVICT_COMMIT, 0, &body);
+        let budget = vote_budget();
+        let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let caps = Caps { acks: true, heartbeat: true };
+        let mut direct = Vec::new();
+        for _ in 0..200 {
+            let _ = process_frame(&s, &r, a.id, &data, &slot, &budget, caps, &mut direct).await;
+        }
+        let checked = r.vote_checks();
+        assert!(checked >= 64, "the burst pays for 64 frames, {checked} were checked");
+        assert!(checked < 100, "{checked} signatures were checked for 200 frames");
+        assert_eq!(r.epoch(), 0);
+    }
+
     #[tokio::test]
     async fn a_peer_a_commit_closes_with_4005_is_not_heard_and_leaves_the_roster() {
         let s = state();
@@ -1265,7 +1351,8 @@ mod closing_sender_tests {
         let mut k = peer(&r, 3, false);
         let mut a = peer(&r, 1, true);
         let mut b = peer(&r, 2, true);
-        assert_eq!(commit(&r, a.id, &[(&a, 1), (&b, 2)], None), 1);
+        // k is in the cohort, so it votes; the commit then closes it.
+        assert_eq!(commit(&r, a.id, &[(&a, 1), (&b, 2), (&k, 3)], None), 1);
         assert_eq!(k.flag.get(), Some(WireCode::ProtocolError));
         assert!(!drain(&mut k).is_empty(), "the peer without a key has its error");
         drain(&mut a);

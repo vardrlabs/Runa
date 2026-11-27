@@ -27,15 +27,21 @@ fn cfg() -> runa_server::config::Config {
 }
 
 async fn spawn(cfg: runa_server::config::Config) -> String {
+    spawn_with_state(cfg).await.0
+}
+
+/// The server and its state, for a test that looks inside a room.
+async fn spawn_with_state(cfg: runa_server::config::Config) -> (String, runa_server::AppState) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = build_router(runa_server::AppState::new(cfg));
+    let state = runa_server::AppState::new(cfg);
+    let app = build_router(state.clone());
     tokio::spawn(async move {
         axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
             .await
             .unwrap();
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), state)
 }
 
 fn rand32() -> [u8; 32] {
@@ -290,7 +296,9 @@ fn named(m: &Member) -> Option<evict::Target> {
 /// What a commit asks for, and the key the new verifier is the hash of.
 struct Commit {
     request_id: [u8; 16],
-    epoch: u32,
+    /// The room's root epoch when the request was made: what every vote
+    /// signs. The commit's header carries the room's current epoch instead.
+    root: u32,
     target: Option<evict::Target>,
     verifier: [u8; 32],
     salt: [u8; 16],
@@ -299,11 +307,11 @@ struct Commit {
 }
 
 impl Commit {
-    fn new(epoch: u32, target: Option<evict::Target>) -> Commit {
+    fn new(root: u32, target: Option<evict::Target>) -> Commit {
         let new_auth = rand32();
         Commit {
             request_id: rand16(),
-            epoch,
+            root,
             target,
             verifier: verifier(&new_auth),
             salt: rand16(),
@@ -323,7 +331,7 @@ impl Commit {
         b.extend_from_slice(&self.config);
         b.push(voters.len() as u8);
         for (key, voter) in voters {
-            let msg = evict::statement(room, &self.request_id, self.epoch, self.target.as_ref(), voter, &self.verifier);
+            let msg = evict::statement(room, &self.request_id, self.root, self.target.as_ref(), voter, &self.verifier);
             b.extend_from_slice(voter);
             b.push(64);
             b.extend_from_slice(&key.sign(&msg, high_s));
@@ -484,7 +492,7 @@ async fn the_targets_other_connections_are_closed_and_do_not_hold_the_vote_down(
     let mut t0 = join(&s, &k, key.clone()).await;
     let mut t = join(&s, &k, key).await;
     let c = Commit::new(0, named(&t));
-    // Counted, t0 would make a's one signature half of two.
+    // Counted, t0 would have to vote too, and the target cannot.
     let body = c.body(&k.id, &[(&a.key, a.id)], false);
     propose_and_commit(&k, &mut a, 0, &body).await;
     assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
@@ -539,7 +547,7 @@ async fn a_voter_counts_once() {
 }
 
 #[tokio::test]
-async fn half_the_room_is_not_enough() {
+async fn one_of_three_others_is_not_enough() {
     let s = spawn(cfg()).await;
     let k = create(&s).await;
     let mut a = join(&s, &k, Signer::ed()).await;
@@ -618,7 +626,7 @@ async fn connections_opened_after_the_request_do_not_hold_the_vote_down() {
     // cohort is fixed.
     next_ft(&mut b.ws, 0x24).await;
     // The target opens three more connections with the old link. Counted,
-    // they would make two signatures out of five others too few.
+    // each of them would have to vote too.
     let mut extra = Vec::new();
     for _ in 0..3 {
         extra.push(join(&s, &k, Signer::ed()).await);
@@ -875,8 +883,8 @@ async fn a_vote_from_someone_no_longer_connected_is_refused() {
     // Wait until the room has seen b go.
     let left = next_ft(&mut a.ws, 0x08).await;
     assert_eq!(json_body(&left)["peer_id"], B64.encode(b_id));
-    // a and c alone are above half of the two others still here, so b's vote
-    // is the only thing wrong with this commit.
+    // a and c are everyone still here other than the target, so b's vote is
+    // the only thing wrong with this commit.
     let c = Commit::new(0, named(&t));
     let body = c.body(&k.id, &[(&a.key, a.id), (&b_key, b_id), (&c_member.key, c_member.id)], false);
     a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
@@ -886,8 +894,8 @@ async fn a_vote_from_someone_no_longer_connected_is_refused() {
     assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &without_b[..]);
 }
 
-/// Review M-1: one vote of two others is exactly half, which is not above
-/// half. A floor written with `>=` would take it.
+/// The server requires every member of the cohort, as each member's tab does
+/// (amendment K): one of two others is not enough.
 #[tokio::test]
 async fn one_vote_of_two_others_is_not_enough() {
     let s = spawn(cfg()).await;
@@ -903,4 +911,168 @@ async fn one_vote_of_two_others_is_not_enough() {
     let both = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
     a.ws.send(frame(&k.hex, 0x23, 0, &both)).await.unwrap();
     assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &both[..]);
+}
+
+/// Two of three others was a majority, which the server used to take. It now
+/// requires everyone the request was put to (S2).
+#[tokio::test]
+async fn two_votes_of_three_others_are_not_enough() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let c_member = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    let c = Commit::new(0, named(&t));
+    let two = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    propose_and_commit(&k, &mut a, 0, &two).await;
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "two votes of three others were taken");
+    let all = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id), (&c_member.key, c_member.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &all)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &all[..]);
+}
+
+/// A connection opened after the request passed is outside the cohort: its
+/// vote is refused even when everyone inside it voted too.
+#[tokio::test]
+async fn a_vote_from_outside_the_cohort_is_refused() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let mut b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
+    next_ft(&mut b.ws, 0x24).await;
+    let late = join(&s, &k, Signer::ed()).await;
+    let c = Commit::new(0, named(&t));
+    let with_late = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id), (&late.key, late.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &with_late)).await.unwrap();
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "a vote from outside the cohort was taken");
+    let cohort = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &cohort)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &cohort[..]);
+}
+
+/// A member of the cohort who has disconnected no longer has to vote.
+#[tokio::test]
+async fn a_member_who_has_left_is_no_longer_required() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let gone = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
+    let gone_id = gone.id;
+    drop(gone);
+    let left = next_ft(&mut a.ws, 0x08).await;
+    assert_eq!(json_body(&left)["peer_id"], B64.encode(gone_id));
+    let c = Commit::new(0, named(&t));
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
+}
+
+/// Review C1. The person being removed sees the vote start and steps the
+/// room's key. The votes name the room's root, which a step does not move,
+/// so the proposer sends the commit at the new epoch and it is applied.
+#[tokio::test]
+async fn a_step_during_the_vote_does_not_end_it() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let mut b = join(&s, &k, Signer::ed()).await;
+    let mut t = join(&s, &k, Signer::ed()).await;
+    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
+    next_ft(&mut t.ws, 0x24).await;
+    t.ws.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    next_ft(&mut a.ws, 0x20).await;
+    next_ft(&mut b.ws, 0x20).await;
+    let c = Commit::new(0, named(&t));
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 1, &body)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
+    assert_eq!(&next_ft(&mut b.ws, 0x23).await[48..], &body[..]);
+    assert_eq!(json_body(&next_ft(&mut t.ws, 0x30).await)["code"], 4014);
+    let ack = try_join(&s, &k.hex, c.new_auth).await.unwrap();
+    assert_eq!(ack["epoch"], 2);
+    assert_eq!(ack["root_epoch"], 2);
+}
+
+/// After a step, a commit whose header still names the epoch before it is
+/// dropped; the same votes under the new epoch's header are applied.
+#[tokio::test]
+async fn a_commit_whose_header_names_the_epoch_before_a_step_is_dropped() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let mut b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
+    next_ft(&mut b.ws, 0x24).await;
+    b.ws.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
+    next_ft(&mut a.ws, 0x20).await;
+    let c = Commit::new(0, named(&t));
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "a commit for the epoch the room left was applied");
+    a.ws.send(frame(&k.hex, 0x23, 1, &body)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
+}
+
+/// After a re-root, votes that name the root before it are refused, whatever
+/// epoch the header names. Votes that name the new root are applied after a
+/// step too.
+#[tokio::test]
+async fn votes_naming_a_root_the_room_has_left_are_refused() {
+    let s = spawn(runa_server::config::Config { epoch_min_interval: Duration::ZERO, ..cfg() }).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let mut b = join(&s, &k, Signer::ed()).await;
+    // A link change moves the room to epoch 1 and makes it the root.
+    let first = Commit::new(0, None);
+    let first_body = first.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    propose_and_commit(&k, &mut a, 0, &first_body).await;
+    next_ft(&mut a.ws, 0x23).await;
+    next_ft(&mut b.ws, 0x23).await;
+    // A step to epoch 2, then a new request at that epoch.
+    b.ws.send(frame(&k.hex, 0x20, 2, b"step")).await.unwrap();
+    next_ft(&mut a.ws, 0x20).await;
+    a.ws.send(frame(&k.hex, 0x24, 2, b"sealed request")).await.unwrap();
+    next_ft(&mut b.ws, 0x24).await;
+    let old_root = Commit::new(0, None);
+    a.ws.send(frame(&k.hex, 0x23, 2, &old_root.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false)))
+        .await
+        .unwrap();
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "votes naming the old root were taken");
+    let new_root = Commit::new(1, None);
+    let body = new_root.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 2, &body)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
+    let ack = try_join(&s, &k.hex, new_root.new_auth).await.unwrap();
+    assert_eq!((ack["epoch"].as_u64(), ack["root_epoch"].as_u64()), (Some(3), Some(3)));
+}
+
+/// Review I1. A member lists itself 32 times, each with a valid signature.
+/// The cheap checks refuse it before a single signature is verified. The
+/// count comes from the room, not from a clock.
+#[tokio::test]
+async fn a_commit_listing_one_voter_many_times_is_refused_before_any_signature_is_checked() {
+    let (s, state) = spawn_with_state(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::p256()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    let room = state.rooms.get(&k.id).expect("the room exists");
+    let c = Commit::new(0, named(&t));
+    let selves: Vec<(&Signer, [u8; 16])> = (0..32).map(|_| (&a.key, a.id)).collect();
+    let repeated = c.body(&k.id, &selves, false);
+    propose_and_commit(&k, &mut a, 0, &repeated).await;
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "the repeated voter was taken");
+    assert_eq!(room.vote_checks(), 0, "signatures were verified for a commit the cheap checks refuse");
+    // The control: an honest commit is verified, one signature per voter.
+    let honest = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &honest)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &honest[..]);
+    assert_eq!(room.vote_checks(), 2);
 }

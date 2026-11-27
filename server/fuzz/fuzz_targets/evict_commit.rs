@@ -33,9 +33,9 @@ fuzz_target!(|data: &[u8]| {
     // valid P-256 key above. The first few votes are enough to cover the
     // paths, and keep each run quick.
     let room_id = c.new_salt;
-    let epoch = u32::from_be_bytes([c.new_verifier[0], c.new_verifier[1], c.new_verifier[2], c.new_verifier[3]]);
+    let root = u32::from_be_bytes([c.new_verifier[0], c.new_verifier[1], c.new_verifier[2], c.new_verifier[3]]);
     for v in c.votes.iter().take(4) {
-        let msg = statement(&room_id, &c.request_id, epoch, c.target.as_ref(), &v.voter, &c.new_verifier);
+        let msg = statement(&room_id, &c.request_id, root, c.target.as_ref(), &v.voter, &c.new_verifier);
         assert_eq!(msg.len(), 145);
         let mut p256 = [0x04u8; 65];
         p256[1..].copy_from_slice(&v.sig);

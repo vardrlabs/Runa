@@ -275,6 +275,7 @@ mod tests {
         let verifier = crate::heimdall::verifier::hash_auth_key(&[7u8; 32]);
         let rr = crate::runar::room::ReRoot {
             at_epoch: 0,
+            root: 0,
             target: None,
             voters: vec![(a, vec![1u8; 32])],
             verifier,

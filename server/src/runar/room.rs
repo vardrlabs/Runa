@@ -311,8 +311,14 @@ struct Epochs {
     /// target, say) cannot move the cohort of a vote already open. Under this
     /// lock because `commit_eviction` reads it beside the epoch, and lock
     /// order stays `epochs`, then `peers`. Only connected senders are kept
-    /// (`note_evict_request_at`).
+    /// (`note_evict_request_at`). A step leaves these alone and a re-root
+    /// clears them: a vote names the room's root, so it survives a step.
     evict_opened: std::collections::HashMap<[u8; 16], (Instant, u64)>,
+    /// Set once a restart ticket has been issued for the room. A ticket
+    /// holds the room's epoch and way in as they were then, so from then on
+    /// neither a step nor a commit may move them: the room the ticket brings
+    /// back must still open with the key its members hold.
+    handed_over: bool,
 }
 
 /// How long a recorded EVICT_REQUEST decides a commit's cohort: the longest
@@ -348,8 +354,12 @@ pub struct AccessView {
 /// An EVICT_COMMIT whose signatures have been checked against the signing
 /// key each voter joined with (amendment K).
 pub struct ReRoot {
-    /// The epoch the votes were signed for: the commit's header epoch.
+    /// The commit's header epoch: the room's current epoch when the commit
+    /// was sent. The new root is the epoch after it.
     pub at_epoch: u32,
+    /// The room's root epoch the votes name. A step does not move it, so a
+    /// vote survives a step; a re-root does, so no vote is used twice.
+    pub root: u32,
     /// The named connection and the digest of the signing key the votes
     /// name for it; None for a link change.
     pub target: Option<Target>,
@@ -403,6 +413,10 @@ pub struct Room {
     /// the next peer would have had then. Everyone who joined before it could
     /// have seen the request; nobody who joined after it could.
     shred_opened: Mutex<Option<(Instant, u64)>>,
+    /// How many EVICT_COMMIT vote signatures have been verified for this
+    /// room. Only counted, so a test can show that a commit the cheap checks
+    /// refuse costs no signature work at all.
+    vote_checks: AtomicU64,
 }
 
 /// Acks for one request id, with the instant they were first seen so the
@@ -452,6 +466,57 @@ pub const MAX_TTL_EXTENSION_SECS: u64 = 720 * 3600;
 /// stale before it acts: either the frame is handled before the commit, or
 /// it is dropped. The flag is checked as well as the list so the rule holds
 /// for any code path that sets the flag without removing the peer.
+/// Every rule a commit must pass, read under the `epochs` and `peers` guards
+/// the caller holds (amendment K). `root` is the root the votes were checked
+/// against, or None before any signature has been verified. The cheap rules
+/// come first; `decide` checks the voters against the sender's cohort.
+#[allow(clippy::too_many_arguments)]
+fn check_commit(
+    epochs: &Epochs,
+    peers: &[ConnectedPeer],
+    header_epoch: u32,
+    root: Option<u32>,
+    target: Option<Target>,
+    voters: &[([u8; 16], Vec<u8>)],
+    sender: [u8; 16],
+    now: Instant,
+) -> Result<(), Refusal> {
+    if epochs.handed_over {
+        return Err(Refusal::HandedOver);
+    }
+    if epochs.state.epoch() != header_epoch {
+        return Err(Refusal::WrongEpoch);
+    }
+    if root.is_some_and(|r| r != epochs.state.root_epoch()) {
+        return Err(Refusal::WrongRoot);
+    }
+    // Only someone who approved may send the commit. The person being
+    // removed, or anyone who arrived during the vote, sees every vote go by
+    // and could otherwise send one with no wraps, moving the room to a way
+    // in nobody was given.
+    if !voters.iter().any(|(v, _)| *v == sender) {
+        return Err(Refusal::SenderNotVoter);
+    }
+    // The cohort: who was in the room when this sender's request was
+    // relayed. Connections opened after it neither vote nor are waited for.
+    let Some(since) = epochs
+        .evict_opened
+        .get(&sender)
+        .filter(|(at, _)| now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW)
+        .map(|(_, seq)| *seq)
+    else {
+        return Err(Refusal::NoOpenRequest);
+    };
+    // A connection being closed is not in the cohort, cannot vote and so
+    // cannot send a commit (the sender is a voter, checked above).
+    let views: Vec<PeerView<'_>> = peers
+        .iter()
+        .filter(|p| p.tx.close.get().is_none())
+        .map(|p| PeerView { peer_id: p.peer_id, pubkey: p.pubkey.as_deref(), joined_at_seq: p.joined_at_seq })
+        .collect();
+    decide(target, voters, &views, since)
+}
+
 fn live<'a>(peers: &'a [ConnectedPeer], id: &[u8; 16]) -> Option<&'a ConnectedPeer> {
     peers.iter().find(|p| p.peer_id == *id && p.tx.close.get().is_none())
 }
@@ -538,6 +603,7 @@ impl Room {
                     generation: 0,
                 },
                 evict_opened: std::collections::HashMap::new(),
+                handed_over: false,
             }),
             ttl_extension_secs: AtomicU64::new(0),
             log_id: {
@@ -548,6 +614,7 @@ impl Room {
             auth_guard: AuthGuard::new(auth_max_per_min),
             purge_acks: Mutex::new(std::collections::HashMap::new()),
             shred_opened: Mutex::new(None),
+            vote_checks: AtomicU64::new(0),
         }
     }
 
@@ -569,10 +636,28 @@ impl Room {
 
     /// The room's way in with its verifier, read under one lock, for a
     /// restart ticket. The verifier copy is zeroed when dropped.
+    ///
+    /// Under the same lock, the room stops moving: `step_epoch` and
+    /// `commit_eviction` refuse from now on. The ticket is sent to each
+    /// member over up to two seconds, and a commit in that time would leave
+    /// the members holding a ticket that brings the room back with the old
+    /// way in, refusing the new key they hold. Lock order: this takes
+    /// `epochs` alone, as the first lock of a step or a commit.
     pub fn ticket_access(&self) -> (AccessView, Option<zeroize::Zeroizing<[u8; 32]>>) {
-        let epochs = self.epochs.lock().unwrap();
+        let mut epochs = self.epochs.lock().unwrap();
+        epochs.handed_over = true;
         let verifier = epochs.access.verifier.as_ref().map(|v| zeroize::Zeroizing::new(*v.expose_secret()));
         (epochs.view(), verifier)
+    }
+
+    /// Note that one vote signature is about to be verified for this room.
+    pub fn count_vote_check(&self) {
+        self.vote_checks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// How many vote signatures have been verified for this room.
+    pub fn vote_checks(&self) -> u64 {
+        self.vote_checks.load(Ordering::Relaxed)
     }
 
     /// An EVICT_REQUEST from `sender` is being relayed (amendment K). Remember
@@ -771,7 +856,8 @@ impl Room {
     /// * `Handover`: every peer except the sender gets it, enveloped.
     /// * `Refused`: nothing is sent. So it is for a sender that is no longer
     ///   in the list or is being closed (see `live`): it is checked under the
-    ///   same guard as the decision, before the epoch can move.
+    ///   same guard as the decision, before the epoch can move. So it is too
+    ///   once a restart ticket has been issued (`ticket_access`).
     ///
     /// Peers closed with 4005, and any peer whose queue is full, are out of
     /// the list before the guard drops, so none of them stays in the roster,
@@ -787,7 +873,7 @@ impl Room {
     ) -> Offer {
         let mut epochs = self.epochs.lock().unwrap();
         let mut peers = self.peers.lock().unwrap();
-        if live(&peers, &sender).is_none() {
+        if live(&peers, &sender).is_none() || epochs.handed_over {
             return Offer::Refused;
         }
         let offer = epochs.state.offer(header_epoch, now, min_interval);
@@ -814,24 +900,56 @@ impl Room {
         offer
     }
 
+    /// The checks an EVICT_COMMIT can fail before any of its signatures is
+    /// verified (review I1), made under the room's locks: the room has not
+    /// been handed over; the header names the room's epoch; the sender is a
+    /// voter; the sender has a request on record; and the voters are distinct
+    /// and exactly that request's cohort. Returns the room's root epoch,
+    /// which every vote must name, and each voter with the signing key it
+    /// joined with, in the commit's order, for the signatures to be checked
+    /// against. `commit_eviction` makes every check again under its own
+    /// locks, so nothing read here is acted on after they are released.
+    ///
+    /// Lock order is `epochs`, then `peers`.
+    #[allow(clippy::type_complexity)]
+    pub fn admit_commit(
+        &self,
+        header_epoch: u32,
+        target: Option<Target>,
+        voter_ids: &[[u8; 16]],
+        sender: [u8; 16],
+        now: Instant,
+    ) -> Result<(u32, Vec<([u8; 16], Vec<u8>)>), Refusal> {
+        let epochs = self.epochs.lock().unwrap();
+        let peers = self.peers.lock().unwrap();
+        // A voter that is not connected, or holds no signing key, gets an
+        // empty key here, which `decide` refuses as absent or changed.
+        let voters: Vec<([u8; 16], Vec<u8>)> = voter_ids
+            .iter()
+            .map(|id| (*id, live(&peers, id).and_then(|p| p.pubkey.clone()).unwrap_or_default()))
+            .collect();
+        check_commit(&epochs, &peers, header_epoch, None, target, &voters, sender, now)?;
+        Ok((epochs.state.root_epoch(), voters))
+    }
+
     /// Apply an EVICT_COMMIT whose signatures have been checked, in one
     /// critical section with the decision (amendment K).
     ///
     /// Same lock order and the same shape as `step_epoch`: the room decides
-    /// against its epoch, the sender's recorded request and the peers
-    /// connected right now, and on success
-    /// swaps the way in, moves to a new root and queues everything before
-    /// either lock is released, so a step or a second commit for the same
-    /// epoch is decided after this one and reaches every peer after it. The
-    /// fan-out is `try_send`, so nothing awaits under the locks.
+    /// against its epoch, its root, the sender's recorded request and the
+    /// peers connected right now, and on success swaps the way in, moves to
+    /// a new root and queues everything before either lock is released, so a
+    /// step or a second commit for the same epoch is decided after this one
+    /// and reaches every peer after it. The fan-out is `try_send`, so nothing
+    /// awaits under the locks.
     ///
     /// On success every connection of the target's (the named one, if it is
-    /// still connected, and every other holding the key the votes name) gets
-    /// `evicted_error` and is closed with 4014 (a target that has gone does
-    /// not stop the commit: controller's decision 3), peers without a
-    /// key-agreement key get `kx_less_error` and are closed
-    /// with 4005, and every other peer, the sender included, gets the commit
-    /// with the sender envelope. Returns the new epoch.
+    /// still connected, and every other holding the key the votes name) is
+    /// queued `evicted_error` and closed with 4014 (a target that has gone
+    /// does not stop the commit: controller's decision 3), peers without a
+    /// key-agreement key are queued `kx_less_error` and closed with 4005, and
+    /// every other peer, the sender included, gets the commit with the sender
+    /// envelope. Returns the new epoch.
     pub fn commit_eviction(
         &self,
         r: &ReRoot,
@@ -842,77 +960,48 @@ impl Room {
         kx_less_error: &Bytes,
     ) -> Result<u32, Refusal> {
         let mut epochs = self.epochs.lock().unwrap();
-        if epochs.state.epoch() != r.at_epoch {
-            return Err(Refusal::WrongEpoch);
+        let mut peers = self.peers.lock().unwrap();
+        check_commit(&epochs, &peers, r.at_epoch, Some(r.root), r.target, &r.voters, sender, now)?;
+        if !epochs.state.reroot(r.at_epoch, now) {
+            return Err(Refusal::LastEpoch);
         }
-        // Only someone who approved may send the commit. The person being
-        // removed, or anyone who arrived during the vote, sees every vote go
-        // by and could otherwise send one with no wraps, moving the room to a
-        // way in nobody was given.
-        if !r.voters.iter().any(|(v, _)| *v == sender) {
-            return Err(Refusal::SenderNotVoter);
-        }
-        // The cohort: who was in the room when this sender's request was
-        // relayed. Connections opened after it can neither vote nor hold the
-        // floor down.
-        let Some(since) = epochs
-            .evict_opened
-            .get(&sender)
-            .filter(|(at, _)| now.saturating_duration_since(*at) < EVICT_REQUEST_WINDOW)
-            .map(|(_, seq)| *seq)
-        else {
-            return Err(Refusal::NoOpenRequest);
+        // Every open request named the root just left.
+        epochs.evict_opened.clear();
+        let generation = epochs.access.generation + 1;
+        epochs.access = Access {
+            verifier: Some(Secret::new(Box::new(r.verifier))),
+            salt: r.salt,
+            config_blob: r.config_blob.clone(),
+            generation,
         };
+        let outbound = envelop(frame, sender);
         let mut dead = Vec::new();
-        {
-            let mut peers = self.peers.lock().unwrap();
-            // A connection being closed is not counted, cannot vote and so
-            // cannot send a commit (the sender is a voter, checked above).
-            let views: Vec<PeerView<'_>> = peers
-                .iter()
-                .filter(|p| p.tx.close.get().is_none())
-                .map(|p| PeerView { peer_id: p.peer_id, pubkey: p.pubkey.as_deref(), joined_at_seq: p.joined_at_seq })
-                .collect();
-            decide(r.target, &r.voters, &views, since)?;
-            drop(views);
-            if !epochs.state.reroot(r.at_epoch, now) {
-                return Err(Refusal::LastEpoch);
+        for p in peers.iter() {
+            if r.target.is_some_and(|t| t.covers(&p.peer_id, p.pubkey.as_deref())) {
+                // Out of the room's list before either lock drops, sent or
+                // not: a connection waiting on its writer to drain must not
+                // stay in the roster, count toward `max_peers`, sit in a
+                // purge cohort or the next vote's cohort, or be found by a
+                // frame of its own still being processed. Dropping the room's
+                // `PeerTx` leaves the error queued if it could be queued, and
+                // the writer then sends it and closes with 4014. If the
+                // target's queue was full, the connection ends without it.
+                let _ = p.tx.send_final_error(evicted_error.clone(), WireCode::Evicted);
+                dead.push(p.peer_id);
+                continue;
             }
-            // Every open request named the epoch just left.
-            epochs.evict_opened.clear();
-            let generation = epochs.access.generation + 1;
-            epochs.access = Access {
-                verifier: Some(Secret::new(Box::new(r.verifier))),
-                salt: r.salt,
-                config_blob: r.config_blob.clone(),
-                generation,
-            };
-            let outbound = envelop(frame, sender);
-            for p in peers.iter() {
-                if r.target.is_some_and(|t| t.covers(&p.peer_id, p.pubkey.as_deref())) {
-                    // Out of the room's list before either lock drops, sent
-                    // or not: a connection waiting on its writer to drain must
-                    // not stay in the roster, count toward `max_peers`, sit in
-                    // a purge cohort, hold the next vote's floor down, or be
-                    // found by a frame of its own still being processed.
-                    // Dropping the room's `PeerTx` leaves the error queued, and
-                    // the writer still sends it and closes with 4014.
-                    let _ = p.tx.send_final_error(evicted_error.clone(), WireCode::Evicted);
-                    dead.push(p.peer_id);
-                    continue;
-                }
-                // The same for a peer that cannot be handed the new key: it
-                // is closed with 4005 and leaves the list now.
-                if p.kx.is_none() {
-                    let _ = p.tx.send_final_error(kx_less_error.clone(), WireCode::ProtocolError);
-                    dead.push(p.peer_id);
-                }
-                if p.tx.try_send(outbound.clone()).is_err() {
-                    dead.push(p.peer_id);
-                }
+            // The same for a peer that cannot be handed the new key: it is
+            // closed with 4005, leaves the list now, and gets no commit.
+            if p.kx.is_none() {
+                let _ = p.tx.send_final_error(kx_less_error.clone(), WireCode::ProtocolError);
+                dead.push(p.peer_id);
+                continue;
             }
-            self.drop_listed(&mut peers, &dead);
+            if p.tx.try_send(outbound.clone()).is_err() {
+                dead.push(p.peer_id);
+            }
         }
+        self.drop_listed(&mut peers, &dead);
         Ok(epochs.state.epoch())
     }
 
@@ -2187,9 +2276,12 @@ mod evict_tests {
         Some(Target { peer_id: id, key_digest: key_digest(&key(n)) })
     }
 
+    /// A commit at header epoch `at` whose votes name `at` as the root: the
+    /// shape of a commit in a room that has not stepped since its last root.
     fn reroot(at: u32, target: Option<Target>, voters: &[(&Member, u8)]) -> ReRoot {
         ReRoot {
             at_epoch: at,
+            root: at,
             target,
             voters: voters.iter().map(|(m, n)| (m.id, key(*n))).collect(),
             verifier: hash_auth_key(&NEW_AUTH),
@@ -2247,8 +2339,11 @@ mod evict_tests {
         let mut old = member(&r, 3, false);
         r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0xC0u8; 40]);
-        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        // It is in the cohort, so it votes too.
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2), (&old, 3)]), &frame, a.id), Ok(1));
         assert_eq!(&old.rx.recv().await.unwrap()[..], ERR_KX_LESS);
+        // Review M7: the error is the last thing it is sent, not the commit.
+        assert!(old.rx.try_recv().is_err(), "a peer closed with 4005 was sent the commit");
         assert_eq!(old.flag.get(), Some(WireCode::ProtocolError));
         assert_eq!(a.flag.get(), None);
     }
@@ -2262,12 +2357,12 @@ mod evict_tests {
         let t = member(&r, 4, true);
         r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0u8; 40]);
-        assert_eq!(commit(&r, &reroot(0, target(t.id, 4), &[(&a, 1)]), &frame, a.id), Err(Refusal::BelowFloor));
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 4), &[(&a, 1)]), &frame, a.id), Err(Refusal::MissingVoter));
         let all = [(&a, 1), (&b, 2), (&c, 3)];
         assert_eq!(commit(&r, &reroot(1, target(t.id, 4), &all), &frame, a.id), Err(Refusal::WrongEpoch));
         // A target that has gone, with nobody holding its key, leaves all
-        // four connected in the floor, so two signatures are not enough.
-        assert_eq!(commit(&r, &reroot(0, target([9; 16], 9), &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::BelowFloor));
+        // four connected in the cohort, so t would have to vote too.
+        assert_eq!(commit(&r, &reroot(0, target([9; 16], 9), &all), &frame, a.id), Err(Refusal::MissingVoter));
         assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
         assert_eq!(r.check_auth(&OLD_AUTH), Some(0));
         assert_eq!(t.flag.get(), None);
@@ -2340,7 +2435,7 @@ mod evict_tests {
         let _early = (member(&r, 4, true), member(&r, 5, true));
         r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0u8; 40]);
-        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::BelowFloor));
+        assert_eq!(commit(&r, &reroot(0, target(t.id, 3), &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::MissingVoter));
         assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
     }
 
@@ -2348,7 +2443,7 @@ mod evict_tests {
     async fn every_connection_holding_the_targets_key_is_closed_and_none_holds_the_floor_down() {
         // A room of two people: a, and the target with two connections under
         // one key, the older one opened first. Counted, the older one would
-        // make a's one signature half of two.
+        // have to vote, and the target cannot.
         let r = room();
         let mut a = member(&r, 1, true);
         let mut t0 = member(&r, 3, true);
@@ -2508,8 +2603,7 @@ mod evict_tests {
     #[test]
     fn a_second_eviction_right_after_the_first_is_not_held_down_by_the_first_target() {
         // A, B and T. T is removed, and before its connection has read its
-        // error A asks to remove B. Counted, T would make A's one signature
-        // half of two.
+        // error A asks to remove B. Counted, T would have to vote too.
         let r = room();
         let a = member(&r, 1, true);
         let b = member(&r, 2, true);
@@ -2634,15 +2728,15 @@ mod evict_tests {
     }
 
     /// Rereview item (a): a peer without a key-agreement key that a step
-    /// closes with 4005 is out of the list at once, so it does not hold the
-    /// next vote's floor down. With it counted, two of four others is not
-    /// above half and the commit would be refused.
+    /// closes with 4005 is out of the list at once, so it is not in the next
+    /// vote's cohort. With it counted, it would have to vote too and the
+    /// commit would be refused.
     #[test]
-    fn a_peer_a_step_closes_with_4005_does_not_count_in_the_next_floor() {
+    fn a_peer_a_step_closes_with_4005_does_not_count_in_the_next_cohort() {
         let r = room();
         let a = member(&r, 1, true);
         let b = member(&r, 2, true);
-        let _c = member(&r, 3, true);
+        let c = member(&r, 3, true);
         let k = member(&r, 4, false);
         let step = Bytes::from(vec![0u8; 40]);
         assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, a.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
@@ -2650,13 +2744,15 @@ mod evict_tests {
         assert!(!r.roster().iter().any(|p| p.peer_id == k.id));
         r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0u8; 40]);
-        assert_eq!(commit(&r, &reroot(1, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(2));
+        // The step moved the epoch and left the root where it was.
+        let rr = ReRoot { root: 0, ..reroot(1, None, &[(&a, 1), (&b, 2), (&c, 3)]) };
+        assert_eq!(commit(&r, &rr, &frame, a.id), Ok(2));
     }
 
     /// The same at the commit's own 4005 site: the first commit closes the
-    /// peer without a key, and the second is counted without it.
+    /// peer without a key, and the second is decided without it.
     #[test]
-    fn a_peer_a_commit_closes_with_4005_does_not_count_in_the_next_floor() {
+    fn a_peer_a_commit_closes_with_4005_does_not_count_in_the_next_cohort() {
         let r = room();
         let a = member(&r, 1, true);
         let b = member(&r, 2, true);
@@ -2664,10 +2760,136 @@ mod evict_tests {
         let k = member(&r, 4, false);
         r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0u8; 40]);
-        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2), (&c, 3)]), &frame, a.id), Ok(1));
+        // k is in the first cohort, so it votes; the commit then closes it.
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2), (&c, 3), (&k, 4)]), &frame, a.id), Ok(1));
         assert_eq!(k.flag.get(), Some(WireCode::ProtocolError));
         assert!(!r.roster().iter().any(|p| p.peer_id == k.id));
         r.note_evict_request(a.id);
+        assert_eq!(commit(&r, &reroot(1, None, &[(&a, 1), (&b, 2), (&c, 3)]), &frame, a.id), Ok(2));
+    }
+
+    /// Review C1 and S1: the person being removed steps the room's key while
+    /// the vote is open. A step does not move the root the votes name, and
+    /// does not clear the sender's request, so the commit sent at the new
+    /// epoch is applied.
+    #[tokio::test]
+    async fn a_step_between_the_votes_and_the_commit_does_not_end_the_vote() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        r.note_evict_request(a.id);
+        let step = Bytes::from(vec![0x57u8; 32]);
+        assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, t.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        let rr = ReRoot { root: 0, ..reroot(1, target(t.id, 3), &[(&a, 1), (&b, 2)]) };
+        assert_eq!(commit(&r, &rr, &frame, a.id), Ok(2));
+        assert_eq!((r.epoch(), r.root_epoch()), (2, 2));
+        assert_eq!(t.flag.get(), Some(WireCode::Evicted));
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0xC0);
+    }
+
+    #[test]
+    fn a_commit_whose_header_names_the_epoch_before_a_step_is_dropped() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        r.note_evict_request(a.id);
+        let step = Bytes::from(vec![0x57u8; 32]);
+        assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, b.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
+        let frame = Bytes::from(vec![0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::WrongEpoch));
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
+    }
+
+    #[test]
+    fn votes_naming_a_root_the_room_has_left_are_refused() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let frame = Bytes::from(vec![0u8; 40]);
+        r.note_evict_request(a.id);
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(1));
+        r.note_evict_request(a.id);
+        let old_root = ReRoot { root: 0, ..reroot(1, None, &[(&a, 1), (&b, 2)]) };
+        assert_eq!(commit(&r, &old_root, &frame, a.id), Err(Refusal::WrongRoot));
+        assert_eq!((r.epoch(), r.root_epoch()), (1, 1));
         assert_eq!(commit(&r, &reroot(1, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Ok(2));
+    }
+
+    /// The cheap checks run before any signature, and give the root the
+    /// votes must name and each voter's key in the commit's order.
+    #[test]
+    fn a_commit_is_admitted_for_its_signatures_only_after_the_cheap_checks() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let now = Instant::now();
+        let tg = target(t.id, 3);
+        assert_eq!(r.admit_commit(0, tg, &[a.id, b.id], a.id, now), Err(Refusal::NoOpenRequest));
+        r.note_evict_request(a.id);
+        assert_eq!(r.admit_commit(1, tg, &[a.id, b.id], a.id, now), Err(Refusal::WrongEpoch));
+        assert_eq!(r.admit_commit(0, tg, &[b.id], t.id, now), Err(Refusal::SenderNotVoter));
+        assert_eq!(r.admit_commit(0, tg, &[a.id; 32], a.id, now), Err(Refusal::DuplicateVoter));
+        assert_eq!(r.admit_commit(0, tg, &[a.id], a.id, now), Err(Refusal::MissingVoter));
+        assert_eq!(r.admit_commit(0, tg, &[a.id, [0xEE; 16]], a.id, now), Err(Refusal::VoterAbsent));
+        assert_eq!(r.admit_commit(0, tg, &[b.id, a.id], a.id, now), Ok((0, vec![(b.id, key(2)), (a.id, key(1))])));
+    }
+
+    /// Review M4: once a restart ticket has been read, neither a step nor a
+    /// commit moves the room, so the ticket still brings back the room its
+    /// members hold the key to.
+    #[test]
+    fn once_a_ticket_has_been_issued_the_room_no_longer_moves() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        r.note_evict_request(a.id);
+        let (view, _) = r.ticket_access();
+        assert_eq!((view.epoch, view.root_epoch), (0, 0));
+        let step = Bytes::from(vec![0u8; 40]);
+        assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, b.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Refused);
+        let frame = Bytes::from(vec![0u8; 40]);
+        assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::HandedOver));
+        assert_eq!(r.admit_commit(0, None, &[a.id, b.id], a.id, Instant::now()), Err(Refusal::HandedOver));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!(r.check_auth(&OLD_AUTH), Some(0));
+    }
+
+    /// Review M8: a room brought back at the last epoch cannot re-root.
+    #[test]
+    fn a_room_at_the_last_epoch_refuses_a_commit() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        r.restore_epochs(u32::MAX, u32::MAX);
+        r.note_evict_request(a.id);
+        let frame = Bytes::from(vec![0u8; 40]);
+        assert_eq!(commit(&r, &reroot(u32::MAX, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::LastEpoch));
+        assert_eq!((r.epoch(), r.root_epoch()), (u32::MAX, u32::MAX));
+        assert_eq!(r.check_auth(&OLD_AUTH), Some(0), "the way in did not change");
+        assert_eq!((a.flag.get(), b.flag.get()), (None, None));
+    }
+
+    /// Review M8: 4014 reads back as Evicted, any other code as a protocol
+    /// error, and the first code set stays.
+    #[test]
+    fn a_close_flag_keeps_its_first_code() {
+        let f = CloseFlag::default();
+        assert_eq!(f.get(), None);
+        f.set(WireCode::Evicted);
+        assert_eq!(f.get(), Some(WireCode::Evicted));
+        f.set(WireCode::ProtocolError);
+        assert_eq!(f.get(), Some(WireCode::Evicted), "the first code stays");
+        let g = CloseFlag::default();
+        g.set(WireCode::ProtocolError);
+        g.set(WireCode::Evicted);
+        assert_eq!(g.get(), Some(WireCode::ProtocolError));
+        let h = CloseFlag::default();
+        h.set(WireCode::RateLimited);
+        assert_eq!(h.get(), Some(WireCode::ProtocolError), "any other code is read as a protocol error");
     }
 }

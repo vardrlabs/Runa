@@ -79,8 +79,14 @@ pub enum ParseError {
 /// Why the room refused a commit. Every refusal is silent on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The votes were signed for an epoch the room is not at.
+    /// The commit's header names an epoch the room is not at.
     WrongEpoch,
+    /// The votes name a root the room is not at: they were made before a
+    /// re-root, so they cannot move the room again.
+    WrongRoot,
+    /// The room's restart tickets are being handed out, and a ticket already
+    /// issued holds the way in it has now. The room no longer moves.
+    HandedOver,
     /// The room is at `u32::MAX` and cannot move.
     LastEpoch,
     /// The commit's sender is not one of its voters. Checked by the room,
@@ -107,7 +113,10 @@ pub enum Refusal {
     /// The voter joined after the request was relayed, so it was not one of
     /// the people the request was put to.
     VoterAfterRequest,
-    BelowFloor,
+    /// A member of the cohort did not vote: someone connected now, connected
+    /// before the request passed, and not the target. The server requires
+    /// everyone the request was put to, as every member's tab does.
+    MissingVoter,
 }
 
 /// A connected peer as the decision sees it.
@@ -201,18 +210,19 @@ pub fn encode_clear(c: &CommitClear<'_>) -> Vec<u8> {
 }
 
 /// What every vote signs:
-/// `"runa/v1/evict" || room_id || request_id || epoch (u32 BE) || target
+/// `"runa/v1/evict" || room_id || request_id || root (u32 BE) || target
 /// peer id || target key digest || voter || new_verifier`, with the target's
 /// two fields all zero for a link change.
 ///
 /// The new verifier is inside it, so a commit cannot swap in a different way
-/// into the room after people voted; the epoch is, so a vote cannot be
-/// replayed after any rotation; and the target's key digest is, so the
+/// into the room after people voted. The room's root epoch is, so a vote
+/// cannot be replayed after any re-root; a step does not move the root, so a
+/// step during a vote does not end it. The target's key digest is, so the
 /// server can recognise every connection the target holds.
 pub fn statement(
     room_id: &[u8; 16],
     request_id: &[u8; 16],
-    epoch: u32,
+    root: u32,
     target: Option<&Target>,
     voter: &[u8; 16],
     new_verifier: &[u8; 32],
@@ -221,7 +231,7 @@ pub fn statement(
     m.extend_from_slice(STATEMENT_DOMAIN);
     m.extend_from_slice(room_id);
     m.extend_from_slice(request_id);
-    m.extend_from_slice(&epoch.to_be_bytes());
+    m.extend_from_slice(&root.to_be_bytes());
     m.extend_from_slice(target.map_or(&NO_PEER, |t| &t.peer_id));
     m.extend_from_slice(target.map_or(&NO_KEY, |t| &t.key_digest));
     m.extend_from_slice(voter);
@@ -260,18 +270,20 @@ pub fn verify_vote(pubkey: &[u8], message: &[u8], sig: &[u8; SIG_LEN]) -> bool {
     }
 }
 
-/// The room's rules for a commit whose signatures have already been checked
-/// against `voters`' keys. `peers` is everyone connected, read under the same
-/// lock that applies the result.
+/// The room's rules for a commit's voters, checked against `voters`' keys.
+/// `peers` is everyone connected, read under the lock that applies the
+/// result. The server runs this once before any signature is verified, with
+/// each voter's key read from `peers`, and again under its locks with the
+/// keys the signatures were checked against.
 ///
-/// Only the cohort counts: peers that joined before the sender's request was
+/// The cohort is the peers that joined before the sender's request was
 /// relayed (`joined_at_seq < since`), as amendment A's purge cohort does for
-/// a shred. Connections opened after a vote started can neither vote nor
-/// hold the floor down. The target is every connection `Target::covers`: the
-/// named one and any other holding the signing key the votes name. None of
-/// them may vote, and none counts toward the floor, which is more than half
-/// of the rest of the cohort. A target with no connection left leaves the
-/// whole cohort in the floor.
+/// a shred, without the target. The target is every connection
+/// `Target::covers`: the named one and any other holding the signing key the
+/// votes name. None of them may vote. The voters must be exactly the cohort:
+/// each of them, and nobody else. Connections opened after a vote started
+/// cannot vote and are not waited for, and a cohort member that has
+/// disconnected is no longer in `peers`, so it is not waited for either.
 pub fn decide(
     target: Option<Target>,
     voters: &[([u8; 16], Vec<u8>)],
@@ -310,12 +322,14 @@ pub fn decide(
             return Err(Refusal::VoterAfterRequest);
         }
     }
-    let others = peers
+    // Every voter is in the cohort and they are distinct, so the voters are
+    // the whole cohort exactly when every cohort member is among them.
+    let everyone = peers
         .iter()
         .filter(|p| p.joined_at_seq < since && !target.is_some_and(|t| t.covers(&p.peer_id, p.pubkey)))
-        .count();
-    if voters.len() * 2 <= others {
-        return Err(Refusal::BelowFloor);
+        .all(|p| seen.contains(&p.peer_id));
+    if !everyone {
+        return Err(Refusal::MissingVoter);
     }
     Ok(())
 }
@@ -550,8 +564,8 @@ mod tests {
         let p = room(&keys);
         // Of the cohort {1, 2, 3}, the target 3 is left out: 1 and 2 are all.
         assert_eq!(decide(t(3), &[v(1), v(2)], &p, 4), Ok(()));
-        // Counted against all five, two of four others would not be enough.
-        assert_eq!(decide(t(3), &[v(1), v(2)], &p, ALL), Err(Refusal::BelowFloor));
+        // Counted against all five, 4 and 5 would have to vote too.
+        assert_eq!(decide(t(3), &[v(1), v(2)], &p, ALL), Err(Refusal::MissingVoter));
         // A late arrival's signature does not count, so it cannot pad the vote.
         assert_eq!(decide(t(3), &[v(1), v(4)], &p, 4), Err(Refusal::VoterAfterRequest));
     }
@@ -565,16 +579,16 @@ mod tests {
         assert_eq!(decide(t(4), &[v(1), v(1), v(2)], &p, ALL), Err(Refusal::DuplicateVoter));
         assert_eq!(decide(t(4), &[v(1), v(9)], &p, ALL), Err(Refusal::VoterAbsent));
         assert_eq!(decide(t(4), &[v(1), ([2; 16], vec![7; 32])], &p, ALL), Err(Refusal::VoterKeyChanged));
-        // Three others; one signature is not more than half of them.
-        assert_eq!(decide(t(4), &[v(1)], &p, ALL), Err(Refusal::BelowFloor));
-        assert_eq!(decide(t(4), &[v(1), v(2)], &p, ALL), Ok(()));
+        // Three others, and each of them must vote.
+        assert_eq!(decide(t(4), &[v(1), v(2)], &p, ALL), Err(Refusal::MissingVoter));
+        assert_eq!(decide(t(4), &[v(1), v(2), v(3)], &p, ALL), Ok(()));
     }
 
     #[test]
     fn the_targets_older_connection_does_not_hold_the_floor_down() {
         // A room of two: A, and the target T (peer 3), which also left an
         // older connection T0 (peer 2) open under the same signing key. T0 is
-        // in the cohort, but it is the target too, so A alone is the floor.
+        // in the cohort, but it is the target too, so A alone is everyone.
         let keys = vec![vec![1u8; 32], vec![3u8; 32], vec![3u8; 32]];
         let p = room(&keys);
         assert_eq!(decide(t(3), &[v(1)], &p, ALL), Ok(()));
@@ -599,7 +613,7 @@ mod tests {
         let keys = vec![vec![1u8; 32], vec![3u8; 32]];
         let p = room(&keys);
         let gone = Some(Target { peer_id: [9; 16], key_digest: key_digest(&[3; 32]) });
-        // Counted, the sibling would make A's one vote half of two.
+        // Counted, the sibling would have to vote, and the target cannot.
         assert_eq!(decide(gone, &[v(1)], &p, ALL), Ok(()));
         assert_eq!(decide(gone, &[v(1), ([2; 16], vec![3; 32])], &p, ALL), Err(Refusal::TargetVoted));
     }
@@ -625,16 +639,49 @@ mod tests {
         let p = room(&keys);
         assert_eq!(decide(t(9), &[v(1), v(2), v(3)], &p, ALL), Ok(()));
         // With no connection holding the target's key, the whole cohort
-        // counts toward the floor.
-        assert_eq!(decide(t(9), &[v(1)], &p, ALL), Err(Refusal::BelowFloor));
+        // must vote.
+        assert_eq!(decide(t(9), &[v(1), v(2)], &p, ALL), Err(Refusal::MissingVoter));
     }
 
     #[test]
-    fn a_link_change_counts_everyone_connected() {
+    fn a_link_change_needs_everyone_connected() {
         let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
         let p = room(&keys);
-        assert_eq!(decide(None, &[v(1)], &p, ALL), Err(Refusal::BelowFloor));
-        assert_eq!(decide(None, &[v(1), v(2)], &p, ALL), Ok(()));
+        assert_eq!(decide(None, &[v(1), v(2)], &p, ALL), Err(Refusal::MissingVoter));
+        assert_eq!(decide(None, &[v(1), v(2), v(3)], &p, ALL), Ok(()));
+    }
+
+    /// S2: the voters are exactly the cohort. A majority used to be enough.
+    #[test]
+    fn the_server_requires_every_member_of_the_cohort() {
+        // One of two others.
+        let three = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32]];
+        assert_eq!(decide(t(3), &[v(1)], &room(&three), ALL), Err(Refusal::MissingVoter));
+        // Two of three others.
+        let four = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]];
+        assert_eq!(decide(t(4), &[v(1), v(3)], &room(&four), ALL), Err(Refusal::MissingVoter));
+        // All of them.
+        assert_eq!(decide(t(4), &[v(3), v(1), v(2)], &room(&four), ALL), Ok(()));
+    }
+
+    #[test]
+    fn a_vote_from_outside_the_cohort_is_refused() {
+        // Peer 4 arrived after the request; 1, 2 and 3 were there.
+        let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]];
+        let p = room(&keys);
+        assert_eq!(decide(t(3), &[v(1), v(2), v(4)], &p, 4), Err(Refusal::VoterAfterRequest));
+        // Someone not connected at all.
+        assert_eq!(decide(t(3), &[v(1), v(2), v(9)], &p, 4), Err(Refusal::VoterAbsent));
+        assert_eq!(decide(t(3), &[v(1), v(2)], &p, 4), Ok(()));
+    }
+
+    #[test]
+    fn a_cohort_member_that_has_disconnected_is_no_longer_required() {
+        // Peer 2 was in the cohort and has gone: it is no longer in the list.
+        let keys = vec![vec![1u8; 32], vec![2u8; 32], vec![3u8; 32], vec![4u8; 32]];
+        let mut p = room(&keys);
+        p.retain(|x| x.peer_id != [2; 16]);
+        assert_eq!(decide(t(4), &[v(1), v(3)], &p, ALL), Ok(()));
     }
 
     #[test]

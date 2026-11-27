@@ -160,13 +160,19 @@ impl AppState {
             if !matches!(room.current_state(), runar::room::RoomState::Active) {
                 continue;
             }
+            // Issued first: issuing stops the room's epoch and way in from
+            // moving (`Room::ticket_access`, under `epochs` alone), so no
+            // commit or step can land while the ticket is on its way and
+            // leave the members holding a ticket for a room that has moved
+            // on. The peers are read after that, under `peers` alone, and
+            // the guard is dropped before anything is awaited.
+            let Some(ticket) = runar::ticket::issue(key, &room, now) else {
+                continue;
+            };
             let peers: Vec<_> = room.peers.lock().unwrap().iter().map(|p| p.tx.clone()).collect();
             if peers.is_empty() {
                 continue;
             }
-            let Some(ticket) = runar::ticket::issue(key, &room, now) else {
-                continue;
-            };
             let frame = crate::bifrost::restart_ticket(room.id, &ticket);
             for tx in peers {
                 let _ = tokio::time::timeout(Duration::from_secs(2), tx.send_backpressured(frame.clone())).await;
