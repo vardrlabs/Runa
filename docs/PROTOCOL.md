@@ -546,9 +546,10 @@ fields are all zero.
 
 A member accepts a request only from a member in its roster, at the epoch it
 holds, naming a target in its roster with the signing key the roster shows for
-it, with a roster hash equal to its own, and with a valid signature over the
-digest of that key. It signs an approval only over that same digest. It counts
-an approval only from a member whose approval the request needs, and only once.
+it, with a roster hash equal to its own, with itself in that roster under its
+own signing key, and with a valid signature over the digest of the target's
+key. It signs an approval only over that same digest. It counts an approval
+only from a member whose approval the request needs, and only once.
 A REJECT carries no signature: the relay's sender envelope already binds who
 sent it, and under UNANIMOUS any member can block by not answering. A cancel
 counts only from the proposer.
@@ -626,23 +627,23 @@ other, and whichever commit arrives first wins.
 
 *Members.* A member applies a commit only for a request it saw, opened and
 still holds a record of, and only if, one at a time with every EPOCH_KEY it
-receives: the sender signed it and is one of the voters; its target key digest
-is SHA-256 of the `targetKey` in that request; its votes cover exactly the
-members the policy needed (the roster the request froze, without every entry
-holding the target's signing key), each with a valid signature; its own wrap
-opens; the way in derives the verifier and salt the clear part names and the
-`confirm` in the tail; and the new config opens under the new content key with
-the same expiry and security level. It then starts its keyring again at `root`
-from the new root, keeping the keys of earlier epochs until a snapshot under
-the new root has landed and the overlap has passed, uses the new `auth` key
-for every later JOIN, and shows the new link or passphrase once, with the new
-fingerprint and a prompt to compare it again. An everyday private room
-replaces the key the tab keeps for a refresh. The snapshotter writes a
-snapshot under the new root as soon as it can, as after a step. A commit ends
-any open shred vote. A commit that fails a check is refused and shown. A
-member left without a wrap, or offline at the commit, cannot follow: its next
-JOIN fails with 4001, and it needs the new link or passphrase from someone who
-was there.
+receives: the sender signed it and is one of the voters; its target, target key
+digest, verifier and epoch are those of that request, the digest being SHA-256
+of its `targetKey`; its votes cover exactly the members the policy needed (the
+roster the request froze, without every entry holding the target's signing
+key), each with a valid signature; its own wrap opens; the way in derives the
+verifier and salt the clear part names and the `confirm` in the tail; and the
+new config opens under the new content key with the same expiry and security
+level. It then starts its keyring again at `root` from the new root, keeping
+the keys of earlier epochs until a snapshot under the new root has landed and
+the overlap has passed, uses the new `auth` key for every later JOIN, and shows
+the new link or passphrase once, with the new fingerprint and a prompt to
+compare it again. An everyday private room replaces the key the tab keeps for a
+refresh. The snapshotter writes a snapshot under the new root as soon as it
+can, as after a step. A commit ends any open shred vote. A commit that fails a
+check is refused and shown. A member left without a wrap, or offline at the
+commit, cannot follow: its next JOIN fails with 4001, and it needs the new link
+or passphrase from someone who was there.
 
 A member that never saw the request, saw it but did not open it, or no longer
 holds a record of it never applies the commit, never opens a wrap in it and
@@ -664,9 +665,11 @@ all of them when the epoch moves.
 removed. Every connection still open under its signing key gets 4014, the
 named one and any it had opened again under a new peer id alike, since the
 server knows them by the key the votes name. A client that sees a commit whose
-target key digest is the digest of its own signing key stops and says it was
-removed in the same way, whether or not a 4014 reached it first. Its old link
-or passphrase now fails with 4001, like a wrong one.
+target key digest is that of its own signing key, or whose target is its own
+peer id, stops and says it was removed in the same way, whether or not a 4014
+reached it first, once the commit has passed the checks on its votes above;
+one that fails them is refused and shown. Its old link or passphrase now fails
+with 4001, like a wrong one.
 
 *Joining a re-rooted room.* JOIN_ACK's `root_epoch` is the epoch the current
 link opens. A client whose keys have not moved since it derived them treats
