@@ -168,6 +168,13 @@ What that buys is narrow, so here it is exactly:
   room's sealed configuration makes it behave as Highest, so it rotates; that
   costs availability, not confidentiality, and the server could delete the room
   anyway.
+- **A vote to remove someone holds key changes back.** While a request to
+  remove someone or change the link is open, the server applies no key change,
+  for up to 150 seconds, and one member's requests can hold the room for at
+  most 300 seconds in any 900 however often they ask. If someone leaves
+  during a hold, the key changes once the hold ends, so a member can let a
+  person who left read on for that long. Any member could already pass them
+  the new key itself.
 - **A tab opened before key rotation existed is kept out once the key has
   changed.** It cannot be handed a new key, so the server refuses it with a
   version error. The older page does not explain that error: it keeps trying to
@@ -213,8 +220,8 @@ passphrase. Removing them takes it away. The person who asks has already made
 the replacement: a new link, or for a shared-name room a passphrase they typed
 or generated, held to the same strength check as a new room's. Everyone else in
 the room has to approve, any one of them can refuse, and a vote that nobody
-settles fails after a minute by default, or after as long as an hour if the
-person asking chose that. The server checks this too: it applies the change
+settles fails after a minute by default, or after as long as two minutes if
+the person asking chose that. The server checks this too: it applies the change
 only when everyone the request was put to has approved. Once everyone has
 approved, each member receives the new link or passphrase sealed to them
 alone, the server replaces what it checks a JOIN against, and the room's key
@@ -253,14 +260,25 @@ What that buys, exactly:
   sending requests that cannot pass or by asking and then never sending the
   change once everyone has agreed. Nothing changes when that happens, and
   nobody is removed either.
+- **A tab running an older version cannot vote.** A tab opened before this
+  release has no key-agreement key and does not understand the vote, so while
+  one is connected no removal or link change can pass; it has to be reloaded
+  first.
 - **Until the change lands, the person being removed is still a member.**
   They can see that a vote has started, because the kind of each frame is
   visible to everyone in the room. They read everything written until the
-  change, they can vote on other things, and they can change the room's key
-  with a rotation step. A step does not stop the vote: every approval names
-  the room's root, which only a re-root moves, and the person who asked sends
-  the change again for the new key. Nobody asks for their approval, and it
-  would not count if they gave it.
+  change, and they can vote on other things. Nobody asks for their approval,
+  and it would not count if they gave it. They cannot change the room's key
+  while the vote is open, because the server holds every key change while a
+  request to remove someone is open. What they can still do is change the key
+  just before a vote starts and leave someone out of the new key on purpose.
+  That person's tab joins again to be handed the key, and a vote asked for
+  before it has done so fails when its old connection leaves; the next request
+  can go ahead once it has. The hold lasts at most 150 seconds, and one
+  person's requests get it for at most 300 seconds in any 900, so a vote asked
+  for past that runs without it and can be stopped that way. A server that
+  does not hold key changes lets them do it during any vote, and then they can
+  make every vote fail; the remedy then is a new room.
 - **Someone being removed cannot dodge it by reconnecting: a new connection is
   not given the new link.** The room changes its link whether or not they are
   still connected, and only the people who approved receive the new one.
@@ -272,7 +290,12 @@ What that buys, exactly:
   the people who must approve by opening connections under other keys before
   anyone asked, and those show in the room as extra people, who would then
   have to be asked too. Several connections that share one signing key, other
-  than the removed person's, are each asked separately.
+  than the removed person's, are each asked separately. The server cannot
+  read a request, so it counts a commit against its sender's latest one: a
+  member who asked while alone in the room could, within 150 seconds, change
+  the link with their own approval alone, and everyone who arrived since would
+  be left out. That is no more than a member can already do to a room by
+  breaking its key.
 - **A copy of someone's signing key counts as them.** A JOIN carries no proof
   that the connection holds the private half of the signing key it presents,
   so the server treats a connection that presents a copy of someone's public
@@ -294,7 +317,9 @@ Against the server:
   with, and changes nothing unless everyone who was connected when the request
   passed through it and is still connected, apart from every connection
   holding the removed person's signing key, signed. Members hold the vote to
-  the same rule, and also end it if anyone whose approval it needs leaves. In
+  the same rule, and also end it if anyone whose approval it needs leaves. It
+  also holds key changes while a request is open, so the person being removed
+  cannot end the vote by changing the room's key, within the limits above. In
   exchange the server learns which connections voted to remove which, and
   when.
 - **It cannot check what it cannot read.** Someone who holds everyone's
@@ -310,9 +335,10 @@ Against the server:
 - **A server that will not enforce a removal** can keep accepting the old link,
   or keep the removed person's connection open. They still cannot read anything
   written under the new key without the substitution above. Such a server can
-  also pass the removed person's edits under the old key to the others, but
-  only until the overlap after the change has passed: from then on every
-  member drops them.
+  also pass the removed person's edits under the old key to the others. Once
+  the overlap after the change has passed, members drop those relayed as live
+  edits, but a server that lies about its log can still present them as part
+  of a catch-up, until each member has forgotten the old key.
 - **Nothing stops a member who stays from passing the new link on.** Removal
   protects the room from the person removed, not from the people who keep their
   place.
