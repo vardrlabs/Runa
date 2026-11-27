@@ -552,6 +552,543 @@ async function main() {
     for (const p of [a, b, c]) await p.close();
   }
 
+  // Removing someone and changing the way in (PROTOCOL amendment K), seen
+  // from every tab involved. These are the first runs of the whole feature in
+  // a real browser, so each step checks what the person in front of that tab
+  // would actually see, and the crypto is checked from outside the browser as
+  // well.
+  //
+  // Tabs that are part of these scenarios, kept so a failure can show what
+  // each of them looked like.
+  const evictPages = new Map();
+
+  /// A page whose clipboard writes are kept where the test can read them.
+  async function makeCopyingPage(label) {
+    const page = await makePage(label);
+    evictPages.set(label, page);
+    await page.addInitScript(() => {
+      window.__copied = [];
+      const write = (t) => {
+        window.__copied.push(t);
+        return Promise.resolve();
+      };
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: write } });
+    });
+    return page;
+  }
+
+  const previewOf = (page) =>
+    page.evaluate(() => document.querySelector(".pane-preview .preview-body")?.textContent ?? "");
+
+  async function typeAtEnd(page, text) {
+    await page.waitForSelector("textarea.inputarea", { state: "attached", timeout: 15_000 });
+    await page.click(".monaco-editor .view-lines");
+    await page.keyboard.press("End");
+    await page.keyboard.type(text);
+  }
+
+  async function copiedLink(page) {
+    await page.click('.statusbar-actions button:has-text("Copy link")');
+    return page.evaluate(() => window.__copied.at(-1));
+  }
+
+  function parseLink(link, label) {
+    const m = /\/r\/([0-9a-f]{32})#k=([^&]+)&s=(.+)$/.exec(link ?? "");
+    if (!m) throw new Error(`[${label}] not a whole room link: ${link}`);
+    return { rid: m[1], key: Buffer.from(m[2], "base64url"), salt: Buffer.from(m[3], "base64url") };
+  }
+
+  /// The epoch-0 content key a link gives, which is what a tab that opened
+  /// the room with it holds until the room's key first changes.
+  async function linkContentKey(key, salt) {
+    const raw = await hkdf(key, salt, INFO_CONTENT, 32);
+    return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+
+  /// The labels of the ask dialog's choices, in the order it lists them.
+  const targetLabels = (page) =>
+    page.$$eval('input[name="evict-target"]', (els) => els.map((el) => el.closest("label")?.textContent?.trim() ?? ""));
+
+  /// Open the ask dialog and wait until it lists exactly `want` choices. The
+  /// list is read when the dialog opens, so a departure that the page has not
+  /// heard of yet is waited out by opening it again.
+  async function openAsk(page, label, button, want) {
+    const until = Date.now() + 15_000;
+    for (;;) {
+      await page.click(`.statusbar-actions button:has-text("${button}")`);
+      await page.waitForSelector("#evict-title", { timeout: 5000 });
+      const labels = await targetLabels(page);
+      if (labels.length === want) return labels;
+      if (Date.now() > until) throw new Error(`[${label}] the ask dialog offers ${labels.length} choices, expected ${want}: ${labels.join(" | ")}`);
+      await page.click('[role="dialog"] button:has-text("Cancel")');
+      await page.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+      await page.waitForTimeout(500);
+    }
+  }
+
+  /// Open a room by its shared name and passphrase, on whichever page the
+  /// address shows first.
+  async function enterNamed(page, label, name, phrase) {
+    await gotoPage(page, label, `${BASE}/${name}`);
+    await page.waitForSelector("#pp", { timeout: 15_000 });
+    await page.fill("#pp", phrase);
+    await page.click('button:has-text("Enter room")');
+  }
+
+  /// What every member who stayed is shown once: the new link or passphrase,
+  /// the same for all of them, under the right title.
+  async function readReRootNotice(page, label, { kind, removed }) {
+    const hook = kind === "link" ? "[data-new-link]" : "[data-new-passphrase]";
+    await page.waitForSelector(hook, { timeout: 20_000 }).catch(async () => {
+      const shown = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 400));
+      throw new Error(`[${label}] never showed the new ${kind}: ${shown}`);
+    });
+    const notice = page.locator('[role="dialog"]:has(#reroot-title)');
+    const title = (await page.textContent("#reroot-title")).trim();
+    const want = kind === "link" ? "THIS ROOM HAS A NEW LINK" : "THIS ROOM HAS A NEW PASSPHRASE";
+    if (title !== want) throw new Error(`[${label}] the notice is titled "${title}", expected "${want}"`);
+    const text = (await notice.textContent()) ?? "";
+    if (removed && !text.includes(`${removed} was removed from this room.`)) {
+      throw new Error(`[${label}] the notice does not say who was removed: ${text}`);
+    }
+    if (!removed && /was removed from this room/.test(text)) {
+      throw new Error(`[${label}] the notice names someone removed when nobody was: ${text}`);
+    }
+    if (!text.includes("The room's fingerprint is now")) {
+      throw new Error(`[${label}] the notice does not give the new fingerprint: ${text}`);
+    }
+    if (await page.$("[data-new-link]") && await page.$("[data-new-passphrase]")) {
+      throw new Error(`[${label}] the notice shows a link and a passphrase at once`);
+    }
+    const value = ((await page.textContent(hook)) ?? "").trim();
+    // Only Done closes it: an Escape pressed by habit must not lose the one
+    // time it is shown.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+    if (!(await page.$(hook))) throw new Error(`[${label}] Escape closed the notice that shows the new ${kind} only once`);
+    return { value, text };
+  }
+
+  async function closeReRootNotice(page) {
+    await page.click("#reroot-done");
+    await page.waitForSelector("#reroot-title", { state: "detached", timeout: 5000 });
+  }
+
+  /// A tab the room removed: a banner over the read-only document it already
+  /// had, Export still working, the room's actions gone, and no reconnecting.
+  async function checkStranded(page, label, { banner, keeps, way }) {
+    await page.waitForSelector(`.banner[role="alert"]:has-text("${banner}")`, { timeout: 20_000 }).catch(async () => {
+      const shown = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 400));
+      throw new Error(`[${label}] never said "${banner}": ${shown}`);
+    });
+    const bannerText = (await page.textContent('.banner[role="alert"]')) ?? "";
+    if (!bannerText.includes("read-only")) throw new Error(`[${label}] the banner does not say the tab keeps a read-only copy: ${bannerText}`);
+    if (way === "pass" && /\blink\b/i.test(bannerText)) throw new Error(`[${label}] a shared room's banner speaks of a link: ${bannerText}`);
+    if (!(await page.$(".monaco-editor"))) throw new Error(`[${label}] the document was taken off the screen`);
+    if (!(await previewOf(page)).includes(keeps)) throw new Error(`[${label}] the document on screen lost "${keeps}"`);
+    const actions = await page.$$eval(".statusbar-actions button", (els) =>
+      els.filter((el) => el.getClientRects().length > 0).map((el) => el.textContent.trim()),
+    );
+    for (const gone of ["Copy link", "Shred", "Remove someone", "Change link", "Change passphrase", "Steady"]) {
+      if (actions.includes(gone)) throw new Error(`[${label}] a stranded tab still offers "${gone}": ${actions.join(", ")}`);
+    }
+    // Read-only: typing changes nothing.
+    await page.click(".monaco-editor .view-lines");
+    await page.keyboard.type("typed-after-stranding");
+    await page.waitForTimeout(1000);
+    if ((await previewOf(page)).includes("typed-after-stranding")) throw new Error(`[${label}] the stranded editor still takes typing`);
+    // Monaco answers typing into a read-only editor with a message of its
+    // own, and that message must not break the page's Trusted Types policy.
+    const ttFromHere = errors.filter((e) => e.startsWith(`[${label}]`) && /TrustedTypePolicy|Trusted Types|trustedTypes/i.test(e));
+    if (ttFromHere.length > 0) {
+      throw new Error(`[${label}] typing into the read-only editor broke the Trusted Types policy: ${ttFromHere[0].slice(0, 200)}`);
+    }
+    // No reconnecting: every socket the tab opened is closed, and no new one
+    // is opened while the client's backoff would have had several goes.
+    const sockets = () => page.evaluate(() => (window.__runaSockets ?? []).map((ws) => ws.readyState));
+    const before = await sockets();
+    await page.waitForTimeout(8000);
+    const after = await sockets();
+    if (after.length !== before.length || after.some((s) => s !== 3)) {
+      throw new Error(`[${label}] a stranded tab is still connecting: sockets ${JSON.stringify(before)} then ${JSON.stringify(after)}`);
+    }
+    // Export, from the banner, still gives the document.
+    page.on("dialog", (d) => void d.accept());
+    await page.click('.banner[role="alert"] button:has-text("Export")');
+    await page.waitForSelector('[role="dialog"] button:has-text("Markdown (.md)")', { timeout: 5000 });
+    const download = page.waitForEvent("download", { timeout: 15_000 });
+    await page.click('[role="dialog"] button:has-text("Markdown (.md)")');
+    const file = await download;
+    const saved = await file.path();
+    const contents = saved ? await (await import("node:fs/promises")).readFile(saved, "utf8") : "";
+    if (!contents.includes(keeps)) throw new Error(`[${label}] Export from a stranded tab lost the document: ${JSON.stringify(contents.slice(0, 120))}`);
+    await page.keyboard.press("Escape");
+  }
+
+  const goneText = "THIS ROOM IS GONE";
+
+  try {
+    // Scenarios 1 to 5 share one everyday private room with three people.
+    const a = await makeCopyingPage("evict-a");
+    await gotoPage(a, "evict-a", `${BASE}/`);
+    await a.waitForSelector("#security", { timeout: 10_000 });
+    await a.click('button:has-text("Create private room")');
+    await a.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    const oldLink = await copiedLink(a);
+    const old = parseLink(oldLink, "evict-a");
+    const rid = old.rid;
+    await typeAtEnd(a, "before-evict ");
+
+    const b = await makeCopyingPage("evict-b");
+    await gotoPage(b, "evict-b", oldLink);
+    await b.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(b, "before-evict", "evict-b");
+    const t = await makeCopyingPage("evict-t");
+    await gotoPage(t, "evict-t", oldLink);
+    await t.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(t, "before-evict", "evict-t");
+
+    // A refusal first. Bob has his own ask dialog open when Alice's request
+    // arrives: it gives way to the vote, so there is only ever one dialog.
+    const relinkLabel = await a.$$eval(".statusbar-actions button", (els) => els.map((el) => el.textContent.trim()));
+    if (!relinkLabel.includes("Change link") || relinkLabel.includes("Change passphrase")) {
+      throw new Error(`[evict-a] a private room's bar should offer "Change link": ${relinkLabel.join(", ")}`);
+    }
+    await openAsk(b, "evict-b", "Remove someone", 3);
+    const labels = await openAsk(a, "evict-a", "Remove someone", 3);
+    const title = ((await a.textContent("#evict-title")) ?? "").trim();
+    if (title !== "REMOVE SOMEONE OR CHANGE THE LINK") throw new Error(`[evict-a] the ask dialog is titled "${title}"`);
+    if (labels[0] !== "Nobody, only the link changes") throw new Error(`[evict-a] the first choice is "${labels[0]}"`);
+    // Nobody first, then everyone else in the order they joined: the third
+    // tab is the last choice.
+    const tHandle = labels[2];
+    let options = await a.$$('input[name="evict-target"]');
+    await options[2].check();
+    await a.click("#evict-propose");
+    await b.waitForSelector("#evict-reject", { timeout: 15_000 });
+    if (await b.$("#evict-title")) throw new Error("[evict-b] the ask dialog stayed open under the vote prompt");
+    const modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
+    if (modals !== 1) throw new Error(`[evict-b] ${modals} modal dialogs at once`);
+    const voteTitle = ((await b.textContent("#evict-vote-title")) ?? "").trim();
+    if (voteTitle !== `REMOVE ${tHandle}?`) throw new Error(`[evict-b] the vote asks "${voteTitle}", expected to remove ${tHandle}`);
+    await b.keyboard.press("Escape");
+    await b.waitForTimeout(300);
+    if (!(await b.$("#evict-reject"))) throw new Error("[evict-b] Escape closed the vote prompt without an answer");
+    // The person named is not asked.
+    await t.waitForTimeout(500);
+    if (await t.$("#evict-approve")) throw new Error("[evict-t] the person being removed was asked to vote");
+    await b.click("#evict-reject");
+    await a.waitForSelector('[role="dialog"]:has-text("Someone refused, so nothing changed.")', { timeout: 15_000 });
+    await a.click('[role="dialog"] button:has-text("Cancel")');
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    // Nothing changed: no new link anywhere, the third tab still writes and
+    // is read, and the room's link is still the old one.
+    await t.waitForTimeout(1500);
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-t", t]]) {
+      if (await page.$("[data-new-link]")) throw new Error(`[${label}] a refused request still changed the link`);
+      if (await page.$('.banner[role="alert"]:has-text("removed")')) throw new Error(`[${label}] a refused request still removed someone`);
+    }
+    await typeAtEnd(t, "still-here ");
+    await waitForPreview(a, "still-here", "evict-a");
+    await waitForPreview(b, "still-here", "evict-b");
+    if ((await copiedLink(b)) !== oldLink) throw new Error("[evict-b] after a refusal Copy link no longer gives the room's link");
+
+    // The removal. Alice asks again, Bob agrees.
+    await openAsk(a, "evict-a", "Remove someone", 3);
+    options = await a.$$('input[name="evict-target"]');
+    await options[2].check();
+    await a.click("#evict-propose");
+    await b.waitForSelector("#evict-approve", { timeout: 15_000 });
+    await b.click("#evict-approve");
+
+    const removedBanner = "You were removed from this room. The link you used no longer opens it.";
+    await t.waitForSelector(`.banner[role="alert"]:has-text("${removedBanner}")`, { timeout: 20_000 });
+    const noticeA = await readReRootNotice(a, "evict-a", { kind: "link", removed: tHandle });
+    const noticeB = await readReRootNotice(b, "evict-b", { kind: "link", removed: tHandle });
+    const newLink = noticeA.value;
+    if (newLink !== noticeB.value) throw new Error("[evict] the two who stayed were shown different links");
+    if (newLink === oldLink || !newLink.includes(`/r/${rid}#k=`)) throw new Error(`[evict] no new link: ${newLink}`);
+    const fresh = parseLink(newLink, "evict-a");
+    await closeReRootNotice(a);
+    await closeReRootNotice(b);
+
+    // The two who stayed keep writing, each sees the other, and Copy link now
+    // gives the new link.
+    await typeAtEnd(a, "after-evict ");
+    await waitForPreview(b, "after-evict", "evict-b");
+    await typeAtEnd(b, "from-b-after ");
+    await waitForPreview(a, "from-b-after", "evict-a");
+    if ((await copiedLink(a)) !== newLink) throw new Error("[evict-a] Copy link still gives an old link");
+
+    // The removed tab: read-only document, Export, no room actions, quiet.
+    await checkStranded(t, "evict-t", { banner: removedBanner, keeps: "still-here", way: "link" });
+    if ((await previewOf(t)).includes("after-evict")) throw new Error("[evict-t] the removed tab still receives what is written");
+
+    // The old link no longer opens the room: the server refuses it, and a
+    // page opening it says the room is gone.
+    const stale = await rawPeer(rid, old.key, old.salt);
+    const refusal = await stale.joined.then(
+      () => "joined",
+      (e) => String(e.message),
+    );
+    stale.close();
+    if (!refusal.includes("4001")) throw new Error(`[evict] the old link was not refused with 4001: ${refusal}`);
+    const late = await makePage("evict-old-link");
+    evictPages.set("evict-old-link", late);
+    await gotoPage(late, "evict-old-link", oldLink);
+    await late.waitForSelector(`text=${goneText}`, { timeout: 20_000 });
+    await late.close();
+    // Nor does the removed tab's own saved key: a refresh brings it to the
+    // same page, not back into the room.
+    await t.reload();
+    await t.waitForSelector(`text=${goneText}`, { timeout: 20_000 });
+    if (await t.$(".monaco-editor")) throw new Error("[evict-t] a refresh took the removed tab back into the room");
+
+    // Someone opening the new link reads everything. What was written before
+    // the removal arrives with the snapshot under the new key, which the
+    // longest-connected member writes once it has been in the room a minute.
+    const c = await makeCopyingPage("evict-c");
+    await gotoPage(c, "evict-c", newLink);
+    await c.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(c, "before-evict", "evict-c", 150_000);
+    await waitForPreview(c, "after-evict", "evict-c");
+    await waitForPreview(c, "from-b-after", "evict-c");
+
+    // From outside the browser: what was written after the removal cannot be
+    // opened with the key the removed tab held, which is the old link's
+    // epoch-0 key, while what was written before it could be.
+    const oldContent = await linkContentKey(old.key, old.salt);
+    const spy = await rawPeer(rid, fresh.key, fresh.salt);
+    await spy.joined;
+    const entries = await spy.syncAll();
+    spy.close();
+    const epochs = [...new Set(entries.map((e) => e.epoch))];
+    const later = entries.filter((e) => e.epoch >= 1);
+    if (later.length === 0) throw new Error(`[evict] no entry from after the removal; epochs seen: ${epochs}`);
+    for (const e of later) {
+      if (await e.openWith(oldContent)) throw new Error(`[evict] the removed tab's key opened an entry from epoch ${e.epoch}`);
+    }
+    const earlier = entries.filter((e) => e.epoch === 0);
+    if (earlier.length > 0 && !(await Promise.all(earlier.map((e) => e.openWith(oldContent)))).some(Boolean)) {
+      throw new Error("[evict] the old key opened nothing from before the removal either; the check above would prove nothing");
+    }
+    // The other half of the proof: the same entries do open with the key the
+    // new link gives, so the refusal above is the old key's, not a check that
+    // could open nothing at all.
+    const freshContent = await linkContentKey(fresh.key, fresh.salt);
+    const freshOpens = (await Promise.all(later.map((e) => e.openWith(freshContent)))).filter(Boolean).length;
+    if (freshOpens === 0) throw new Error("[evict] the new link's key opened nothing written after the removal; the check above would prove nothing");
+
+    // An everyday room keeps the new key for a refresh.
+    await b.reload();
+    await b.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(b, "after-evict", "evict-b", 60_000);
+    if ((await copiedLink(b)) !== newLink) throw new Error("[evict-b] after a refresh Copy link does not give the new link");
+    await typeAtEnd(b, "after-refresh ");
+    await waitForPreview(a, "after-refresh", "evict-a");
+
+    // Changing the link with nobody removed. A fourth tab is away while it
+    // happens, and comes back to find the room gone, as for an expired one.
+    const d = await makeCopyingPage("evict-away");
+    await gotoPage(d, "evict-away", newLink);
+    await d.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(d, "after-refresh", "evict-away", 60_000);
+    await severNetwork(d);
+    await openAsk(a, "evict-a", "Change link", 3);
+    const checked = await a.$$eval('input[name="evict-target"]', (els) => els.findIndex((el) => el.checked));
+    if (checked !== 0) throw new Error(`[evict-a] Change link opened with choice ${checked} picked, not nobody`);
+    await a.click("#evict-propose");
+    for (const [label, page] of [["evict-b", b], ["evict-c", c]]) {
+      await page.waitForSelector("#evict-approve", { timeout: 15_000 });
+      const asked = ((await page.textContent("#evict-vote-title")) ?? "").trim();
+      if (asked !== "CHANGE THE LINK?") throw new Error(`[${label}] the vote asks "${asked}"`);
+      await page.click("#evict-approve");
+    }
+    const relinked = [];
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-c", c]]) {
+      relinked.push((await readReRootNotice(page, label, { kind: "link", removed: null })).value);
+      await closeReRootNotice(page);
+    }
+    const link2 = relinked[0];
+    if (relinked.some((l) => l !== link2)) throw new Error(`[relink] the members were shown different links: ${relinked.join(" | ")}`);
+    if (link2 === newLink || link2 === oldLink) throw new Error("[relink] the link did not change");
+    const stale2 = await rawPeer(rid, fresh.key, fresh.salt);
+    const refusal2 = await stale2.joined.then(
+      () => "joined",
+      (e) => String(e.message),
+    );
+    stale2.close();
+    if (!refusal2.includes("4001")) throw new Error(`[relink] the previous link was not refused with 4001: ${refusal2}`);
+    await typeAtEnd(c, "after-relink ");
+    await waitForPreview(a, "after-relink", "evict-a");
+    await waitForPreview(b, "after-relink", "evict-b");
+    await restoreNetwork(d);
+    await d.waitForSelector(`text=${goneText}`, { timeout: 30_000 }).catch(async () => {
+      const shown = await d.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 300));
+      throw new Error(`[evict-away] a tab away during the change did not find the room gone: ${shown}`);
+    });
+
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-c", c]]) {
+      const alarms = await page.$$eval('.banner[role="alert"]', (els) => els.map((e) => e.textContent));
+      if (alarms.some((x) => /key change|list of people|lost track/.test(x))) {
+        throw new Error(`[${label}] showed a key alarm after an honest removal: ${alarms.join(" | ")}`);
+      }
+    }
+    for (const p of [a, b, c, d, t]) await p.close();
+
+    // The same removal in a shared room. Everything the page says names the
+    // passphrase, never a link, and the new passphrase is generated in the
+    // dialog.
+    const sharedName = `e2e-evict-${randomBytes(3).toString("hex")}`;
+    const s1 = await makeCopyingPage("shared-a");
+    await s1.setViewportSize({ width: 1280, height: 900 });
+    await gotoPage(s1, "shared-a", `${BASE}/`);
+    await s1.click("text=Shared name");
+    await s1.waitForSelector("text=Create shared room", { timeout: 5000 });
+    const suffix = s1.locator(".checkbox-row input[type=checkbox]");
+    if (await suffix.isChecked()) await suffix.uncheck();
+    await s1.fill("#room-name", sharedName);
+    await s1.click('button:has-text("Generate")');
+    const oldPhrase = await s1.inputValue("#passphrase");
+    await s1.click('button:has-text("Create shared room")');
+    await s1.waitForURL(`${BASE}/${sharedName}`, { timeout: 60_000 });
+    await s1.waitForSelector(".monaco-editor, #pp", { timeout: 60_000 });
+    if (await s1.$("#pp")) {
+      await s1.fill("#pp", oldPhrase);
+      await s1.click('button:has-text("Enter room")');
+    }
+    await s1.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await typeAtEnd(s1, "before-shared ");
+    const s2 = await makeCopyingPage("shared-b");
+    await enterNamed(s2, "shared-b", sharedName, oldPhrase);
+    await s2.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s2, "before-shared", "shared-b");
+    const s3 = await makeCopyingPage("shared-t");
+    await enterNamed(s3, "shared-t", sharedName, oldPhrase);
+    await s3.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s3, "before-shared", "shared-t");
+
+    const bar = await s1.$$eval(".statusbar-actions button", (els) => els.map((el) => el.textContent.trim()));
+    if (!bar.includes("Change passphrase") || bar.includes("Change link")) {
+      throw new Error(`[shared-a] a shared room's bar should offer "Change passphrase": ${bar.join(", ")}`);
+    }
+    const sLabels = await openAsk(s1, "shared-a", "Remove someone", 3);
+    const sTitle = ((await s1.textContent("#evict-title")) ?? "").trim();
+    if (sTitle !== "REMOVE SOMEONE OR CHANGE THE PASSPHRASE") throw new Error(`[shared-a] the ask dialog is titled "${sTitle}"`);
+    if (sLabels[0] !== "Nobody, only the passphrase changes") throw new Error(`[shared-a] the first choice is "${sLabels[0]}"`);
+    const askText = (await s1.textContent('[role="dialog"]:has(#evict-title)')) ?? "";
+    if (/\blink\b/i.test(askText)) throw new Error(`[shared-a] a shared room's ask dialog speaks of a link: ${askText}`);
+    const s3Handle = sLabels[2];
+    const sOptions = await s1.$$('input[name="evict-target"]');
+    await sOptions[2].check();
+    await s1.click('[role="dialog"] button:has-text("Generate")');
+    const newPhrase = await s1.inputValue("#evict-passphrase");
+    if (!newPhrase || newPhrase === oldPhrase) throw new Error(`[shared-a] Generate gave no new passphrase: "${newPhrase}"`);
+    // While the passphrase is stretched into keys the dialog cannot be
+    // closed, and says why. On a fast machine that lasts well under a
+    // second, so the page watches for it itself: the moment the dialog says
+    // it is busy, it records what it shows and presses Escape and Cancel.
+    await s1.evaluate(() => {
+      const seen = (window.__busySeen = []);
+      const look = () => {
+        const dialog = document.querySelector('[role="dialog"][aria-busy="true"]');
+        if (!dialog || seen.length) return;
+        const cancel = [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
+        seen.push({
+          cancelDisabled: !!cancel?.disabled,
+          says: dialog.textContent.includes("This tab is making the new keys."),
+        });
+        dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        cancel?.click();
+      };
+      new MutationObserver(look).observe(document.body, { subtree: true, childList: true, attributes: true });
+    });
+    await s1.click("#evict-propose");
+    await s1.waitForFunction(() => window.__busySeen.length > 0, null, { timeout: 30_000 }).catch(() => {
+      throw new Error("[shared-a] the ask dialog never said it was busy making the new keys");
+    });
+    const [busy] = await s1.evaluate(() => window.__busySeen);
+    if (!busy.cancelDisabled) throw new Error("[shared-a] Cancel works while the new keys are being made");
+    if (!busy.says) throw new Error("[shared-a] the dialog does not say it is making the new keys");
+    await s2.waitForSelector("#evict-approve", { timeout: 60_000 });
+    const sVote = ((await s2.textContent('[role="alertdialog"]')) ?? "").trim();
+    if (!sVote.includes(`REMOVE ${s3Handle}?`) || !sVote.includes("new passphrase") || /\blink\b/i.test(sVote)) {
+      throw new Error(`[shared-b] the vote prompt does not ask the right thing in passphrase words: ${sVote}`);
+    }
+    // The Escape and Cancel pressed while it was busy did not withdraw the
+    // request: it is still open and still waiting.
+    if (!(await s1.$("#evict-title"))) throw new Error("[shared-a] Escape or Cancel closed the ask dialog while the new keys were being made");
+    if ((await s2.$$("#evict-approve")).length !== 1) throw new Error("[shared-b] the request was withdrawn by a Cancel pressed while it was being made");
+    await s2.click("#evict-approve");
+
+    const sRemoved = "You were removed from this room. The passphrase you used no longer opens it.";
+    await s3.waitForSelector(`.banner[role="alert"]:has-text("${sRemoved}")`, { timeout: 20_000 });
+    const sNoticeA = await readReRootNotice(s1, "shared-a", { kind: "pass", removed: s3Handle });
+    const sNoticeB = await readReRootNotice(s2, "shared-b", { kind: "pass", removed: s3Handle });
+    for (const [label, n] of [["shared-a", sNoticeA], ["shared-b", sNoticeB]]) {
+      if (n.value !== newPhrase) throw new Error(`[${label}] the notice shows "${n.value}", not the generated passphrase`);
+      if (/\blink\b/i.test(n.text)) throw new Error(`[${label}] a shared room's notice speaks of a link: ${n.text}`);
+    }
+    await closeReRootNotice(s1);
+    await closeReRootNotice(s2);
+    await typeAtEnd(s1, "after-shared ");
+    await waitForPreview(s2, "after-shared", "shared-b");
+    await checkStranded(s3, "shared-t", { banner: sRemoved, keeps: "before-shared", way: "pass" });
+
+    // The old passphrase no longer opens the room: it gets the page an
+    // expired room gets, in passphrase words. The new one opens it, with
+    // everything in it.
+    const sLate = await makePage("shared-old-phrase");
+    evictPages.set("shared-old-phrase", sLate);
+    await enterNamed(sLate, "shared-old-phrase", sharedName, oldPhrase);
+    await sLate.waitForSelector(`text=${goneText}`, { timeout: 60_000 }).catch(async () => {
+      const shown = await sLate.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 300));
+      throw new Error(`[shared-old-phrase] the old passphrase was not refused: ${shown}`);
+    });
+    if (await sLate.$(".monaco-editor")) throw new Error("[shared-old-phrase] the old passphrase opened the room");
+    const goneSaid = await sLate.evaluate(() => document.body.innerText);
+    if (/\blink\b/i.test(goneSaid) || !goneSaid.includes("someone changed its passphrase")) {
+      throw new Error(`[shared-old-phrase] a shared room's gone page does not speak of its passphrase: ${goneSaid.replace(/\s+/g, " ")}`);
+    }
+    await sLate.close();
+    const s4 = await makePage("shared-c");
+    evictPages.set("shared-c", s4);
+    await enterNamed(s4, "shared-c", sharedName, newPhrase);
+    await s4.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s4, "before-shared", "shared-c", 150_000);
+    await waitForPreview(s4, "after-shared", "shared-c");
+
+    for (const [label, page] of [["shared-a", s1], ["shared-b", s2], ["shared-c", s4]]) {
+      const alarms = await page.$$eval('.banner[role="alert"]', (els) => els.map((e) => e.textContent));
+      if (alarms.some((x) => /key change|list of people|lost track/.test(x))) {
+        throw new Error(`[${label}] showed a key alarm after an honest removal: ${alarms.join(" | ")}`);
+      }
+    }
+    for (const p of [s1, s2, s3, s4]) await p.close();
+  } catch (e) {
+    // What every tab in these scenarios looked like when it failed, and a
+    // screenshot of each when a folder for them is given.
+    for (const [label, page] of evictPages) {
+      if (page.isClosed()) continue;
+      try {
+        const shown = await Promise.race([
+          page.evaluate(() => ({
+            url: location.pathname,
+            dialogs: [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].map((d) => d.textContent.trim().slice(0, 160)),
+            alerts: [...document.querySelectorAll('[role="alert"], [role="status"], .banner, .toast')]
+              .map((d) => d.textContent.trim().slice(0, 160))
+              .filter(Boolean),
+            body: document.body.innerText.replace(/\s+/g, " ").slice(0, 200),
+          })),
+          new Promise((r) => setTimeout(() => r("page did not answer within 3s"), 3000)),
+        ]);
+        console.error(`${label.toUpperCase()} STATE:`, JSON.stringify(shown));
+        if (process.env.RUNA_E2E_SHOTS) await page.screenshot({ path: `${process.env.RUNA_E2E_SHOTS}/${label}.png` });
+      } catch {}
+    }
+    throw e;
+  }
+
   const landing = await makePage("landing");
   for (const width of [320, 375, 414]) {
     await landing.setViewportSize({ width, height: 780 });
@@ -1815,6 +2352,10 @@ async function main() {
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
+  console.log(`  removing someone: a refusal changes nothing; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
+  console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
+  console.log(`  a shared room removes someone with a generated passphrase and never speaks of a link`);
   console.log(`  shared rooms: highest keeps the name out of the address; everyday takes it after joining`);
   console.log(`  two headless peers joined ${roomIdHex.slice(0, 8)}…`);
   console.log(`  typed concurrently; Alice's preview converged to include Bob's text`);
