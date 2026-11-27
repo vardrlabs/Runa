@@ -624,28 +624,41 @@ room's new epoch and is relayed like a handover, which every member that has
 applied the commit ignores. In a room of two, either member can remove the
 other, and whichever commit arrives first wins.
 
-*Members.* A member applies a commit only if, one at a time with every
-EPOCH_KEY it receives: the sender signed it and is one of the voters; its
-target key digest is SHA-256 of the `targetKey` in the request it saw for
-that id, or, for a member that never saw the request, SHA-256 of the signing
-key its roster shows for the named peer if that peer is still listed; its
-votes cover exactly the members the policy needed (the roster the request
-froze, without every entry holding the target's signing key; or, for a member
-that never saw the request, its own roster without the named peer, without
-every entry whose signing key has the digest the commit names, and without
-itself), each with a valid signature; its own wrap opens; the way in
-derives the verifier and salt the clear part names and the `confirm` in the
-tail; and the new config opens under the new content key with the same expiry
-and security level. It then starts its keyring again at `root` from the new
-root, keeping the keys of earlier epochs until a snapshot under the new root
-has landed and the overlap has passed, uses the new `auth` key for every later
-JOIN, and shows the new link or passphrase once, with the new fingerprint and a
-prompt to compare it again. An everyday private room replaces the key the tab
-keeps for a refresh. The snapshotter writes a snapshot under the new root as
-soon as it can, as after a step. A commit ends any open shred vote. A commit
-that fails a check is refused and shown. A member left without a wrap, or
-offline at the commit, cannot follow: its next JOIN fails with 4001, and it
-needs the new link or passphrase from someone who was there.
+*Members.* A member applies a commit only for a request it saw, opened and
+still holds a record of, and only if, one at a time with every EPOCH_KEY it
+receives: the sender signed it and is one of the voters; its target key digest
+is SHA-256 of the `targetKey` in that request; its votes cover exactly the
+members the policy needed (the roster the request froze, without every entry
+holding the target's signing key), each with a valid signature; its own wrap
+opens; the way in derives the verifier and salt the clear part names and the
+`confirm` in the tail; and the new config opens under the new content key with
+the same expiry and security level. It then starts its keyring again at `root`
+from the new root, keeping the keys of earlier epochs until a snapshot under
+the new root has landed and the overlap has passed, uses the new `auth` key
+for every later JOIN, and shows the new link or passphrase once, with the new
+fingerprint and a prompt to compare it again. An everyday private room
+replaces the key the tab keeps for a refresh. The snapshotter writes a
+snapshot under the new root as soon as it can, as after a step. A commit ends
+any open shred vote. A commit that fails a check is refused and shown. A
+member left without a wrap, or offline at the commit, cannot follow: its next
+JOIN fails with 4001, and it needs the new link or passphrase from someone who
+was there.
+
+A member that never saw the request, saw it but did not open it, or no longer
+holds a record of it never applies the commit, never opens a wrap in it and
+leaves its keyring as it is. In an honest room every member wrapped for
+approved the request, so such a member is never one of them. It checks the
+commit as far as it can: the sender signed it and is one of the voters; its
+target key digest is SHA-256 of the signing key its roster shows for the named
+peer, if that peer is still listed; and its votes cover exactly its own roster
+without the named peer, without every entry whose signing key has the digest
+the commit names, and without itself, each with a valid signature. If all of
+that holds, it knows the room's way in changed without it and says so, or says
+it was removed if the digest the commit names is that of its own signing key.
+A commit that fails one of those checks is refused and shown. A member's
+record of the requests it saw is bounded: it lets go of requests it did not
+open before settled ones, the oldest first, never of the vote open now, and of
+all of them when the epoch moves.
 
 *The removed member.* Its client stops reconnecting on 4014 and says it was
 removed. Every connection still open under its signing key gets 4014, the
