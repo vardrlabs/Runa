@@ -302,12 +302,13 @@ export interface SessionEvents {
   /// with 4014 or a commit naming this tab's key came first.
   onRemoved?(): void;
   /// The room's way in changed and this tab was not given the new one: it can
-  /// no longer take part, and what it holds is all it has. Said once per
-  /// re-root, whichever way the evict coordinator found out: a commit this
-  /// tab could place but held no usable wrap in (raised after
-  /// `onEvictState("FAILED", "left-out")`), or a member's commit for an epoch
-  /// this tab has not reached (no evict state comes with it). Said again only
-  /// after a later re-root has let the tab back in.
+  /// no longer take part, and what it holds is all it has. The socket stops
+  /// and does not reconnect, as for a removed tab, and the document stays.
+  /// Said once, whichever way the evict coordinator found out: a commit this
+  /// tab could place but held no usable wrap in, or could not place at all
+  /// (raised after `onEvictState("FAILED", "left-out")`), or a member's
+  /// commit for an epoch this tab has not reached (with that state only if a
+  /// vote was open here).
   onLeftOut?(): void;
 }
 
@@ -378,7 +379,8 @@ export class Session {
   private rerootGen = 0;
   /// The room removed this tab (amendment K).
   private removedSaid = false;
-  /// The page was told this tab was left out of the room's latest re-root.
+  /// This tab was left out of a re-root (amendment K): it has stopped, like a
+  /// removed tab, and nothing brings it back.
   private leftOutSaid = false;
   /// A forgetting of the old root's keys is queued on the epoch queue.
   private forgetting = false;
@@ -695,7 +697,7 @@ export class Session {
   carryOver(): boolean {
     const held = this.socket.heldRestartTicket();
     const restore = this.cfg.restoreRoom;
-    if (!held || !restore || this.destroyed || this.removedSaid) return false;
+    if (!held || !restore || this.destroyed || this.removedSaid || this.leftOutSaid) return false;
     if (this.carryingOver) return true;
     this.carryingOver = true;
     void (async () => {
@@ -710,8 +712,8 @@ export class Session {
           }
           if (result === "restored") {
             this.socket.dropRestartTicket();
-            // Removed meanwhile: a removed tab stays stopped.
-            if (this.removedSaid) return;
+            // Removed or left out meanwhile: such a tab stays stopped.
+            if (this.removedSaid || this.leftOutSaid) return;
             this.socket.resume();
             return;
           }
@@ -906,7 +908,8 @@ export class Session {
   /// to the evict coordinator from the moment it is handed over: it wipes it
   /// on every path that does not keep it.
   async proposeEviction(target: Uint8Array | null, passphrase?: string): Promise<string | null> {
-    if (this.destroyed || this.removedSaid) return "failed";
+    // A removed or left-out tab holds no way in the room still opens.
+    if (this.destroyed || this.removedSaid || this.leftOutSaid) return "failed";
     const victim = target ? ([...this.internals.roster.values()].find((r) => bytesEqual(r.peerId, target)) ?? null) : null;
     if (target && !victim) return "target-gone";
     let way: WayIn;
@@ -920,8 +923,9 @@ export class Session {
     } else {
       way = newLinkWayIn();
     }
-    // Argon2id takes seconds: the tab may have been removed or closed since.
-    if (this.destroyed || this.removedSaid) {
+    // Argon2id takes seconds: the tab may have been removed, left out or
+    // closed since.
+    if (this.destroyed || this.removedSaid || this.leftOutSaid) {
       wipeWayIn(way);
       return "failed";
     }
@@ -973,8 +977,6 @@ export class Session {
     quietly(() => this.machine.reset());
     quietly(() => this.events.onShredState("IDLE"));
     this.rerootGen += 1;
-    // Let in: a later re-root this tab is left out of is said again.
-    this.leftOutSaid = false;
     this.rerootAt = Date.now();
     this.rerootSnapshotSeen = false;
     quietly(() => this.snapshotSoon());
@@ -1085,10 +1087,15 @@ export class Session {
     if (state === "FAILED" && reason === "left-out") this.leftOutOfReRoot();
   }
 
-  /// Tells the page, once per re-root, that this tab was left out of it.
+  /// This tab was left out of a re-root. It holds no key the room opens
+  /// now, so, like a removed tab, it stops its socket and never reconnects:
+  /// connected, it would sit in every later vote's list of people without
+  /// being able to answer, and block them all. Its document stays on screen.
+  /// Said once.
   private leftOutOfReRoot(): void {
     if (this.leftOutSaid) return;
     this.leftOutSaid = true;
+    quietly(() => this.socket.stopReconnecting());
     quietly(() => this.events.onLeftOut?.());
   }
 

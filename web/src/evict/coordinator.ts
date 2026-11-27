@@ -616,7 +616,14 @@ export class EvictCoordinator {
     if (this.dead || ring.current.epoch > epoch) return;
     if (epoch > ring.current.epoch) {
       // The room moved where this member cannot follow without the new way
-      // in: a member signed a commit for an epoch it has not reached.
+      // in: a member signed a commit for an epoch it has not reached. A vote
+      // it had open is over, and its own new way in, kept or not, goes.
+      this.dropPending();
+      this.dropLate();
+      if (this.machine.isOpen()) {
+        this.machine.fail();
+        this.report("left-out");
+      }
       this.say(() => this.d.leftOut());
       return;
     }
@@ -757,6 +764,8 @@ export class EvictCoordinator {
   /// whatever vote it had open is over, and it needs the new way in from
   /// someone who was there.
   private leftOutOfCommit(): void {
+    this.dropPending();
+    this.dropLate();
     this.machine.fail();
     this.reported = "IDLE";
     this.report("left-out");

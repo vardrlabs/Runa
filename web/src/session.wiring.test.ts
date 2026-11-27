@@ -4,11 +4,12 @@ import { generateIdentity, signPayload, type Identity } from "./crypto/identity"
 import { generateKx, kxStatement } from "./crypto/kx";
 import { wrapWithLengthAndPad } from "./doc/ydoc";
 import type { EvictDeps } from "./evict/coordinator";
+import { encodeCommit } from "./evict/frame";
 import { deriveReRoot, newLinkWayIn, newPassWayIn, type WayIn } from "./evict/reroot";
 import type { Keyring } from "./epoch/keyring";
 import { EPOCH_OVERLAP_MS, LEAVE_GRACE_MS, ROTATOR_FALLBACK_MS } from "./epoch/rotation";
-import { KEY_STATUS_TEXT, Session, type SessionEvents } from "./session";
-import { FT } from "./transport/frame";
+import { KEY_STATUS_TEXT, Session, type SessionConfig, type SessionEvents } from "./session";
+import { encodeHeader, FT, PROTOCOL_VERSION } from "./transport/frame";
 import { toB64, type JoinAck, type SocketEvents } from "./transport/socket";
 
 /// What Session.create hands the socket, and what the session asks of it.
@@ -160,12 +161,20 @@ afterEach(() => {
 });
 
 /// A session joined to a room of this tab (seq 1), `a` (seq 2) and `b` (seq 3).
-async function joined(opts: { wayKind?: "link" | "pass" } = {}) {
+async function joined(opts: { wayKind?: "link" | "pass"; restoreRoom?: SessionConfig["restoreRoom"] } = {}) {
   const contentKey = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(9), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
   const chainKey = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(8), "HKDF", false, ["deriveBits", "deriveKey"]);
   const { events, seen } = recorder();
   const session = await Session.create(
-    { url: "wss://relay.invalid/socket", roomIdHex: ROOM_HEX, authKey: new Uint8Array(32).fill(1), contentKey, chainKey, wayKind: opts.wayKind ?? "link" },
+    {
+      url: "wss://relay.invalid/socket",
+      roomIdHex: ROOM_HEX,
+      authKey: new Uint8Array(32).fill(1),
+      contentKey,
+      chainKey,
+      wayKind: opts.wayKind ?? "link",
+      restoreRoom: opts.restoreRoom,
+    },
     events,
   );
   sessions.push(session);
@@ -335,12 +344,13 @@ describe("Session.create wiring: a tab left out of a re-root (amendment K)", () 
     expect(seen.leftOut).toBe(1);
   });
 
-  it("tells the page again when a later re-root it was let into is followed by one it was left out of", async () => {
-    const { session, seen, evictDeps, keyring } = await joined();
+  it("is not brought back by a later re-root: it stays left out and is not told again", async () => {
+    const { session, socket, seen, evictDeps, keyring } = await joined();
     evictDeps.leftOut();
     await reRoot(session, keyring, evictDeps);
     evictDeps.leftOut();
-    expect(seen.leftOut).toBe(2);
+    expect(seen.leftOut).toBe(1);
+    expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
   });
 
   it("does not stop telling the page when the page's callback throws", async () => {
@@ -353,6 +363,96 @@ describe("Session.create wiring: a tab left out of a re-root (amendment K)", () 
     expect(() => evictDeps.leftOut()).not.toThrow();
     expect(() => evictDeps.state("FAILED", "left-out")).not.toThrow();
     expect(calls).toBe(1);
+  });
+});
+
+describe("Session.create wiring: a left-out tab stops (amendment K)", () => {
+  /// A commit `a` signed for an epoch this tab has not reached: the evict
+  /// coordinator's later-epoch route to "left out".
+  async function laterCommit(a: { peerId: Uint8Array; identity: Identity }) {
+    const h = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.EVICT_COMMIT, roomId: ROOM, epoch: 3, nonceSess: new Uint8Array(4), flags: 0 });
+    const body = await encodeCommit(
+      h,
+      {
+        requestId: new Uint8Array(16).fill(0x41),
+        target: null,
+        targetKeyDigest: null,
+        verifier: new Uint8Array(32).fill(0x42),
+        salt: new Uint8Array(16).fill(0x43),
+        config: new Uint8Array(40),
+        votes: [{ voter: a.peerId, sig: new Uint8Array(64).fill(1) }],
+      },
+      { root: 4, sender: a.peerId, confirm: new Uint8Array(16), wraps: [] },
+      a.identity,
+    );
+    return { h, body };
+  }
+
+  it("stops its socket once, and does not reconnect, when a member's commit names an epoch it has not reached", async () => {
+    const { socket, seen, a } = await joined();
+    const { h, body } = await laterCommit(a);
+    socket.events.onEvictCommit?.(h, 3, a.peerId, body);
+    await waitFor(() => expect(seen.leftOut).toBe(1));
+    expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
+    socket.events.onEvictCommit?.(h, 3, a.peerId, body);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(seen.leftOut).toBe(1);
+    expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
+    expect(socket.calls).not.toContain("resume");
+    expect(socket.calls).not.toContain("reconnectNow");
+    const [text, alarming] = seen.keyStatus.at(-1)!;
+    expect(text).toMatch(/link changed, and this tab was not given the new one/);
+    expect(alarming).toBe(false);
+  });
+
+  it("stops its socket once when the evict coordinator fails its vote as left out", async () => {
+    const { socket, seen, evictDeps } = await joined();
+    evictDeps.state("FAILED", "left-out");
+    evictDeps.leftOut();
+    expect(seen.leftOut).toBe(1);
+    expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
+  });
+
+  it("refuses to propose once left out, and sends nothing", async () => {
+    const { session, socket, evictDeps } = await joined();
+    evictDeps.leftOut();
+    expect(await session.proposeEviction(null)).toBe("failed");
+    expect(socket.evictSent).toEqual([]);
+  });
+
+  it("refuses to propose when it was left out while Argon2id ran", async () => {
+    const { session, socket, evictDeps } = await joined({ wayKind: "pass" });
+    let finish: (w: WayIn) => void = () => {};
+    vi.mocked(newPassWayIn).mockImplementationOnce(() => new Promise<WayIn>((res) => (finish = res)));
+    const proposing = session.proposeEviction(null, "violet harbour copper lantern quartz ninety");
+    await Promise.resolve();
+    evictDeps.leftOut();
+    const way = { ...newLinkWayIn(), kind: "pass" as const, phrase: "violet harbour copper lantern quartz ninety" };
+    finish(way);
+    expect(await proposing).toBe("failed");
+    expect(socket.evictSent).toEqual([]);
+    expect(way.secret.every((x) => x === 0)).toBe(true);
+  });
+
+  it("is not brought back by a restart carry-over", async () => {
+    let restores = 0;
+    const restoreRoom = async () => {
+      restores += 1;
+      return "restored" as const;
+    };
+    // A tab that was not left out carries over: the control.
+    const control = await joined({ restoreRoom });
+    (control.socket as unknown as { heldRestartTicket: () => unknown }).heldRestartTicket = () => ({ ticket: "t", at: Date.now() });
+    expect(control.session.carryOver()).toBe(true);
+    await waitFor(() => expect(control.socket.calls).toContain("resume"));
+    const before = restores;
+    const { session, socket, evictDeps } = await joined({ restoreRoom });
+    (socket as unknown as { heldRestartTicket: () => unknown }).heldRestartTicket = () => ({ ticket: "t", at: Date.now() });
+    evictDeps.leftOut();
+    expect(session.carryOver()).toBe(false);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(restores).toBe(before);
+    expect(socket.calls).not.toContain("resume");
   });
 });
 

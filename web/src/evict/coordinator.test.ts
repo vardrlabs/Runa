@@ -760,6 +760,31 @@ describe("EvictCoordinator (amendment K)", () => {
     expect(b.leftOut).toBe(1);
     expect(b.keyring.rootEpoch).toBe(0);
   });
+
+  it("ends this member's own open vote and wipes its new way in when a later-epoch commit leaves it out (review M-3)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    hub.dropCommits = true;
+    const way = newLinkWayIn();
+    expect(await a.ev.propose(t.view(), way)).toBeNull();
+    await hub.flush();
+    for (const p of [b, c]) await p.ev.vote("APPROVE");
+    await hub.flush();
+    expect(a.ev.isOpen()).toBe(true);
+    const real = decodeCommit(hub.captured[0].body)!;
+    const h3 = header(FT.EVICT_COMMIT, 3);
+    const later = await encodeCommit(h3, real.clear, { ...real.tail, root: 4, sender: b.id }, b.identity);
+    await a.ev.receiveCommit(h3, 3, b.id, later);
+    expect(a.leftOut).toBe(1);
+    expect(a.states.at(-1)).toBe("FAILED");
+    expect(a.ev.isOpen()).toBe(false);
+    expect(way.secret.every((x) => x === 0)).toBe(true);
+    // Nothing kept for a late echo either: the tick after has nothing to apply.
+    hub.dropCommits = false;
+    hub.deliver(a, hub.captured[0].h, hub.captured[0].body);
+    await hub.flush();
+    expect(a.applied).toHaveLength(0);
+  });
 });
 
 describe("frames that arrive before their request (fix wave 1, A1)", () => {

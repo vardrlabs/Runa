@@ -130,9 +130,6 @@ function JoinableRoom(props: RoomProps) {
   const evictOpenRef = useRef(false);
   const evictPromptOpenRef = useRef(false);
   const shredOpenRef = useRef(false);
-  // The burn countdown makes the editor read-only too, and leaving the
-  // stranded state must not undo that.
-  const burningRef = useRef(false);
   // Whether this tab asked or was asked in the vote that is open, so its
   // ending can be said when the dialog is not on screen.
   const evictInvolvedRef = useRef(false);
@@ -349,7 +346,6 @@ function JoinableRoom(props: RoomProps) {
           },
           onCountdown: (phase) => {
             setLadder(phase);
-            burningRef.current = phase.kind === "burn";
             if (phase.kind === "burn") {
               editorRef.current?.updateOptions({ readOnly: true });
               setTemper("BURN");
@@ -436,20 +432,12 @@ function JoinableRoom(props: RoomProps) {
           },
           onEvictIgnored: (reason) => announce(ignoredText(reason, wayKind)),
           onReRooted: (r) => {
-            if (strandedRef.current === "removed") return;
+            // A removed or left-out tab has stopped for good: no re-root lets
+            // it back in.
+            if (strandedRef.current) return;
             if (r.fragment && props.roomIdHex) {
               fragmentRef.current = r.fragment;
               replaceRoomKey(props.roomIdHex, r.fragment, levelRef.current);
-            }
-            // A tab left out of one re-root and let into a later one can
-            // take part again.
-            if (strandedRef.current === "left-out") {
-              strandedRef.current = null;
-              setStranded(null);
-              // The editor's usual options do not name readOnly, so going
-              // back to them would leave it set. A room in its burn
-              // countdown stays read-only.
-              editorRef.current?.updateOptions({ readOnly: burningRef.current });
             }
             if (r.fingerprint) setFingerprint(r.fingerprint);
             shredOpenRef.current = false;
