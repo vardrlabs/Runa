@@ -4,6 +4,7 @@ import Editor, { loader } from "@monaco-editor/react";
 import * as monacoModule from "monaco-editor";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { clipboardReadAsksEveryTime, openBrowserMenuOnRightClick } from "../ui/contextmenu";
+import { silenceReadOnlyMessage } from "../ui/readonlymessage";
 
 loader.config({ monaco: monacoModule });
 
@@ -521,6 +522,10 @@ function JoinableRoom(props: RoomProps) {
 
   const onEditorMount = useCallback(
     async (editor: MonacoEditor.IStandaloneCodeEditor) => {
+      // Before anything can make it read-only: Monaco's own "Cannot edit"
+      // message breaks the page's Trusted Types policy, and the banner or the
+      // burn countdown already says why typing does nothing.
+      silenceReadOnlyMessage(editor);
       const model = editor.getModel();
       if (!model || !sessionRef.current) return;
       editorRef.current = editor;
