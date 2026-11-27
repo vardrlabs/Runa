@@ -907,6 +907,95 @@ describe("eviction and re-roots (amendment K)", () => {
     expect(onError).toHaveBeenCalledWith(4014);
   });
 
+  it("passes on each snapshot with the epoch of the frame it came in, not the epoch it sends under", async () => {
+    const onSnapshot = vi.fn();
+    const { socket, key, keyring } = await makeSocket({ events: { onSnapshot }, epochOverlapMs: 60_000 });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    const snapshot = async (epoch: number, k: CryptoKey, covers: bigint) => {
+      const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.SNAPSHOT, roomId: ROOM, epoch, nonceSess: new Uint8Array(4), flags: 0 });
+      const env = await new FrameCipher(k, OTHER).encrypt(header, text("state"), covers);
+      const body = new Uint8Array(8 + env.length);
+      new DataView(body.buffer).setBigUint64(0, covers, false);
+      body.set(env, 8);
+      return concatBytes(header, OTHER, body);
+    };
+    // Sealed under the epoch this socket has just left, then under its own.
+    ws.deliver(await snapshot(0, key, 3n));
+    await waitFor(() => onSnapshot.mock.calls.length === 1);
+    ws.deliver(await snapshot(1, keyring.current.contentKey, 4n));
+    await waitFor(() => onSnapshot.mock.calls.length === 2);
+    expect(onSnapshot.mock.calls[0][1]).toBe(3n);
+    expect(onSnapshot.mock.calls[0][3]).toBe(0);
+    expect(onSnapshot.mock.calls[1][1]).toBe(4n);
+    expect(onSnapshot.mock.calls[1][3]).toBe(1);
+  });
+
+  it("stays stopped after ERROR 4014 and then an abnormal close, and says so once", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(1006);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("says it was removed once when ERROR 4014 comes twice", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("does not come back on resume() after a close with 4014", async () => {
+    await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.close(4014);
+    const before = FakeWebSocket.all.length;
+    const socket = sockets[sockets.length - 1];
+    socket.resume();
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+  });
+
+  it("ignores reconnectNow() once removed, so the page is not told twice that it disconnected", async () => {
+    const onDisconnected = vi.fn();
+    const { socket } = await makeSocket({ events: { onDisconnected } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(4014);
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    const before = FakeWebSocket.all.length;
+    socket.reconnectNow();
+    await sleep(700);
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(FakeWebSocket.all.length).toBe(before);
+  });
+
   it("joins with the replacement key after a re-root", async () => {
     const { socket } = await makeSocket();
     const ws = latest();

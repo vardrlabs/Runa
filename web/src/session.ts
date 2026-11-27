@@ -152,6 +152,16 @@ export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
     "This room's link changed, and this tab was not given the new one. Ask someone in the room for the new link or passphrase.",
 };
 
+/// `KEY_STATUS_TEXT` for a room opened the way `way` says: a shared room is
+/// told that its passphrase changed, never its link.
+export function keyStatusText(way: WayKind): Record<KeyStatus, string | null> {
+  const word = way === "pass" ? "passphrase" : "link";
+  return {
+    ...KEY_STATUS_TEXT,
+    "left-out": `This room's ${word} changed, and this tab was not given the new one. Ask someone in the room for the new ${word}.`,
+  };
+}
+
 /// Passes a key status on only when it changes. The coordinator repeats
 /// "waiting" every second, and each report re-renders the room page.
 export type KeyStatusReporter = ((s: KeyStatus) => void) & {
@@ -159,19 +169,23 @@ export type KeyStatusReporter = ((s: KeyStatus) => void) & {
   alarming(): boolean;
 };
 
-/// "left-out" is not a sign of tampering, but a tab in that state can no
-/// longer follow the room, and the person has to ask someone for the new link
-/// or passphrase: it is shown the same way, so it is not missed.
+/// The states that may mean tampering. The alarm they raise sticks over a
+/// later SECURE. "left-out" is not one of them: a member left out of a
+/// re-root, or one that joined after the request, was not tampered with, and
+/// its text says what happened and what to do.
 const isAlarming = (s: KeyStatus | null): boolean =>
-  s === "refused" || s === "roster-mismatch" || s === "server-behind" || s === "left-out";
+  s === "refused" || s === "roster-mismatch" || s === "server-behind";
 
-export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "onTemper">): KeyStatusReporter {
+export function keyStatusReporter(
+  events: Pick<SessionEvents, "onKeyStatus" | "onTemper">,
+  text: Record<KeyStatus, string | null> = KEY_STATUS_TEXT,
+): KeyStatusReporter {
   let last: KeyStatus | null = null;
   const report = ((s: KeyStatus) => {
     if (s === last) return;
     last = s;
     const alarming = isAlarming(s);
-    events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
+    events.onKeyStatus?.(text[s], alarming);
     if (alarming) events.onTemper("WATCH");
   }) as KeyStatusReporter;
   report.alarming = () => isAlarming(last);
@@ -270,6 +284,13 @@ export interface SessionEvents {
   onKeyStatus?(message: string | null, alarming: boolean): void;
   /// Someone asks this member to agree to removing someone, or to changing
   /// the link (amendment K). `who` is null for a link change.
+  ///
+  /// Raised after the names are worked out, which awaits. The session does
+  /// not raise it for a vote that is no longer open by then, but a state can
+  /// still overtake it on the way to the page: a page that has already shown
+  /// a terminal state (REJECTED, EXPIRED, CANCELLED, FAILED, DONE) for the
+  /// vote ignores a prompt that comes after it. Answering one anyway is
+  /// harmless, since the coordinator refuses a vote for a closed request.
   onEvictPrompt?(p: { by: string; who: string | null }): void;
   /// Where a vote to remove someone or change the link stands.
   onEvictState?(state: string, reason?: string): void;
@@ -349,6 +370,12 @@ export class Session {
   private rerootGen = 0;
   /// The room removed this tab (amendment K).
   private removedSaid = false;
+  /// A forgetting of the old root's keys is queued on the epoch queue.
+  private forgetting = false;
+  /// The reason this tab's own commit just failed with, while the evict
+  /// coordinator's task that failed it is still running: the refusal it
+  /// reports next is of this tab's own commit.
+  private ownCommitFailed: string | null = null;
   securityLevel: SecurityLevel = "highest";
   private epochTimer: ReturnType<typeof setInterval> | null = null;
   /// A JOIN_ACK arrived while this tab held no key for the room's epoch, so
@@ -396,7 +423,7 @@ export class Session {
     this.socket = socket;
     this.machine = machine;
     this.internals = internals;
-    this.keyStatus = keyStatusReporter(events);
+    this.keyStatus = keyStatusReporter(events, keyStatusText(cfg.wayKind));
   }
 
   static async create(cfg: SessionConfig, events: SessionEvents): Promise<Session> {
@@ -504,7 +531,7 @@ export class Session {
           ),
         onDocUpdate: (sender, envelope) =>
           sessionRef?.handleRemoteUpdate(envelope) ?? void sender,
-        onSnapshot: (sender, covers, blob) => sessionRef?.handleSnapshot(sender, covers, blob),
+        onSnapshot: (sender, covers, blob, epoch) => sessionRef?.handleSnapshot(sender, covers, blob, epoch),
         onAwareness: (sender, pt) => sessionRef?.awareness?.receive(sender, pt),
         onShredFrame: (ft, sender, pt) => void sessionRef?.handleShredFrame(ft, sender, pt),
         onPeerJoin: (entry) => peerJoined(entry),
@@ -619,7 +646,7 @@ export class Session {
       sealedConfig: () => session.sealedConfig(),
       applyReRoot: (r) => session.applyReRoot(r),
       prompt: (p) => void session.raiseEvictPrompt(p),
-      state: (st, reason) => events.onEvictState?.(st, reason),
+      state: (st, reason) => session.evictStateChanged(st, reason),
       refused: (reason) => session.evictRefused(reason),
       leftOut: () => session.reportKeyStatus("left-out"),
       // This tab was the one removed, under an earlier connection or with no
@@ -771,15 +798,20 @@ export class Session {
     // What a commit seals again under the new key. A commit cannot change
     // the room's expiry or level, so a re-root that lands during the await
     // above changes nothing read here.
+    // Both fallbacks run when the config is missing or will not open (`cfg`
+    // is null): the clear values are all there is then. The coordinator's
+    // check of a commit's config compares only the expiry and the level.
     this.sealed = {
       ttl: cfg?.ttl ?? { kind: ack.ttl.kind, secs: ack.ttl.secs },
       ceilingOptout: cfg?.ceilingOptout ?? ack.ceiling_optout,
       level,
     };
     // Members who left while this tab was away count as departures, the same
-    // as a PEER_LEAVE it saw (amendment J).
+    // as a PEER_LEAVE it saw (amendment J), and an open vote they were part
+    // of fails as voter-left now rather than at its deadline (amendment K).
     for (const gone of departedMembers(rosterBefore, [...this.internals.roster.values()])) {
       this.coordinator.memberLeft(gone);
+      void this.evict?.memberLeft(gone);
     }
     // A JOIN_ACK without root_epoch comes from a server that predates
     // amendment J: it never advances a room, so no step is sent or followed.
@@ -895,14 +927,29 @@ export class Session {
   /// snapshotter can, and show the new way in once.
   ///
   /// Called synchronously inside the queue task that re-rooted the keyring,
-  /// so it neither awaits nor throws: a throw would reach the coordinator
-  /// after the socket already owns the new auth key. The socket gets the key
-  /// first, and every page callback after it is fenced off.
+  /// so it never awaits. The socket gets the key first, and every page
+  /// callback after it is fenced off. Switching the send cipher is not: if it
+  /// failed, the socket would go on sending under the old root, which a
+  /// removed member holds. Then the socket stops, the secrets here are wiped,
+  /// and the throw reaches the coordinator, which zeroes the auth key the
+  /// stopped socket no longer uses.
   private applyReRoot(r: ReRooted): void {
     this.socket.replaceAuthKey(r.keys.authKey);
+    // The socket owns this array and zeroes it at its final close. The
+    // session holds the same reference, as it did for the first key, and
+    // none to the old one, which the socket zeroed.
+    this.cfg.authKey = r.keys.authKey;
     this.cfg.contentKey = r.keys.contentKey;
     this.cfg.chainKey = r.keys.chainKey;
-    quietly(() => this.socket.adoptEpoch(r.root));
+    try {
+      this.socket.adoptEpoch(r.root);
+    } catch (e) {
+      quietly(() => this.socket.stopReconnecting());
+      r.keys.fingerprintSeed.fill(0);
+      wipeWayIn(r.way);
+      quietly(() => this.events.onTemper("COLD"));
+      throw e;
+    }
     // Clears the departures the re-root cut out and reports "ok", which
     // reaches the page.
     quietly(() => this.coordinator.reRooted(r.targetKey));
@@ -945,15 +992,27 @@ export class Session {
   /// just before it can still be read. The keyring is changed on the epoch
   /// queue, like every other change to it, and the conditions are read again
   /// there.
+  ///
+  /// The timer asks every second: while a forgetting waits on the queue, it
+  /// is not queued again.
   private forgetOldRoot(): Promise<void> {
-    if (!this.oldRootDue()) return Promise.resolve();
-    return this.coordinator
-      .exclusive(async () => {
+    if (this.forgetting || !this.oldRootDue()) return Promise.resolve();
+    this.forgetting = true;
+    let queued: Promise<void>;
+    try {
+      queued = this.coordinator.exclusive(async () => {
         if (!this.oldRootDue()) return;
         this.keyring.forgetBeforeRoot();
         this.rerootAt = null;
-      })
-      .catch(() => undefined);
+      });
+    } catch {
+      queued = Promise.resolve();
+    }
+    return queued
+      .catch(() => undefined)
+      .finally(() => {
+        this.forgetting = false;
+      });
   }
 
   private oldRootDue(): boolean {
@@ -978,17 +1037,49 @@ export class Session {
     try {
       const by = await handleFromPubkey(p.proposerKey);
       const who = p.targetKey ? await handleFromPubkey(p.targetKey) : null;
+      // The vote may have ended during the awaits above.
+      if (this.evict && !this.voteStillOpen(p.requestId)) return;
       this.events.onEvictPrompt?.({ by, who });
     } catch {
       // A page that cannot show the prompt leaves the vote to its deadline.
     }
   }
 
-  /// A commit that failed a check is a key change refused, shown like one;
-  /// anything else is a request ignored.
+  private voteStillOpen(requestId: Uint8Array): boolean {
+    const m = this.evict.machine;
+    const cur = m.current();
+    return m.state === "VOTING" && cur !== null && bytesEqual(cur.request.id, requestId);
+  }
+
+  /// Where a vote stands, from the evict coordinator. When it fails this
+  /// tab's own commit, it reports FAILED with the commit's fault and then
+  /// refuses the commit with the same reason, in the same task: that refusal
+  /// is noted here as this tab's own.
+  private evictStateChanged(state: string, reason?: string): void {
+    this.ownCommitFailed = state === "FAILED" && reason?.startsWith("commit-") ? reason : null;
+    if (this.ownCommitFailed !== null) {
+      queueMicrotask(() => {
+        this.ownCommitFailed = null;
+      });
+    }
+    this.events.onEvictState?.(state, reason);
+  }
+
+  /// A commit that failed a check may mean tampering: it is a key change
+  /// refused, and raises the alarm. Two commit faults do not: `commit-stale`
+  /// (the keyring had already moved, a benign race with another commit) and
+  /// any fault in this tab's own commit, whose vote the page was already told
+  /// failed. Anything else is a request ignored.
   private evictRefused(reason: string): void {
-    if (reason.startsWith("commit-") || reason === "malformed-commit") this.reportKeyStatus("refused");
-    else this.events.onEvictIgnored?.(reason);
+    const own = this.ownCommitFailed !== null && reason === this.ownCommitFailed;
+    this.ownCommitFailed = null;
+    const commit = reason.startsWith("commit-") || reason === "malformed-commit";
+    if (!commit) {
+      this.events.onEvictIgnored?.(reason);
+      return;
+    }
+    if (own || reason === "commit-stale") return;
+    this.reportKeyStatus("refused");
   }
 
   /// After a rotation the elected member snapshots straight away, so the log
@@ -1140,7 +1231,8 @@ export class Session {
     void this.refreshOwnHash();
   }
 
-  private handleSnapshot(_sender: Uint8Array, covers: bigint, blobWithPrefix: Uint8Array): void {
+  /// `epoch` is the epoch the snapshot was sealed under, from its frame.
+  private handleSnapshot(_sender: Uint8Array, covers: bigint, blobWithPrefix: Uint8Array, epoch?: number): void {
     try {
       this.doc.applyRemote(blobWithPrefix);
     } catch {
@@ -1148,10 +1240,12 @@ export class Session {
     }
     const c = Number(covers);
     this.doc.cursor.noteBelow(c);
-    // A snapshot that arrives after a re-root. The socket does not say which
-    // epoch it was sealed under, so one sent just before the commit counts
-    // too; the overlap still has to pass before old keys go.
-    if (this.rerootAt !== null) this.rerootSnapshotSeen = true;
+    // Only a snapshot sealed under the current root lets the keys before it
+    // go (amendment K). One sealed under the old root, sent just before the
+    // commit and delivered after it, may cover less than the old-root entries
+    // this tab still has to read. One that lands before any re-root is
+    // forgotten by the next, which starts the wait again.
+    if (epoch !== undefined && epoch >= this.keyring.rootEpoch) this.rerootSnapshotSeen = true;
     if (Number.isSafeInteger(c)) this.lastCovered = Math.max(this.lastCovered, c);
     void this.refreshOwnHash();
   }

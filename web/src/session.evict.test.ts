@@ -3,7 +3,7 @@ import { fingerprintWords } from "./crypto/fingerprint";
 import { EPOCH_OVERLAP_MS } from "./epoch/rotation";
 import { handleFromPubkey } from "./doc/awareness";
 import type { ReRooted } from "./evict/coordinator";
-import { KEY_STATUS_TEXT, keyStatusReporter, Session } from "./session";
+import { KEY_STATUS_TEXT, keyStatusReporter, keyStatusText, Session } from "./session";
 import { toB64 } from "./transport/socket";
 
 /// What a Session's eviction wiring touches, built without a network. Each
@@ -108,6 +108,7 @@ interface SessionPrivates {
   forgetOldRoot(): Promise<void>;
   removedFromRoom(): void;
   evictRefused(reason: string): void;
+  evictStateChanged(state: string, reason?: string): void;
   raiseEvictPrompt(p: { requestId: Uint8Array; proposerKey: Uint8Array; target: Uint8Array | null; targetKey: Uint8Array | null }): Promise<void>;
   proposeEviction(target: Uint8Array | null, passphrase?: string): Promise<string | null>;
   sealedConfig(): { ttl: { kind: string; secs: number }; ceilingOptout: boolean; level: string };
@@ -190,6 +191,64 @@ describe("a re-root this tab applied", () => {
     expect(r.way.secret.every((b) => b === 0)).toBe(true);
     expect(r.keys.fingerprintSeed.every((b) => b === 0)).toBe(true);
     await vi.waitFor(() => expect(shown.reRooted).toHaveLength(1));
+  });
+});
+
+describe("a re-root this tab applied (fix wave 1)", () => {
+  it("does not hide a failure to switch the send cipher: the socket stops, the secrets are wiped, and the throw reaches the coordinator", () => {
+    const { session, socket, calls } = fakeSession();
+    socket.adoptEpoch = () => {
+      throw new Error("no cipher");
+    };
+    const { r } = reRooted("link", null);
+    expect(() => session.applyReRoot(r)).toThrow("no cipher");
+    expect(calls).toContain("stopReconnecting");
+    expect(r.way.secret.every((b) => b === 0)).toBe(true);
+    expect(r.keys.fingerprintSeed.every((b) => b === 0)).toBe(true);
+  });
+
+  it("keeps no reference to the old auth key, which the socket zeroed", () => {
+    const { s, session } = fakeSession();
+    const old = new Uint8Array(32).fill(1);
+    (s.cfg as Record<string, unknown>).authKey = old;
+    const { r, authKey } = reRooted("link", null);
+    session.applyReRoot(r);
+    expect((s.cfg as { authKey: Uint8Array }).authKey).toBe(authKey);
+  });
+
+  it("queues the forgetting of old keys at most once while the epoch queue is held up", async () => {
+    vi.useFakeTimers();
+    const { s, session, keyring } = fakeSession();
+    let release: () => void = () => {};
+    const blocker = new Promise<void>((res) => (release = res));
+    let queued = 0;
+    (s.coordinator as { exclusive: unknown }).exclusive = <T>(fn: () => Promise<T>): Promise<T> => {
+      queued += 1;
+      return blocker.then(fn);
+    };
+    session.applyReRoot(reRooted("link", null).r);
+    s.rerootSnapshotSeen = true;
+    vi.advanceTimersByTime(EPOCH_OVERLAP_MS);
+    const runs = [session.forgetOldRoot(), session.forgetOldRoot(), session.forgetOldRoot()];
+    expect(queued).toBe(1);
+    release();
+    await Promise.all(runs);
+    expect(keyring.forgot).toBe(1);
+  });
+
+  it("says in a shared room that its passphrase changed, never its link", () => {
+    const shown: (string | null)[] = [];
+    const report = keyStatusReporter({ onKeyStatus: (m) => shown.push(m), onTemper: () => {} }, keyStatusText("pass"));
+    report("left-out");
+    expect(shown[0]).toMatch(/passphrase changed/);
+    expect(shown[0]).not.toMatch(/\blink\b/);
+    expect(keyStatusText("link")["left-out"]).toMatch(/link changed/);
+    expect(keyStatusText("link")["left-out"]).not.toMatch(/passphrase/);
+    for (const t of [...Object.values(keyStatusText("pass")), ...Object.values(keyStatusText("link"))]) {
+      if (t === null) continue;
+      expect(t).not.toMatch(/\u2014/);
+      expect(t).not.toMatch(/\bwe\b/i);
+    }
   });
 });
 
@@ -377,12 +436,61 @@ describe("what the session says about eviction frames", () => {
     expect(shown.prompts).toEqual([{ by: await handleFromPubkey(proposerKey), who: await handleFromPubkey(targetKey) }]);
   });
 
-  it("treats a tab left out of a re-root as something the person must notice", () => {
+  it("tells a tab left out of a re-root what happened without the tampering alarm", () => {
+    // Controller's decision (fix wave 1, M4): the alarm means possible
+    // tampering and sticks over a later SECURE. A member left out of a
+    // re-root, or one that joined after the request, was not tampered with.
     const tempers: string[] = [];
-    const report = keyStatusReporter({ onKeyStatus: () => {}, onTemper: (t) => tempers.push(t) });
+    const shown: { m: string | null; alarming: boolean }[] = [];
+    const report = keyStatusReporter({ onKeyStatus: (m, alarming) => shown.push({ m, alarming }), onTemper: (t) => tempers.push(t) });
     report("left-out");
-    expect(report.alarming()).toBe(true);
-    expect(tempers).toEqual(["WATCH"]);
+    expect(report.alarming()).toBe(false);
+    expect(tempers).toEqual([]);
+    expect(shown).toEqual([{ m: KEY_STATUS_TEXT["left-out"], alarming: false }]);
+  });
+
+  it("does not raise the alarm for a commit that lost a race to another one", () => {
+    const { session, shown } = fakeSession();
+    session.evictRefused("commit-stale");
+    expect(shown.keyStatus).toEqual([]);
+    expect(shown.ignored).toEqual([]);
+  });
+
+  it("does not raise the alarm when this tab's own commit fails, and still does for anyone else's", async () => {
+    const { session, shown } = fakeSession();
+    // The coordinator ends this tab's vote, then refuses the commit, in one go.
+    session.evictStateChanged("FAILED", "commit-keys");
+    session.evictRefused("commit-keys");
+    expect(shown.keyStatus).toEqual([]);
+    // Someone else's commit with the same fault, straight after.
+    session.evictRefused("commit-keys");
+    expect(shown.keyStatus).toEqual([KEY_STATUS_TEXT.refused]);
+  });
+
+  it("forgets that its own commit failed once the coordinator's task is over", async () => {
+    const { session, shown } = fakeSession();
+    session.evictStateChanged("FAILED", "commit-config");
+    await Promise.resolve();
+    session.evictRefused("commit-config");
+    expect(shown.keyStatus).toEqual([KEY_STATUS_TEXT.refused]);
+  });
+
+  it("raises no prompt for a vote that ended while the names were worked out", async () => {
+    const { s, session, shown } = fakeSession();
+    const requestId = new Uint8Array(16).fill(3);
+    const machine = { state: "VOTING", current: () => ({ request: { id: requestId } }) };
+    s.evict = { machine };
+    const prompt = { requestId, proposerKey: new Uint8Array(32).fill(5), target: null, targetKey: null };
+    const raising = session.raiseEvictPrompt(prompt);
+    machine.state = "CANCELLED";
+    await raising;
+    expect(shown.prompts).toEqual([]);
+    machine.state = "VOTING";
+    await session.raiseEvictPrompt(prompt);
+    expect(shown.prompts).toHaveLength(1);
+    // A different request open now is not the one asked about.
+    await session.raiseEvictPrompt({ ...prompt, requestId: new Uint8Array(16).fill(4) });
+    expect(shown.prompts).toHaveLength(1);
   });
 });
 

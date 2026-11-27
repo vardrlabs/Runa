@@ -68,7 +68,10 @@ export interface JoinAck {
 export interface SocketEvents {
   onJoinAck(ack: JoinAck): void;
   onDocUpdate(sender: Uint8Array, envelope: Uint8Array): void;
-  onSnapshot(sender: Uint8Array, covers: bigint, envelope: Uint8Array): void;
+  /// `epoch` is the epoch of the frame the snapshot came in, the one it was
+  /// sealed under, so a re-root can tell a snapshot under its new root from
+  /// one sealed under the old root and delivered late (amendment K).
+  onSnapshot(sender: Uint8Array, covers: bigint, envelope: Uint8Array, epoch: number): void;
   onAwareness(sender: Uint8Array, plaintext: Uint8Array): void;
   onShredFrame(frameType: number, sender: Uint8Array, plaintext: Uint8Array): void;
   onPeerJoin(entry: RosterEntry): void;
@@ -406,6 +409,9 @@ export class RunaSocket {
   /// Drop this connection and join again, to be handed the room's keys as a
   /// newcomer. For a member that saw the room move to an epoch it cannot follow.
   reconnectNow(): void {
+    // A removed tab stays stopped, and its page was already told it is
+    // disconnected.
+    if (this.removed) return;
     this.abandonConnection();
   }
 
@@ -908,7 +914,7 @@ export class RunaSocket {
             env.body.slice(8),
             snapshotCoversOf(env.body),
           );
-          this.events.onSnapshot(senderId, covers, pt);
+          this.events.onSnapshot(senderId, covers, pt, header.epoch);
         } catch {
           return;
         }
