@@ -570,12 +570,13 @@ describe("model check", () => {
 });
 
 describe("request limits", () => {
-  it("refuses a deadline of zero or beyond an hour, and takes exactly an hour", async () => {
+  it("refuses a deadline of zero or beyond two minutes, and takes exactly two minutes", async () => {
     const room = await makeRoom(3);
     const [a, b, t] = room.people;
     expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 0 }), a.id)).toBe("malformed");
-    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 3_600_001 }), a.id)).toBe("malformed");
-    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 3_600_000 }), a.id)).toBeNull();
+    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 120_001 }), a.id)).toBe("malformed");
+    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 3_600_000 }), a.id)).toBe("malformed");
+    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 120_000 }), a.id)).toBeNull();
   });
 });
 

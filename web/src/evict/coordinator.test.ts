@@ -601,7 +601,7 @@ describe("EvictCoordinator (amendment K)", () => {
   it("answers a deadline out of range without opening a vote, and wipes the way in", async () => {
     const { peers } = await room(3);
     const [a, , c] = peers;
-    for (const ms of [0, -1, 3_600_001, 1.5, Number.NaN]) {
+    for (const ms of [0, -1, 120_001, 3_600_000, 1.5, Number.NaN]) {
       const way = newLinkWayIn();
       expect(await a.ev.propose(c.view(), way, ms)).toBe("failed");
       expect(way.secret.every((x) => x === 0)).toBe(true);
@@ -612,7 +612,7 @@ describe("EvictCoordinator (amendment K)", () => {
   it("accepts the longest deadline", async () => {
     const { hub, peers } = await room(3);
     const [a, , c] = peers;
-    expect(await a.ev.propose(c.view(), newLinkWayIn(), 3_600_000)).toBeNull();
+    expect(await a.ev.propose(c.view(), newLinkWayIn(), 120_000)).toBeNull();
     await hub.flush();
   });
 

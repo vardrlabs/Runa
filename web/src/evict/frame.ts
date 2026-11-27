@@ -12,7 +12,10 @@ import { ZERO_KEY_DIGEST, ZERO_PEER } from "./statement";
 /// server reads, then a signed CBOR tail only members read.
 
 export const MAX_VOTES = 32;
-export const MAX_DEADLINE_MS = 3_600_000;
+/// The longest vote, two minutes. The server keeps a request's record, and
+/// holds key changes in the room for it, for 150 seconds: the vote and half a
+/// minute for the commit to follow.
+export const MAX_DEADLINE_MS = 120_000;
 export const MAX_CONFIG_LEN = 4096;
 export const SIG_LEN = 64;
 const MAX_TAIL = 64 * 1024;

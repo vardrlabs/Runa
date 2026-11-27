@@ -70,13 +70,18 @@ describe("EVICT_REQUEST", () => {
     expect(decodeRequest(encodeRequest(relink))).toEqual(relink);
   });
 
+  it("takes the longest vote, two minutes", () => {
+    expect(decodeRequest(encodeRequest(request({ deadline: 120_000 })))?.deadline).toBe(120_000);
+  });
+
   it("refuses what amendment K does not allow", () => {
     for (const bad of [
       request({ id: new Uint8Array(15) }),
       request({ verifier: new Uint8Array(31) }),
       request({ roster: new Uint8Array(33) }),
       request({ sig: new Uint8Array(63) }),
-      request({ deadline: 3_600_001 }),
+      request({ deadline: 120_001 }),
+      request({ deadline: 3_600_000 }),
       request({ targetKey: null }),
       request({ targetKey: new Uint8Array(40) }),
       request({ target: null, targetKey: new Uint8Array(32) }),
