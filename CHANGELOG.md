@@ -26,9 +26,11 @@ section, so this file is not documentation of the release, it is part of it.
   Everyone else in the room has to agree, and any one of them can refuse; the
   server checks that everyone agreed too. The person being removed isn't asked.
   They can't block it by changing the room's key, because while a request is
-  open the server holds key changes back for up to two and a half minutes, but a
-  member who is determined to stay can still block their own removal, and the
-  threat model says how. A tab still running an earlier version can't vote, so
+  open the server holds key changes back for up to two and a half minutes, and
+  they can't block it by keeping a request of their own open, because several
+  requests can be open at once. A member who is determined to stay can still
+  block their own removal, though, and the threat model says how. A tab still
+  running an earlier version can't vote, so
   nothing can be removed or changed while one is open until it's reloaded. The
   person who asks makes the new link first, or for a shared room types or
   generates a new passphrase, held to the same strength check as a new room's.
