@@ -467,7 +467,9 @@ going to.
 - PING, TTL_EXTEND, PURGE_ACK and DOC_SYNC_REQ carry no ciphertext and are
   never refused for their epoch. Server-authored frames still carry epoch 0.
 - Restart tickets cover `epoch` and `root_epoch`. A ticket from a process that
-  predates this amendment has neither, and restores the room at 0.
+  predates this amendment has neither, and restores the room at 0. Once the
+  server has begun issuing a room's tickets it refuses every further step for
+  that room, so a ticket holds the epoch its members hold.
 
 Every rotation is visible to the server: it relays the frame and moves the
 epoch. It already saw the departure that caused it. The secret itself reaches
@@ -491,10 +493,12 @@ the peer, so the server recognises all of those connections too. Any one of
 the members who must approve can stop it by refusing, and a request nobody
 settles fails at its deadline (60 seconds by default, at most an hour). The
 request also fails when its proposer or any member whose approval it needs
-leaves, and when the room's epoch changes during the vote, since every
-signature names the epoch. The target leaving does not stop it: the room still
-moves to the new way in, and a connection the target opens again is never
-given it.
+leaves, and when the room re-roots during the vote, since every signature
+names the room's root epoch. An EPOCH_KEY step during the vote does not end
+it, on a member or on the server: a step does not move the root, and a member
+that approved before the step does not vote again. The target leaving does
+not stop it: the room still moves to the new way in, and a connection the
+target opens again is never given it.
 
 *The new way in.* The proposer makes it before asking. For a private room it is
 a new 32-byte link secret and a new 16-byte salt. For a shared-name room it is a
@@ -512,10 +516,12 @@ never stored. When an EVICT_REQUEST passes through, the server records, for
 its sender, the time and the join sequence number the next peer would get, as
 it does for a SHRED_REQUEST under amendment A. It cannot read the request, so
 the record is that sender's most recent request; one sender's request never
-replaces another's. Their plaintexts are canonical CBOR maps:
+replaces another's. A step leaves these records as they are, and a re-root
+clears them all. Their plaintexts are canonical CBOR maps:
 
 ```
-EVICT_REQUEST { "type": "EVICT_REQUEST", "id": bstr(16), "epoch": u32,
+EVICT_REQUEST { "type": "EVICT_REQUEST", "id": bstr(16),
+                "epoch": u32           the room's root epoch, not its current one,
                 "target": bstr(16)     peer id, all zero for a link change,
                 "targetKey": bstr      the target's signing key as sent in its JOIN,
                                        empty for a link change,
@@ -533,30 +539,38 @@ An approval, the proposer's included (its `sig` in the request), is a signature
 by the voter's session key over this fixed statement:
 
 ```
-"runa/v1/evict" || room_id (16) || id (16) || epoch (u32 BE)
+"runa/v1/evict" || room_id (16) || id (16) || root (u32 BE)
   || target peer id (16, zero for none)
   || target key digest (32, zero for none)
   || voter peer id (16) || verifier (32)
 ```
 
-The target key digest is SHA-256 of the request's `targetKey`: the target's
+`root` is the room's root epoch when the request was made, which the request
+carries as its `epoch`. A step does not move it, so an approval survives a
+step; every re-root moves it, so no approval can be used again after one. The
+target key digest is SHA-256 of the request's `targetKey`: the target's
 signing key in the raw form it sent in its JOIN, 32 bytes for Ed25519 or the
 65-byte uncompressed point for P-256. A link change names neither, and both
 fields are all zero.
 
-A member accepts a request only from a member in its roster, at the epoch it
-holds, naming a target in its roster with the signing key the roster shows for
-it, with a roster hash equal to its own, with itself in that roster under its
-own signing key, and with a valid signature over the digest of the target's
-key. It signs an approval only over that same digest. It counts an approval
-only from a member whose approval the request needs, and only once. A REJECT
-carries no signature: the relay's sender envelope already binds who sent it,
-and under UNANIMOUS any member can block by not answering. A cancel counts
-only from the proposer.
+A member accepts a request only from a member in its roster, only if the root
+it names is the root of its own keyring, and only if it names a target in its
+roster with the signing key the roster shows for it, with a roster hash equal
+to its own, with itself in that roster under its own signing key, and with a
+valid signature over the digest of the target's key. It signs an approval
+only over that same digest. It counts an approval only from a member whose
+approval the request needs, and only once. A REJECT carries no signature: the
+relay's sender envelope already binds who sent it, and under UNANIMOUS any
+member can block by not answering. A cancel counts only from the proposer.
 
 *EVICT_COMMIT.* Once every approval is in, the proposer sends EVICT_COMMIT
-under the header epoch the votes name. Its body is a clear part the server
-reads, then a tail it does not:
+with the room's current epoch, the one it holds, in the header. If it applies
+a step while its commit has been sent and not echoed, it builds the commit
+again for the new epoch (a new header, a new `root` in the tail, the wraps
+sealed again, a new signature) and sends it again, at most three times for
+one vote. The approvals are reused as they are, since they name the room's
+root, which a step does not move. Its body is a clear part the server reads,
+then a tail it does not:
 
 ```
 id (16) || target (16, zero for none) || target key digest (32, zero for none)
@@ -584,82 +598,110 @@ apart from a step's. `sig` is the proposer's signature over
 
 *Server rules.* The server reads the clear part and nothing after it. It
 refuses a clear part that names a target peer but no key digest, or a digest
-but no peer. It rebuilds each voter's statement from the clear part, with the
-target's peer id and key digest exactly as the clear part gives them, and
-checks every signature against the signing key that voter sent in its JOIN:
-Ed25519 with strict verification, or ECDSA P-256 over SHA-256 in WebCrypto's
-64-byte r||s form with a high s accepted, since WebCrypto does not normalise s.
-Then, in one step with the room's epoch and peer list locked, the same lock as
-an EPOCH_KEY step, it requires the header epoch to equal the room's; the
-sender to be one of the voters; a request from the sender recorded within the
-last hour and a minute; the named target, if it is still connected, to hold
-the signing key whose digest the clear part names; voters to be distinct,
-connected, still holding the key they signed with, not the target, and
-connected before that request passed; and more voters than half of the
-connected members, other than the target, who were connected before that
-request passed. To the server the target is every connection whose signing key
-has the digest the clear part names, as well as the named peer: none of them
-may vote, and none counts toward that half. Connections opened after the
-request neither vote nor count. A named target that is no longer connected
-does not stop the commit, and a connection of the target's that is still open
-is recognised by its key. It also refuses a verifier that cannot be a SHA-256
-output and a config larger than a new room's. If all of that holds, it
-replaces the verifier, salt and config, moves the room to the next epoch and
-makes that epoch its root, sends ERROR 4014 to every connection of the
-target's that is still open and closes each of them with 4014, closes any
-connection without a key-agreement key as a step does, and relays the commit
-to every other member, its sender included. Anything else is dropped without
-an answer; a proposer whose commit is not echoed within 10 seconds gives up. A
-commit is not held to the five-second spacing between steps, since a quorum of
-signatures already limits it, but it starts that spacing for the next step.
-From then on every reader of the room's verifier, salt and config sees the new
-values: JOIN, JOIN_ACK, room metadata, name resolution and restart tickets. A
-JOIN whose key was checked just before a commit is refused with 4001, so
-nobody holding the old key slips in beside it. Frames from a connection that
-is being closed are ignored.
+but no peer. In one step with the room's epoch and peer list locked, the same
+lock as an EPOCH_KEY step, it first makes every check that needs no
+signature: the header epoch equals the room's current epoch; the sender is
+one of the voters; a request from the sender was recorded within the last
+hour and a minute; the named target, if it is still connected, holds the
+signing key whose digest the clear part names; the voters are distinct,
+connected, not the target, and connected before that request passed; and
+every member of that request's cohort is among them. The cohort is every
+connection that is connected now, was connected before that request passed,
+and is not the target. To the server the target is every connection whose
+signing key has the digest the clear part names, as well as the named peer:
+none of them may vote, and none is in the cohort. Connections opened after
+the request neither vote nor are waited for, and a member of the cohort that
+has disconnected is no longer waited for. A commit that fails any of these
+costs no signature check. Each connection may then have at most 32 vote
+signatures checked a second, with a burst of 128, so that it can send a
+commit again after a step at once; a commit over that budget is dropped.
+
+The server then rebuilds each voter's statement from the clear part, with the
+target's peer id and key digest exactly as the clear part gives them and with
+the room's root epoch, so a vote that names any other root fails. It checks
+every signature against the signing key that voter sent in its JOIN: Ed25519
+with strict verification, or ECDSA P-256 over SHA-256 in WebCrypto's 64-byte
+r||s form with a high s accepted, since WebCrypto does not normalise s.
+Finally, locked again, it repeats every check above, and requires the room's
+root epoch to be the one the statements were rebuilt with and every voter to
+still hold the key it signed with. A named target that is no longer connected
+does not stop the commit, and a connection of the target's that is still
+open is recognised by its key. It also refuses a verifier whose bytes are
+all the same, as at room creation, and a config larger than a new room's.
+Once it has begun issuing the room's restart tickets (amendment I) it refuses
+every commit, as it does every step, so a ticket brings back the room its
+members hold the key to. If all of that holds, it replaces the verifier, salt
+and config, moves the room to the next epoch and makes that epoch its root,
+sends ERROR 4014 to every connection of the target's that is still open and
+closes each of them with 4014, closes any connection without a key-agreement
+key as a step does, and relays the commit to every other member, its sender
+included. Anything else is dropped without an answer; a proposer whose commit
+is not echoed within 10 seconds of its first send gives up. A commit is not
+held to the five-second spacing between steps, since the signatures of the
+whole cohort already limit it, but it starts that spacing for the next step.
+From then on every reader of the room's verifier, salt and config sees the
+new values: JOIN, JOIN_ACK, room metadata, name resolution and restart
+tickets. A JOIN whose key was checked just before a commit is refused with
+4001, so nobody holding the old key slips in beside it. Frames from a
+connection that is being closed are ignored.
 
 Two commits for the same epoch, or a commit and a step, are decided by the
 room in the order they arrive: the first moves the epoch, and the other then
-names an epoch the room has left. A step that loses to a commit names the
-room's new epoch and is relayed like a handover, which every member that has
-applied the commit ignores. In a room of two, either member can remove the
-other, and whichever commit arrives first wins.
+names an epoch the room has left. A commit that loses to a step is sent again
+for the new epoch, as described above. A step that loses to a commit names
+the room's new epoch and is relayed like a handover, which every member that
+has applied the commit ignores. In a room of two, either member can remove
+the other, and whichever commit arrives first wins.
 
 *Members.* A member applies a commit only for a request it saw, opened and
 still holds a record of, and only if, one at a time with every EPOCH_KEY it
-receives: the sender signed it and is one of the voters; its target, target key
-digest, verifier and epoch are those of that request, the digest being SHA-256
-of its `targetKey`; its votes cover exactly the members the policy needed (the
-roster the request froze, without every entry holding the target's signing
-key), each with a valid signature; its own wrap opens; the way in derives the
-verifier and salt the clear part names and the `confirm` in the tail; and the
-new config opens under the new content key with the same expiry and security
-level. It then starts its keyring again at `root` from the new root, keeping
-the keys of earlier epochs until a snapshot under the new root has landed and
-the overlap has passed, uses the new `auth` key for every later JOIN, and shows
-the new link or passphrase once, with the new fingerprint and a prompt to
-compare it again. An everyday private room replaces the key the tab keeps for a
-refresh. The snapshotter writes a snapshot under the new root as soon as it
-can, as after a step. A commit ends any open shred vote. A commit that fails a
-check is refused and shown. A member left without a wrap, or offline at the
-commit, cannot follow: its next JOIN fails with 4001, and it needs the new link
-or passphrase from someone who was there.
+receives: the sender signed it and is one of the voters; its target, target
+key digest and verifier are those of that request, the digest being SHA-256
+of its `targetKey`; its header epoch is the epoch this member holds, and the
+root that request named is still this member's root; its votes cover exactly
+the members the policy needed (the roster the request froze, without every
+entry holding the target's signing key), each with a valid signature; its own
+wrap opens; the way in derives the verifier and salt the clear part names and
+the `confirm` in the tail; and the new config opens under the new content key
+with the same expiry and security level. It then starts its keyring again at
+`root` from the new root, keeping the keys of earlier epochs until a snapshot
+under the new root has landed and the overlap has passed, uses the new `auth`
+key for every later JOIN, and shows the new link or passphrase once, with the
+new fingerprint and a prompt to compare it again. An everyday private room
+replaces the key the tab keeps for a refresh. The snapshotter writes a
+snapshot under the new root as soon as it can, as after a step. Once the
+overlap after the re-root has passed, every member, not only the snapshotter,
+drops a live DOC_UPDATE whose header epoch is below its root epoch; entries
+inside a sync response are not affected. A commit ends any open shred vote. A
+commit that fails a check is refused and shown. A member left without a wrap,
+or offline at the commit, cannot follow: its next JOIN fails with 4001, and it
+needs the new link or passphrase from someone who was there. The server
+cannot check what it cannot read, so it may already have applied a commit a
+member refuses: a proposer holding every approval can send one whose wraps or
+config the members refuse, and the server applies it. Those members cannot
+follow either.
 
 A member that never saw the request, saw it but did not open it, or no longer
 holds a record of it never applies the commit, never opens a wrap in it and
 leaves its keyring as it is. In an honest room every member wrapped for
-approved the request, so such a member is never one of them. It checks the
-commit as far as it can: the sender signed it and is one of the voters; its
-target key digest is SHA-256 of the signing key its roster shows for the named
-peer, if that peer is still listed; and its votes cover exactly its own roster
-without the named peer, without every entry whose signing key has the digest
-the commit names, and without itself, each with a valid signature. If all of
-that holds, it knows the room's way in changed without it and says so, or says
-it was removed if the digest the commit names is that of its own signing key.
-A commit that fails one of those checks is refused and shown. A member's
-record of the requests it saw is bounded: it lets go of requests it did not
-open before settled ones, the oldest first, never of the vote open now, and of
-all of them when the epoch moves.
+approved the request, so such a member is never one of them. It checks only
+what a dishonest commit can fail: the sender signed the commit, is listed in
+its roster, and is one of the voters; if the named target peer is still
+listed, the target key digest is SHA-256 of the signing key the roster shows
+for it; every voter still listed in its roster has a valid signature over the
+statement under the key the roster shows for it; and no voter holds the key
+the commit names as the target's, no voter is this member, and the voters are
+distinct. Whether the votes cover its current roster does not matter, since
+people can join during a vote and a voter can leave while the commit is on
+its way. If all of that holds, it says it was removed when the commit names
+its own signing key or peer id, and otherwise says it was left out. A commit
+that fails one of those checks is refused and shown. A tab that was left out
+stops its connection and does not reconnect, as a removed one does, keeps its
+document on screen read-only, and refuses to propose; a restart carry-over
+does not bring it back. A member's record of the requests it saw is bounded:
+it lets go of requests it did not open before settled ones, the oldest first,
+never of the vote open now, and of all of them when the root moves. A step
+leaves that record and the open vote as they are.
 
 *The removed member.* Its client stops reconnecting on 4014 and says it was
 removed. Every connection still open under its signing key gets 4014, the

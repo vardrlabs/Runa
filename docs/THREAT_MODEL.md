@@ -213,13 +213,15 @@ passphrase. Removing them takes it away. The person who asks has already made
 the replacement: a new link, or for a shared-name room a passphrase they typed
 or generated, held to the same strength check as a new room's. Everyone else in
 the room has to approve, any one of them can refuse, and a vote that nobody
-settles fails after a minute. Once everyone has approved, each member receives
-the new link or passphrase sealed to them alone, the server replaces what it
-checks a JOIN against, and the room's key starts again from the new link or
-passphrase. Changing the link is the same vote with nobody removed. It is what
-an everyday room can do about someone who once had its link, since an everyday
-room does not change its key when people leave. The design is in PROTOCOL
-amendment K.
+settles fails after a minute by default, or after as long as an hour if the
+person asking chose that. The server checks this too: it applies the change
+only when everyone the request was put to has approved. Once everyone has
+approved, each member receives the new link or passphrase sealed to them
+alone, the server replaces what it checks a JOIN against, and the room's key
+starts again from the new link or passphrase. Changing the link is the same
+vote with nobody removed. It is what an everyday room can do about someone who
+once had its link, since an everyday room does not change its key when people
+leave. The design is in PROTOCOL amendment K.
 
 What that buys, exactly:
 
@@ -242,26 +244,35 @@ What that buys, exactly:
   someone who was there.
 - **A member follows a change only for a request it saw**, in a roster that
   lists it under its own signing key. A member that did not see the request
-  checks what it can and is told it was left out, and its tab keeps what it
-  already had on screen, read-only.
+  checks what it can and is told it was left out. Its tab then stops
+  connecting, as a removed one does, and keeps what it already had on screen,
+  read-only.
 - **A hostile member can stall a removal.** Any member other than the person
   being removed can refuse, which is the point of the rule. A member can also
   make a vote fail, or make the others wait until a vote's deadline, by
   sending requests that cannot pass or by asking and then never sending the
   change once everyone has agreed. Nothing changes when that happens, and
   nobody is removed either.
+- **Until the change lands, the person being removed is still a member.**
+  They can see that a vote has started, because the kind of each frame is
+  visible to everyone in the room. They read everything written until the
+  change, they can vote on other things, and they can change the room's key
+  with a rotation step. A step does not stop the vote: every approval names
+  the room's root, which only a re-root moves, and the person who asked sends
+  the change again for the new key. Nobody asks for their approval, and it
+  would not count if they gave it.
 - **Someone being removed cannot dodge it by reconnecting: a new connection is
   not given the new link.** The room changes its link whether or not they are
   still connected, and only the people who approved receive the new one.
-- **Connections opened after a vote started are not counted.** The server
-  checks that more than half agreed among the people who were connected when
-  the request passed through it, so nobody can hold the vote down by opening
-  connections once it has begun. Connections the person being removed holds
-  under their own signing key are not counted at any time. They could only
-  inflate the count by opening connections under other keys before anyone
-  asked, and those show in the room as extra people, who would then have to be
-  asked too. Several connections that share one signing key, other than the
-  removed person's, each count as a separate member toward that half.
+- **Connections opened after a vote started are not asked.** The server
+  checks that everyone who was connected when the request passed through it,
+  and is still connected, approved, so nobody can hold the vote down by
+  opening connections once it has begun. Connections the person being removed
+  holds under their own signing key are never asked. They could only add to
+  the people who must approve by opening connections under other keys before
+  anyone asked, and those show in the room as extra people, who would then
+  have to be asked too. Several connections that share one signing key, other
+  than the removed person's, are each asked separately.
 - **A copy of someone's signing key counts as them.** A JOIN carries no proof
   that the connection holds the private half of the signing key it presents,
   so the server treats a connection that presents a copy of someone's public
@@ -272,7 +283,7 @@ What that buys, exactly:
   queue was already full at the commit is closed without the 4014 code, and
   the notice that it left carries no reason; an error already queued for it
   can be the one it receives.
-- **In a room of two, either person can remove the other.** Whichever request
+- **In a room of two, either person can remove the other.** Whichever change
   reaches the server first wins.
 - **The room's fingerprint changes.** Anyone who compared it before should
   compare the new one.
@@ -280,11 +291,16 @@ What that buys, exactly:
 Against the server:
 
 - **It checks the votes itself**, against the signing key each voter joined
-  with, and changes nothing unless more than half of the people who were
-  connected when the request passed through it, apart from every connection
-  holding the removed person's signing key, signed. Members hold the vote to the
-  stricter rule that everyone signed. In exchange the server learns which
-  connections voted to remove which, and when.
+  with, and changes nothing unless everyone who was connected when the request
+  passed through it and is still connected, apart from every connection
+  holding the removed person's signing key, signed. Members hold the vote to
+  the same rule, and also end it if anyone whose approval it needs leaves. In
+  exchange the server learns which connections voted to remove which, and
+  when.
+- **It cannot check what it cannot read.** Someone who holds everyone's
+  approval can still send a change whose sealed copies or new settings the
+  others refuse. The server applies it, and the people who refused are left
+  out with what they already had, as if they had left to start a new room.
 - **It never sees the new link or passphrase.** Each member's copy is sealed
   under a key agreed with the person who asked, as with rotation, and the same
   limit applies: a server working with the removed person can put its own
@@ -293,7 +309,10 @@ Against the server:
   this, because the fingerprint comes from the link itself.
 - **A server that will not enforce a removal** can keep accepting the old link,
   or keep the removed person's connection open. They still cannot read anything
-  written under the new key without the substitution above.
+  written under the new key without the substitution above. Such a server can
+  also pass the removed person's edits under the old key to the others, but
+  only until the overlap after the change has passed: from then on every
+  member drops them.
 - **Nothing stops a member who stays from passing the new link on.** Removal
   protects the room from the person removed, not from the people who keep their
   place.
