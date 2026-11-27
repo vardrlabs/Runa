@@ -73,6 +73,7 @@ class Peer {
   adopted: number[] = [];
   rejoined = 0;
   extraMember: MemberView | null = null;
+  held = false;
   constructor(
     readonly hub: Hub,
     readonly id: Uint8Array,
@@ -100,6 +101,7 @@ class Peer {
       },
       status: (s) => this.statuses.push(s),
       snapshotSoon: () => {},
+      stepsHeld: () => this.held,
     });
   }
 }
@@ -755,5 +757,83 @@ describe("EpochCoordinator", () => {
     expect(await sameKey(a.keyring.keyFor(1)!, d.keyring.keyFor(1)!)).toBe(true);
     expect(b.keyring.current.epoch).toBe(0);
     expect(b.rejoined).toBe(1);
+  });
+});
+
+describe("EpochCoordinator and re-roots (amendment K)", () => {
+  it("runs exclusive work one at a time, in order, and a failure does not stall the queue", async () => {
+    const { peers } = await room(2);
+    const [a] = peers;
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const first = a.coord.exclusive(async () => {
+      await gate;
+      order.push("first");
+    });
+    const second = a.coord.exclusive(async () => {
+      order.push("second");
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(order).toEqual([]);
+    release();
+    await Promise.all([first, second]);
+    expect(order).toEqual(["first", "second"]);
+    await expect(a.coord.exclusive(async () => Promise.reject(new Error("x")))).rejects.toThrow("x");
+    expect(await a.coord.exclusive(async () => 7)).toBe(7);
+  });
+
+  it("settles pending departures on a re-root, so no step follows", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    leave(hub, c);
+    for (const p of [a, b]) p.coord.reRooted(c.identity.publicKeyRaw);
+    hub.now += LEAVE_GRACE_MS * 2;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+    expect(a.statuses.at(-1)).toBe("ok");
+  });
+
+  it("does not count a removed peer's departure", async () => {
+    const { hub, peers } = await room(3);
+    const [, , c] = peers;
+    const view = hub.members().find((m) => m.peerId === c.id)!;
+    hub.peers = hub.peers.filter((p) => p !== c);
+    for (const p of hub.peers) p.coord.memberLeft(view, 4014);
+    hub.now += LEAVE_GRACE_MS * 2;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+  });
+
+  it("does not count the key a re-root cut out when its departure arrives later", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    for (const p of [a, b]) p.coord.reRooted(c.identity.publicKeyRaw);
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS * 2;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+  });
+
+  it("holds a due step while an eviction vote is open, and sends it after", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    a.held = b.held = true;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS + ROTATOR_FALLBACK_MS * 3;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+    a.held = b.held = false;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(1);
+  });
+
+  it("gives out a key-agreement key only once its signature checks out", async () => {
+    const { hub, peers } = await room(2);
+    const [a, b] = peers;
+    const view = hub.members().find((m) => m.peerId === b.id)!;
+    expect(await a.coord.kxOf(view)).toEqual(b.kx.publicKeyRaw);
+    const forged = { ...view, peerId: new Uint8Array(16).fill(0xee), kxSig: new Uint8Array(64) };
+    expect(await a.coord.kxOf(forged)).toBeNull();
   });
 });

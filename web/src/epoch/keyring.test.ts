@@ -197,3 +197,95 @@ describe("Keyring", () => {
     expect(r.secretsBlob()).toEqual(s);
   });
 });
+
+describe("Keyring re-roots (amendment K)", () => {
+  async function otherRoot() {
+    const content = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(21), { name: "AES-GCM" }, false, [
+      "encrypt",
+      "decrypt",
+    ]);
+    const chain = await deriveChainKey(new Uint8Array(32).fill(22), new Uint8Array(16).fill(23));
+    return { content, chain };
+  }
+
+  it("moves to a new root at the next epoch and keeps earlier keys for the log", async () => {
+    const r = await ring();
+    const s = randomEpochSecret();
+    const next = await stepKeys(r.current, s);
+    await r.applyStep(1, s, next.confirm);
+    const { content, chain } = await otherRoot();
+    const root = await r.reroot(2, content, chain);
+    expect(root?.epoch).toBe(2);
+    expect(r.rootEpoch).toBe(2);
+    expect(r.current.epoch).toBe(2);
+    expect(await sameKey(r.keyFor(2)!, content)).toBe(true);
+    expect(r.keyFor(1)).not.toBeNull();
+    expect(r.keyFor(0)).not.toBeNull();
+    expect(r.secretsBlob().length).toBe(0);
+  });
+
+  it("refuses a re-root that is not the next epoch", async () => {
+    const r = await ring();
+    const { content, chain } = await otherRoot();
+    expect(await r.reroot(2, content, chain)).toBeNull();
+    expect(await r.reroot(0, content, chain)).toBeNull();
+    expect(r.rootEpoch).toBe(0);
+  });
+
+  it("steps and hands over from the new root", async () => {
+    const r = await ring();
+    const { content, chain } = await otherRoot();
+    const root = (await r.reroot(1, content, chain))!;
+    const s = randomEpochSecret();
+    const next = await stepKeys(root, s);
+    expect((await r.applyStep(2, s, next.confirm))?.epoch).toBe(2);
+    expect(r.secretsBlob()).toEqual(s);
+    // A newcomer on the new link derives the same root and is handed the step.
+    const fresh = await Keyring.fromRoot(1, content, chain);
+    expect((await fresh.applyHandover(2, r.secretsBlob(), next.confirm))?.epoch).toBe(2);
+  });
+
+  it("forgets the keys from before its root", async () => {
+    const r = await ring();
+    const { content, chain } = await otherRoot();
+    await r.reroot(1, content, chain);
+    r.forgetBeforeRoot();
+    expect(r.keyFor(0)).toBeNull();
+    expect(r.keyFor(1)).not.toBeNull();
+  });
+
+  it("takes the root epoch the server names, but only before anything has moved it", async () => {
+    const r = await ring();
+    expect(r.relabelRoot(4)).toBe(true);
+    expect(r.rootEpoch).toBe(4);
+    expect(r.current.epoch).toBe(4);
+    expect(r.has(0)).toBe(false);
+    expect(r.keyFor(4)).not.toBeNull();
+    expect(r.relabelRoot(6)).toBe(false);
+    expect(r.rootEpoch).toBe(4);
+
+    const moved = await ring();
+    const s = randomEpochSecret();
+    const next = await stepKeys(moved.current, s);
+    await moved.applyStep(1, s, next.confirm);
+    expect(moved.relabelRoot(3)).toBe(false);
+    expect(moved.rootEpoch).toBe(0);
+  });
+
+  it("steps on from a relabelled root's number", async () => {
+    const r = await ring();
+    r.relabelRoot(5);
+    const s = randomEpochSecret();
+    const next = await stepKeys(r.current, s);
+    expect(next.epoch).toBe(6);
+    expect((await r.applyStep(6, s, next.confirm))?.epoch).toBe(6);
+  });
+
+  it("refuses a re-root and a relabel once wiped", async () => {
+    const r = await ring();
+    const { content, chain } = await otherRoot();
+    r.wipe();
+    expect(await r.reroot(1, content, chain)).toBeNull();
+    expect(r.relabelRoot(3)).toBe(false);
+  });
+});

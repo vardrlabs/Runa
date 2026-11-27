@@ -141,6 +141,8 @@ export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
     "The latest key change was made with a different list of people than this tab sees. Someone may be hidden from this room.",
   "server-behind":
     "The server has lost track of this room's key changes, so this tab has stopped sending. Copy your work out and reload.",
+  "left-out":
+    "This room's link changed, and this tab was not given the new one. Ask someone in the room for the new link or passphrase.",
 };
 
 /// Passes a key status on only when it changes. The coordinator repeats
