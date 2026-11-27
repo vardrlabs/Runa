@@ -127,6 +127,7 @@ describe("the words a person reads (fix wave 1)", () => {
       evictCopy("pass").relinkButton,
       evictCopy("pass").nobody,
       evictCopy("pass").removedBody,
+      evictCopy("pass").gone,
       voteTitle(null, "pass"),
       voteBody("TIN-HARBOUR", null, "pass"),
       voteBody("TIN-HARBOUR", "COPPER-LANTERN", "pass"),

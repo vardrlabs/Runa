@@ -44,6 +44,7 @@ const PASS_COPY = {
   relinkButton: "Change passphrase",
   nobody: "Nobody, only the passphrase changes",
   removedBody: "You were removed from this room. The passphrase you used no longer opens it.",
+  gone: "It was shredded, it expired, the server restarted, or someone changed its passphrase. If the passphrase changed, ask someone who is still in the room for the new one. Rooms live only in memory, so there is no copy to recover.",
 } as const;
 
 /// `EVICT_COPY` for a room opened the way `way` says. A private room's is

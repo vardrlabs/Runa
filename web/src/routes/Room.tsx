@@ -776,7 +776,7 @@ function JoinableRoom(props: RoomProps) {
               ? "The server restarted for an update, and this room could not be brought back to the new version. Rooms live only in memory, so there is no copy to recover, which is the point."
               : restartAnnouncedRef.current
               ? "The server restarted for an update, and this room ended with it. Rooms live only in memory, so there is no copy to recover, which is the point."
-              : EVICT_COPY.gone}
+              : words.gone}
           </p>
           <p style={{ marginBottom: 0 }}>
             <a href="/">← New room</a>
