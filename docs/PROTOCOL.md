@@ -124,8 +124,8 @@ known limits.
   EVICT_REQUEST the server first notes who was connected, as it does for a
   SHRED_REQUEST (amendment K).
 - EVICT_COMMIT: check the votes and, if they pass, replace the room's verifier,
-  salt and config, move it to a new root and close the target's connection if
-  it is still open, all at once. See amendment K.
+  salt and config, move it to a new root and close every connection still open
+  that holds the target's signing key, all at once. See amendment K.
 - EPOCH_KEY: a header epoch one above the room's advances the room to it, and
   only the first such frame for that epoch does; a header epoch equal to the
   room's is a handover and is relayed as it is; anything else is dropped. See
@@ -488,13 +488,13 @@ approve: the UNANIMOUS policy of the shred machine, with the target left out of
 the count. "The target" is the named peer and any other connection in the
 roster holding the same signing key. Every approval names that key as well as
 the peer, so the server recognises all of those connections too. Any one of
-the members who must approve can stop it by refusing,
-and a request nobody settles fails at its deadline (60 seconds by default, at
-most an hour). The request also fails when its proposer or any member whose
-approval it needs leaves, and when the room's epoch changes during the vote,
-since every signature names the epoch. The target leaving does not stop it:
-the room still moves to the new way in, and a connection the target opens
-again is never given it.
+the members who must approve can stop it by refusing, and a request nobody
+settles fails at its deadline (60 seconds by default, at most an hour). The
+request also fails when its proposer or any member whose approval it needs
+leaves, and when the room's epoch changes during the vote, since every
+signature names the epoch. The target leaving does not stop it: the room still
+moves to the new way in, and a connection the target opens again is never
+given it.
 
 *The new way in.* The proposer makes it before asking. For a private room it is
 a new 32-byte link secret and a new 16-byte salt. For a shared-name room it is a
@@ -549,10 +549,10 @@ holds, naming a target in its roster with the signing key the roster shows for
 it, with a roster hash equal to its own, with itself in that roster under its
 own signing key, and with a valid signature over the digest of the target's
 key. It signs an approval only over that same digest. It counts an approval
-only from a member whose approval the request needs, and only once.
-A REJECT carries no signature: the relay's sender envelope already binds who
-sent it, and under UNANIMOUS any member can block by not answering. A cancel
-counts only from the proposer.
+only from a member whose approval the request needs, and only once. A REJECT
+carries no signature: the relay's sender envelope already binds who sent it,
+and under UNANIMOUS any member can block by not answering. A cancel counts
+only from the proposer.
 
 *EVICT_COMMIT.* Once every approval is in, the proposer sends EVICT_COMMIT
 under the header epoch the votes name. Its body is a clear part the server
@@ -589,34 +589,34 @@ target's peer id and key digest exactly as the clear part gives them, and
 checks every signature against the signing key that voter sent in its JOIN:
 Ed25519 with strict verification, or ECDSA P-256 over SHA-256 in WebCrypto's
 64-byte r||s form with a high s accepted, since WebCrypto does not normalise s.
-Then,
-in one step with the room's epoch and peer list locked, the same lock as an
-EPOCH_KEY step, it requires the header epoch to equal the room's; the sender to
-be one of the voters; a request from the sender recorded within the last hour
-and a minute; the named target, if it is still connected, to hold the signing
-key whose digest the clear part names; voters to be distinct, connected, still
-holding the key they signed with, not the target, and connected before that
-request passed; and more voters than half of the connected members, other than
-the target, who were connected before that request passed. To the server the
-target is every connection whose signing key has the digest the clear part
-names, as well as the named peer: none of them may vote, and none counts
-toward that half. Connections opened after the request neither vote nor count.
-A named target that is no longer connected does not stop the commit, and a
-connection of the target's that is still open is recognised by its key. It
-also refuses a verifier that cannot be a SHA-256 output and a config larger
-than a new room's. If all of that holds, it replaces the verifier, salt and
-config, moves the room to the next epoch and makes that epoch its root, sends
-ERROR 4014 to every connection of the target's that is still open and closes
-each of them with 4014, closes any connection without a key-agreement key as a
-step does, and relays the commit to every other member, its sender included.
-Anything else is dropped without an answer; a proposer whose commit is not
-echoed within 10 seconds gives up. A commit is not held to the five-second
-spacing between steps, since a quorum of signatures already limits it, but it
-starts that spacing for the next step. From then on every reader of the
-room's verifier, salt and config sees the new values: JOIN, JOIN_ACK, room
-metadata, name resolution and restart tickets. A JOIN whose key was checked
-just before a commit is refused with 4001, so nobody holding the old key slips
-in beside it. Frames from a connection that is being closed are ignored.
+Then, in one step with the room's epoch and peer list locked, the same lock as
+an EPOCH_KEY step, it requires the header epoch to equal the room's; the
+sender to be one of the voters; a request from the sender recorded within the
+last hour and a minute; the named target, if it is still connected, to hold
+the signing key whose digest the clear part names; voters to be distinct,
+connected, still holding the key they signed with, not the target, and
+connected before that request passed; and more voters than half of the
+connected members, other than the target, who were connected before that
+request passed. To the server the target is every connection whose signing key
+has the digest the clear part names, as well as the named peer: none of them
+may vote, and none counts toward that half. Connections opened after the
+request neither vote nor count. A named target that is no longer connected
+does not stop the commit, and a connection of the target's that is still open
+is recognised by its key. It also refuses a verifier that cannot be a SHA-256
+output and a config larger than a new room's. If all of that holds, it
+replaces the verifier, salt and config, moves the room to the next epoch and
+makes that epoch its root, sends ERROR 4014 to every connection of the
+target's that is still open and closes each of them with 4014, closes any
+connection without a key-agreement key as a step does, and relays the commit
+to every other member, its sender included. Anything else is dropped without
+an answer; a proposer whose commit is not echoed within 10 seconds gives up. A
+commit is not held to the five-second spacing between steps, since a quorum of
+signatures already limits it, but it starts that spacing for the next step.
+From then on every reader of the room's verifier, salt and config sees the new
+values: JOIN, JOIN_ACK, room metadata, name resolution and restart tickets. A
+JOIN whose key was checked just before a commit is refused with 4001, so
+nobody holding the old key slips in beside it. Frames from a connection that
+is being closed are ignored.
 
 Two commits for the same epoch, or a commit and a step, are decided by the
 room in the order they arrive: the first moves the epoch, and the other then
@@ -667,8 +667,8 @@ named one and any it had opened again under a new peer id alike, since the
 server knows them by the key the votes name. A client that sees a commit whose
 target key digest is that of its own signing key, or whose target is its own
 peer id, stops and says it was removed in the same way, whether or not a 4014
-reached it first, once the commit has passed the checks on its votes above;
-one that fails them is refused and shown. Its old link or passphrase now fails
+reached it first, once the commit has passed the checks above; one that fails
+them is refused and shown. Its old link or passphrase now fails
 with 4001, like a wrong one.
 
 *Joining a re-rooted room.* JOIN_ACK's `root_epoch` is the epoch the current

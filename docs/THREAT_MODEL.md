@@ -228,16 +228,28 @@ What that buys, exactly:
   removed. Every connection holding their signing key is left out of the vote
   and of the new link, and closed, as well as the one that was named: every
   vote names that key, so the server recognises those connections too. If
-  someone sends
-  them the new one, they can come back, visibly.
+  someone sends them the new one, they can come back, visibly.
 - **They cannot read what is written afterwards**, unless someone gives them
   the new link or passphrase, or a dishonest server helps them (below).
 - **It gives no backward secrecy.** They keep everything they saw.
 - **Anyone not connected at that moment, or who arrived during the vote, is cut
   off too.** Their link stops working, and they need the new one from someone
-  who was there. Each member is
-  shown the new link or passphrase once, with a reminder to send it to anyone
-  who should still be here.
+  who was there. Each member is shown the new link or passphrase once, with a
+  reminder to send it to anyone who should still be here. A tab that was away
+  when the way in changed comes back with the old link or passphrase, is
+  refused, and shows the same "this room is gone" page as for an expired room.
+  The page cannot tell the two apart, so the person needs the new one from
+  someone who was there.
+- **A member follows a change only for a request it saw**, in a roster that
+  lists it under its own signing key. A member that did not see the request
+  checks what it can and is told it was left out, and its tab keeps what it
+  already had on screen, read-only.
+- **A hostile member can stall a removal.** Any member other than the person
+  being removed can refuse, which is the point of the rule. A member can also
+  make a vote fail, or make the others wait until a vote's deadline, by
+  sending requests that cannot pass or by asking and then never sending the
+  change once everyone has agreed. Nothing changes when that happens, and
+  nobody is removed either.
 - **Someone being removed cannot dodge it by reconnecting: a new connection is
   not given the new link.** The room changes its link whether or not they are
   still connected, and only the people who approved receive the new one.
@@ -248,7 +260,18 @@ What that buys, exactly:
   under their own signing key are not counted at any time. They could only
   inflate the count by opening connections under other keys before anyone
   asked, and those show in the room as extra people, who would then have to be
-  asked too.
+  asked too. Several connections that share one signing key, other than the
+  removed person's, each count as a separate member toward that half.
+- **A copy of someone's signing key counts as them.** A JOIN carries no proof
+  that the connection holds the private half of the signing key it presents,
+  so the server treats a connection that presents a copy of someone's public
+  key as that person. Removing either of them closes both.
+- **A removed person can delay the notice that they left.** A removed peer
+  that stops reading its own socket holds its connection slot until TCP gives
+  up, and the others are told it left only then. A removed peer whose outgoing
+  queue was already full at the commit is closed without the 4014 code, and
+  the notice that it left carries no reason; an error already queued for it
+  can be the one it receives.
 - **In a room of two, either person can remove the other.** Whichever request
   reaches the server first wins.
 - **The room's fingerprint changes.** Anyone who compared it before should
