@@ -23,9 +23,11 @@ section, so this file is not documentation of the release, it is part of it.
   has changed the server turns it away. The older page doesn't say why; it keeps
   trying to connect until it is reloaded.
 - **People can be removed from a room, and a room's link can be changed.**
-  Everyone else in the room has to agree, and any one of them can refuse. The
-  person who asks makes the new link first, or for a shared room types or
-  generates a new passphrase, held to the same strength check as a new room's.
+  Everyone else in the room has to agree, and any one of them can refuse; the
+  server checks that everyone agreed too. The person being removed can't block
+  it, not even by changing the room's key while the vote is open. The person
+  who asks makes the new link first, or for a shared room types or generates a
+  new passphrase, held to the same strength check as a new room's.
   Once everyone has agreed, each member receives it sealed to them alone, the
   server stops accepting the old one, and the room's key starts again from the
   new one. The removed person's page says they were removed, and their old link
