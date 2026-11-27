@@ -82,6 +82,10 @@ export interface SocketEvents {
   onEpochStale(epoch: number): void;
   /// An EPOCH_KEY, unopened: the coordinator verifies and applies it.
   onEpochKey?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
+  /// EVICT_REQUEST, EVICT_VOTE or EVICT_CANCEL, opened (amendment K).
+  onEvictFrame?(frameType: number, sender: Uint8Array, plaintext: Uint8Array): void;
+  /// An EVICT_COMMIT, unopened: the evict coordinator checks and applies it.
+  onEvictCommit?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
   onDisconnected(): void;
   /// This many of our document frames are now in the room log — or, against
   /// a server without acks, have been sent. The snapshot index is estimated
@@ -321,6 +325,9 @@ export class RunaSocket {
   /// succeeds. Kept past that, a room shredded after coming back could be
   /// brought back again by a second restart inside the ticket's lifetime.
   private restartTicket: { ticket: string; at: number } | null = null;
+  /// The room removed this member (amendment K). Said once, whether the
+  /// ERROR or the close arrives first.
+  private removed = false;
 
   constructor(private opts: SocketOptions) {
     this.maxBackoffMs = opts.maxBackoffMs ?? 15_000;
@@ -363,10 +370,12 @@ export class RunaSocket {
     void this.pump();
   }
 
-  epochKeyHeader(epoch: number): Uint8Array {
+  /// The header of a frame this member signs rather than seals: EPOCH_KEY
+  /// and EVICT_COMMIT.
+  frameHeader(frameType: number, epoch: number): Uint8Array {
     return encodeHeader({
       version: PROTOCOL_VERSION,
-      frameType: FT.EPOCH_KEY,
+      frameType,
       roomId: this.opts.roomId,
       epoch,
       nonceSess: new Uint8Array(4),
@@ -374,10 +383,24 @@ export class RunaSocket {
     });
   }
 
+  epochKeyHeader(epoch: number): Uint8Array {
+    return this.frameHeader(FT.EPOCH_KEY, epoch);
+  }
+
   /// Returns whether it went out.
-  sendEpochKey(header: Uint8Array, body: Uint8Array): boolean {
+  sendSigned(header: Uint8Array, body: Uint8Array): boolean {
     if (!this.joined) return false;
     return this.rawSend(concatBytes(header, body));
+  }
+
+  sendEpochKey(header: Uint8Array, body: Uint8Array): boolean {
+    return this.sendSigned(header, body);
+  }
+
+  /// The room's link changed (amendment K): every later JOIN presents this.
+  replaceAuthKey(next: Uint8Array): void {
+    if (next !== this.opts.authKey) this.opts.authKey.fill(0);
+    this.opts.authKey = next;
   }
 
   /// Drop this connection and join again, to be handed the room's keys as a
@@ -415,6 +438,17 @@ export class RunaSocket {
       if (this.ws === ws) this.connectionLost();
       const code = (ev as CloseEvent | undefined)?.code;
       if (code === 4007 || code === 4008) this.events.onRefused?.(code);
+      // Removed from the room: the ERROR before this close says so, but a
+      // close that arrives alone means the same.
+      if (code === 4014) {
+        this.closedByUs = true;
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        if (!this.removed) {
+          this.removed = true;
+          this.events.onError(4014);
+        }
+      }
       this.events.onDisconnected();
       if (!this.closedByUs) this.scheduleReconnect();
     };
@@ -499,6 +533,8 @@ export class RunaSocket {
   /// that found it missing stopped the retries, and nothing queued was
   /// discarded (amendment I).
   resume(): void {
+    // A removed tab stays stopped.
+    if (this.removed) return;
     const old = this.ws;
     if (old) {
       // The refused connection, closed or about to be. Its handlers must not
@@ -629,7 +665,10 @@ export class RunaSocket {
       header.frameType === FT.AWARENESS ||
       header.frameType === FT.SHRED_REQUEST ||
       header.frameType === FT.SHRED_VOTE ||
-      header.frameType === FT.SHRED_CANCEL;
+      header.frameType === FT.SHRED_CANCEL ||
+      header.frameType === FT.EVICT_REQUEST ||
+      header.frameType === FT.EVICT_VOTE ||
+      header.frameType === FT.EVICT_CANCEL;
     if (!isServerEvent && liveOnly && this.opts.keyring.has(header.epoch) && this.isStale(header.epoch)) {
       this.events.onEpochStale(header.epoch);
       return;
@@ -650,6 +689,12 @@ export class RunaSocket {
       // Ahead of this member: a member must hand it the key. Behind: the
       // server has lost track of the room's rotations, and sending under an
       // older key would hand new writing to whoever left. Either way, hold.
+      // A keyring nothing has moved holds the root its link opens, which is
+      // the epoch the room names as its root (amendment K). Nothing has been
+      // sealed under it yet, so relabelling it here changes no frame.
+      if (typeof ack.root_epoch === "number" && this.opts.keyring.relabelRoot(ack.root_epoch)) {
+        this.epoch = this.opts.keyring.current.epoch;
+      }
       this.roomEpoch = typeof ack.epoch === "number" ? ack.epoch : 0;
       // Compared with the epoch the cipher sends under, not the keyring's: a
       // keyring that advanced before adoptEpoch ran must not send under a key
@@ -732,9 +777,14 @@ export class RunaSocket {
       // 4001 covers "wrong key" and "no such room" — both are terminal. Left
       // to reconnect, a purged room turned every open tab into a client that
       // hammered the server every 15 seconds indefinitely.
-      if (code === 4001 || code === 4010 || code === 4011) {
+      if (code === 4001 || code === 4010 || code === 4011 || code === 4014) {
         this.closedByUs = true;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (code === 4014) {
+        if (this.removed) return;
+        this.removed = true;
       }
       this.events.onError(code);
       return;
@@ -808,6 +858,10 @@ export class RunaSocket {
 
     if (header.frameType === FT.EPOCH_KEY) {
       this.events.onEpochKey?.(bytes.slice(0, HEADER_LEN), header.epoch, senderId, env.body);
+      return;
+    }
+    if (header.frameType === FT.EVICT_COMMIT) {
+      this.events.onEvictCommit?.(bytes.slice(0, HEADER_LEN), header.epoch, senderId, env.body);
       return;
     }
     // An epoch this member holds no key for is read from the log later, once
@@ -885,6 +939,17 @@ export class RunaSocket {
             env.body,
           );
           this.events.onShredFrame(header.frameType, senderId, pt);
+        } catch {
+          return;
+        }
+        return;
+      }
+      case FT.EVICT_REQUEST:
+      case FT.EVICT_VOTE:
+      case FT.EVICT_CANCEL: {
+        try {
+          const pt = await decryptEnvelope(key, bytes.slice(0, HEADER_LEN), senderId, env.body);
+          this.events.onEvictFrame?.(header.frameType, senderId, pt);
         } catch {
           return;
         }
@@ -1176,6 +1241,14 @@ export class RunaSocket {
     const header = this.ownHeader(frameType);
     const envelope = await this.cipher.encrypt(header, plaintext);
     this.rawSend(concatBytes(header, envelope));
+  }
+
+  /// Returns whether it went out.
+  async sendEvictFrame(frameType: number, plaintext: Uint8Array): Promise<boolean> {
+    if (!this.canSendDocuments()) return false;
+    const header = this.ownHeader(frameType);
+    const envelope = await this.cipher.encrypt(header, plaintext);
+    return this.rawSend(concatBytes(header, envelope));
   }
 
   /// Throws when nothing was sent, so the caller does not move its sync index

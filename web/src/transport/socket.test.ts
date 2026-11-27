@@ -795,3 +795,134 @@ describe("epochs (amendment J)", () => {
     expect(onPeerJoin.mock.calls[0][0].kxSig).toEqual(sig);
   });
 });
+
+describe("eviction and re-roots (amendment K)", () => {
+  it("treats what it derived as the root the room names, before anything has moved", async () => {
+    const { socket, key, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck({ epoch: 3, root_epoch: 3 }));
+    await sleep(0);
+    expect(socket.isAwaitingKeys).toBe(false);
+    expect(socket.currentEpoch).toBe(3);
+    expect(keyring.rootEpoch).toBe(3);
+    await socket.sendUpdate(text("on the new link"));
+    await waitFor(() => docFrames(ws).length === 1);
+    const frames = docFrames(ws);
+    expect(new DataView(frames[0].buffer, frames[0].byteOffset).getUint32(20, false)).toBe(3);
+    expect(await readAsPeer(frames[0], key)).toEqual(text("on the new link"));
+  });
+
+  it("does not relabel a keyring that has already moved", async () => {
+    const { socket, keyring } = await makeSocket();
+    await stepRing(keyring);
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck({ epoch: 5, root_epoch: 5 }));
+    await sleep(0);
+    expect(keyring.rootEpoch).toBe(0);
+    expect(socket.isAwaitingKeys).toBe(true);
+  });
+
+  it("opens EVICT frames and passes them on, and drops stale ones", async () => {
+    const onEvictFrame = vi.fn();
+    const onEpochStale = vi.fn();
+    const { socket, key, keyring } = await makeSocket({ events: { onEvictFrame, onEpochStale }, epochOverlapMs: 0 });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.deliver(await incoming(FT.EVICT_VOTE, 0, key, new Uint8Array([1, 2, 3])));
+    await waitFor(() => onEvictFrame.mock.calls.length === 1);
+    expect(onEvictFrame.mock.calls[0][0]).toBe(FT.EVICT_VOTE);
+    expect(onEvictFrame.mock.calls[0][1]).toEqual(OTHER);
+    expect(onEvictFrame.mock.calls[0][2]).toEqual(new Uint8Array([1, 2, 3]));
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    await sleep(5);
+    ws.deliver(await incoming(FT.EVICT_REQUEST, 0, key, new Uint8Array([4])));
+    await waitFor(() => onEpochStale.mock.calls.length > 0);
+    expect(onEvictFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes EVICT_COMMIT through unopened", async () => {
+    const onEvictCommit = vi.fn();
+    await makeSocket({ events: { onEvictCommit } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.EVICT_COMMIT, roomId: ROOM, epoch: 0, nonceSess: new Uint8Array(4), flags: 0 });
+    const body = new Uint8Array([9, 8, 7]);
+    ws.deliver(concatBytes(header, OTHER, body));
+    await waitFor(() => onEvictCommit.mock.calls.length === 1);
+    const [h, e, sender, b] = onEvictCommit.mock.calls[0];
+    expect(h).toEqual(header);
+    expect(e).toBe(0);
+    expect(sender).toEqual(OTHER);
+    expect(b).toEqual(body);
+  });
+
+  it("sends EVICT frames sealed under the current key, and signed frames as they are", async () => {
+    const { socket, key } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    expect(await socket.sendEvictFrame(FT.EVICT_REQUEST, new Uint8Array([5, 5]))).toBe(true);
+    const sealed = ws.sent.find((f) => f[3] === FT.EVICT_REQUEST)!;
+    expect(await readAsPeer(sealed, key)).toEqual(new Uint8Array([5, 5]));
+    const h = socket.frameHeader(FT.EVICT_COMMIT, 0);
+    expect(h[3]).toBe(FT.EVICT_COMMIT);
+    expect(socket.sendSigned(h, new Uint8Array([1]))).toBe(true);
+    expect(ws.sent.at(-1)).toEqual(concatBytes(h, new Uint8Array([1])));
+  });
+
+  it("stops reconnecting when it is removed, and says so once", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(4014);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("treats a close with 4014 alone the same way", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.close(4014);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError).toHaveBeenCalledWith(4014);
+  });
+
+  it("joins with the replacement key after a re-root", async () => {
+    const { socket } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const next = new Uint8Array(32).fill(2);
+    const before = FakeWebSocket.all.length;
+    socket.replaceAuthKey(next);
+    socket.reconnectNow();
+    await waitFor(() => FakeWebSocket.all.length > before);
+    const again = latest();
+    expect(again).not.toBe(ws);
+    again.open();
+    await waitFor(() => again.sent.length > 0);
+    const body = JSON.parse(new TextDecoder().decode(again.sent[0].slice(HEADER_LEN)));
+    expect(body.auth_key).toBe(toB64(new Uint8Array(32).fill(2)));
+  });
+});
