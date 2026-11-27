@@ -143,6 +143,7 @@ export class EvictCoordinator {
     this.machine = new EvictMachine({
       roomId: d.roomId,
       me: () => d.me(),
+      myKey: () => d.identity.publicKeyRaw,
       members: () => d.members(),
       now: () => d.now(),
       epoch: () => d.keyring.current.epoch,
@@ -614,6 +615,15 @@ export class EvictCoordinator {
     // room's way in changed without it. No wrap is opened and the keyring is
     // not touched.
     if (!placed) return this.leftOutOfCommit();
+    // A backstop to the request's own check: the votes were held to a policy
+    // set that needed this member's approval under this tab's own key. One
+    // that did not (a roster that left it out, or listed its peer id under
+    // another key) says nothing about what this member agreed to, so its wrap
+    // is never opened.
+    const myKey = this.d.identity.publicKeyRaw;
+    if (!placed.policySet.some((r) => eq(r.peerId, me) && r.pubkey !== undefined && eq(r.pubkey, myKey))) {
+      return this.leftOutOfCommit();
+    }
 
     const pend = this.pending;
     const late = this.late;

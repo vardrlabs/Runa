@@ -2,7 +2,7 @@ import * as cbor2 from "cbor2";
 import { describe, expect, it } from "vitest";
 import { decryptWithExplicitNonce, encryptWithExplicitNonce } from "../crypto/aead";
 import { deriveChainKey } from "../crypto/epoch";
-import { generateIdentity, type Identity } from "../crypto/identity";
+import { generateIdentity, signPayload, type Identity } from "../crypto/identity";
 import { generateKx, sealWrap, wrapKey, type KxPair } from "../crypto/kx";
 import type { MemberView } from "../epoch/coordinator";
 import { Keyring } from "../epoch/keyring";
@@ -20,7 +20,7 @@ import {
 import { decodeCommit, decodeRequest, decodeVote, encodeCancel, encodeCommit, encodeRequest, encodeVote, MAX_VOTES, type EvictRequest } from "./frame";
 import { COMMIT_WAIT_MS, MAX_SEEN_REQUESTS, type EvictState } from "./machine";
 import { deriveReRoot, encodeWayIn, newLinkWayIn, type WayIn } from "./reroot";
-import { bytesEqual, hexOf, keyDigest } from "./statement";
+import { bytesEqual, hexOf, keyDigest, voteStatement } from "./statement";
 
 const ROOM = new Uint8Array(16).fill(7);
 const IV = new Uint8Array(12).fill(1);
@@ -98,6 +98,13 @@ class Hub {
   members(): MemberView[] {
     return this.peers.map((p) => p.view());
   }
+
+  /// A dishonest server's roster for one viewer; null shows everyone the room.
+  rosterFor: ((viewer: Peer) => MemberView[] | null) | null = null;
+
+  membersFor(viewer: Peer): MemberView[] {
+    return this.rosterFor?.(viewer) ?? this.members();
+  }
 }
 
 let nextSeq = 1;
@@ -135,7 +142,7 @@ class Peer {
       keyring,
       now: () => hub.now,
       me: () => this.id,
-      members: () => hub.members(),
+      members: () => hub.membersFor(this),
       exclusive: <T>(fn: () => Promise<T>): Promise<T> => this.exclusive(fn),
       kxOf: async (m) => {
         const p = hub.peers.find((q) => bytesEqual(q.id, m.peerId));
@@ -1429,5 +1436,104 @@ describe("fix wave 2, the Minors", () => {
     await hub.flush();
     expect(b.states).toEqual(["VOTING", "EXPIRED", "VOTING"]);
     expect(b.prompts).toHaveLength(2);
+  });
+});
+
+describe("a member only follows a re-root from a roster that lists itself under its own key (fix wave 3, Important 1)", () => {
+  /// A dishonest server shows A, B and C one roster, chosen by `shown`, so
+  /// every roster digest agrees. A, hostile, asks to remove T. B is asked,
+  /// or refuses, and tries to vote no; C approves. A then sends a commit with
+  /// the votes `votes` picks and a wrap for B all the same.
+  async function shownRoster(
+    shown: (p: { a: Peer; b: Peer; c: Peer; t: Peer }) => MemberView[],
+    votes: (p: { a: Peer; b: Peer; c: Peer; t: Peer; req: EvictRequest; cSig: Uint8Array }) => Promise<{ voter: Uint8Array; sig: Uint8Array }[]>,
+  ) {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const roster = shown({ a, b, c, t });
+    hub.rosterFor = (viewer) => (viewer === t ? null : roster);
+    const held = holdFrames(hub);
+    const way = newLinkWayIn();
+    const copy = keep(way);
+    expect(await a.ev.propose(t.view(), way)).toBeNull();
+    const req = decodeRequest(held[0].pt)!;
+    for (const p of [b, c]) await p.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await b.ev.vote("REJECT");
+    const at = held.length;
+    await c.ev.vote("APPROVE");
+    const cVote = decodeVote(held[at].pt)!;
+    const { h, body } = await forgeCommit(a, req, copy, await votes({ a, b, c, t, req, cSig: cVote.sig! }), [b, c]);
+    await b.ev.receiveCommit(h, 0, a.id, body);
+    return { b, req };
+  }
+
+  it("a roster without B: B refuses the request, and the commit wrapped for it changes nothing", async () => {
+    const { b } = await shownRoster(
+      ({ a, c, t }) => [a.view(), c.view(), t.view()],
+      async ({ a, c, req, cSig }) => [
+        { voter: a.id, sig: req.sig },
+        { voter: c.id, sig: cSig },
+      ],
+    );
+    expect(b.applied).toHaveLength(0);
+    expect(b.keyring.rootEpoch).toBe(0);
+    expect(b.keyring.current.epoch).toBe(0);
+    expect(b.refusals[0]).toBe("roster-mismatch");
+    expect(b.prompts).toHaveLength(0);
+  });
+
+  it("a roster that lists B's peer id under another key: B refuses the request, and a vote forged under that key changes nothing", async () => {
+    const forger = await generateIdentity();
+    const { b } = await shownRoster(
+      ({ a, b, c, t }) => [a.view(), { ...b.view(), pubkey: forger.publicKeyRaw }, c.view(), t.view()],
+      async ({ a, b, c, req, cSig }) => {
+        const digest = await keyDigest(req.targetKey!);
+        const forged = await signPayload(forger, voteStatement(ROOM, req.id, req.epoch, req.target, digest, b.id, req.verifier));
+        return [
+          { voter: a.id, sig: req.sig },
+          { voter: b.id, sig: forged },
+          { voter: c.id, sig: cSig },
+        ];
+      },
+    );
+    expect(b.applied).toHaveLength(0);
+    expect(b.keyring.rootEpoch).toBe(0);
+    expect(b.keyring.current.epoch).toBe(0);
+    expect(b.refusals[0]).toBe("roster-mismatch");
+    expect(b.prompts).toHaveLength(0);
+  });
+
+  it("the commit path alone refuses to open a wrap when the frozen policy set lacks this member under its own key", async () => {
+    // An honest roster, so the request opens; then B's frozen policy set is
+    // made to lack B, standing in for a machine without the request's guard.
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    const way = newLinkWayIn();
+    const copy = keep(way);
+    expect(await a.ev.propose(t.view(), way)).toBeNull();
+    const req = decodeRequest(held[0].pt)!;
+    for (const p of [b, c]) await p.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    const frozen = b.ev.machine.requestFor(req.id)!;
+    frozen.policySet = frozen.policySet.filter((r) => !bytesEqual(r.peerId, b.id));
+    await b.ev.vote("REJECT");
+    const at = held.length;
+    await c.ev.vote("APPROVE");
+    const cVote = decodeVote(held[at].pt)!;
+    const { h, body } = await forgeCommit(
+      a,
+      req,
+      copy,
+      [
+        { voter: a.id, sig: req.sig },
+        { voter: c.id, sig: cVote.sig! },
+      ],
+      [b, c],
+    );
+    await b.ev.receiveCommit(h, 0, a.id, body);
+    expect(b.applied).toHaveLength(0);
+    expect(b.leftOut).toBe(1);
+    expect(b.keyring.rootEpoch).toBe(0);
+    expect(b.keyring.current.epoch).toBe(0);
   });
 });

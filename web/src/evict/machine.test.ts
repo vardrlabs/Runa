@@ -35,6 +35,7 @@ function machineFor(room: Room, me: Person): EvictMachine {
   return new EvictMachine({
     roomId: ROOM,
     me: () => me.id,
+    myKey: () => me.identity.publicKeyRaw,
     members: () => room.roster,
     now: () => room.clock.now,
     epoch: () => room.epoch.value,
@@ -449,6 +450,7 @@ describe("requests that cannot be read", () => {
     const m = new EvictMachine({
       roomId: ROOM,
       me: () => b.id,
+      myKey: () => b.identity.publicKeyRaw,
       members: () => room.roster,
       now: () => room.clock.now,
       epoch: () => room.epoch.value,
@@ -747,5 +749,50 @@ describe("a vote past its deadline that tick has not seen (fix wave 1, C1)", () 
     const mine = await requestBy(room, b, t, { id: new Uint8Array(16).fill(0x42) });
     expect(() => m.start(mine, b.id, room.roster, null)).not.toThrow();
     expect(m.current()!.request.id).toEqual(mine.id);
+  });
+});
+
+describe("a member only freezes a roster that lists itself under its own key (fix wave 3, Important 1)", () => {
+  it("refuses a request whose roster leaves this member out, and never judges a commit for it as one it saw", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    // A dishonest server shows A and B a roster without B, so the digests agree.
+    room.roster = [a.entry, c.entry, t.entry];
+    const req = await requestBy(room, a, t);
+    const m = machineFor(room, b);
+    expect(await m.onRequest(req, a.id)).toBe("roster-mismatch");
+    expect(m.state).toBe("IDLE");
+    expect(m.current()).toBeNull();
+    expect(m.requestFor(req.id)).toBeNull();
+    expect(m.wasSeen(req.id)).toBe(true);
+  });
+
+  it("refuses a request whose roster lists this member's peer id under another key", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const other = await generateIdentity();
+    room.roster = [a.entry, { ...b.entry, pubkey: other.publicKeyRaw }, c.entry, t.entry];
+    const req = await requestBy(room, a, t);
+    const m = machineFor(room, b);
+    expect(await m.onRequest(req, a.id)).toBe("roster-mismatch");
+    expect(m.state).toBe("IDLE");
+    expect(m.requestFor(req.id)).toBeNull();
+  });
+
+  it("refuses a request whose roster lists this member without a key", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    room.roster = [a.entry, { ...b.entry, pubkey: undefined }, t.entry];
+    const req = await requestBy(room, a, t);
+    expect(await machineFor(room, b).onRequest(req, a.id)).toBe("roster-mismatch");
+  });
+
+  it("still opens a request whose roster lists this member under its own key", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t);
+    const m = machineFor(room, b);
+    expect(await m.onRequest(req, a.id)).toBeNull();
+    expect(m.requestFor(req.id)!.policySet.map((r) => r.peerId)).toEqual([a.id, b.id]);
   });
 });

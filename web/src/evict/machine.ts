@@ -66,6 +66,11 @@ export async function requestStatement(req: EvictRequest): Promise<Statement> {
 export interface MachineDeps {
   roomId: Uint8Array;
   me(): Uint8Array | null;
+  /// This tab's own signing key. Required, not optional: a request is only
+  /// opened from a roster that lists `me` under this key, and a check that
+  /// could be left out would let a dishonest server leave this member out of
+  /// the policy set it freezes.
+  myKey(): Uint8Array;
   /// The roster, this member included.
   members(): RosterEntry[];
   now(): number;
@@ -260,6 +265,13 @@ export class EvictMachine {
       if (!target.pubkey || !req.targetKey || !eq(target.pubkey, req.targetKey)) return "target-key-mismatch";
       if (eq(target.pubkey, proposer.pubkey)) return "proposer-is-target";
     }
+    // This member votes only on a roster that lists it under its own signing
+    // key. Otherwise the policy set it freezes would not need its approval (a
+    // roster without it), or would take another key's signature as its own,
+    // and a commit it refused could still pass its checks.
+    const me = this.d.me();
+    const myKey = this.d.myKey();
+    if (!me || !roster.some((r) => eq(r.peerId, me) && r.pubkey !== undefined && eq(r.pubkey, myKey))) return "roster-mismatch";
     if (!eq(await rosterDigest(roster), req.roster)) return "roster-mismatch";
     // The proposer signed the digest of the key the roster shows for the
     // target (checked above to equal `req.targetKey`), so a commit carrying
