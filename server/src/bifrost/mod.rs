@@ -707,12 +707,15 @@ async fn process_frame(
     if data.len() < HEADER_LEN {
         return Err(Some(WireCode::ProtocolError));
     }
-    // A connection the room has removed (an eviction takes it out of the peer
-    // list at once) can still be reading while its last error drains. Nothing
-    // it sends is relayed, logged or applied.
-    if !room.peers.lock().unwrap().iter().any(|p| p.peer_id == sender) {
-        return Ok(());
-    }
+    // A connection the room has removed or is closing (ERROR 4014 or 4005
+    // queued) can still be reading while its last error drains. Nothing it
+    // sends is relayed, logged or applied. That is not checked here: a check
+    // made on its own lock could pass and then be overtaken by a commit on
+    // another worker thread before the frame is acted on. Each action below
+    // decides it under the `peers` guard the action itself takes, which is
+    // the guard a commit or a step closes a connection under (`live` in
+    // room.rs). What a closing connection is still sent directly (an
+    // EPOCH_STALE error, a PONG) goes only to itself.
     let frame_bytes = Bytes::copy_from_slice(data);
 
     // Amendment J: ciphertext from an epoch the room has left is refused once
@@ -742,14 +745,14 @@ async fn process_frame(
 
     match header.frame_type {
         FT_DOC_UPDATE => {
-            room.touch();
-            let append_result = {
-                let mut log = room.log.write().unwrap();
-                log.append(sender, FT_DOC_UPDATE, header.epoch, frame_bytes.clone())
-            };
-            match append_result {
-                Ok(index) => {
-                    room.broadcast_update(&frame_bytes, sender, index).await;
+            // Stored and relayed under one `peers` guard with the check that
+            // the sender is still a member (`Room::append_update`). None: it
+            // was removed or is being closed, so nothing is stored, relayed
+            // or acknowledged.
+            match room.append_update(&frame_bytes, sender, header.epoch) {
+                None => {}
+                Some(Ok(index)) => {
+                    room.touch();
                     // The client keeps every update until this comes back, and
                     // sends it again on its next connection if it never does.
                     // That is what makes an edit typed into a connection that
@@ -761,7 +764,8 @@ async fn process_frame(
                         direct.push(json_frame(room.id, FT_DOC_ACK, &body));
                     }
                 }
-                Err(_) => {
+                Some(Err(_)) => {
+                    room.touch();
                     send_direct(room, sender, error_frame(room.id, WireCode::FrameTooLarge));
                     if caps.acks {
                         let body = serde_json::json!({ "ok": false });
@@ -781,49 +785,18 @@ async fn process_frame(
             if frame_bytes.len() < HEADER_LEN + 8 {
                 return Err(None);
             }
-            // Deterministic election (spec §5.8): only the lowest
-            // joined_at_seq peer currently in the room may compact the log.
-            // Anything else is refused before it can truncate history.
-            let min_seq = room
-                .peers
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|p| p.joined_at_seq)
-                .min();
-            let sender_seq = room
-                .peers
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|p| p.peer_id == sender)
-                .map(|p| p.joined_at_seq);
-            if sender_seq != min_seq || sender_seq.is_none() {
-                send_direct(
-                    room,
-                    sender,
-                    error_frame(room.id, WireCode::ProtocolError),
-                );
-                return Ok(());
-            }
             let covers = u64::from_be_bytes([
                 data[32], data[33], data[34], data[35], data[36], data[37], data[38], data[39],
             ]);
-            let entry = LogEntry {
-                sender,
-                frame_type: FT_SNAPSHOT,
-                epoch: header.epoch,
-                frame: frame_bytes.clone(),
-            };
-            let applied = {
-                let mut log = room.log.write().unwrap();
-                log.apply_snapshot(covers, entry)
-            };
-            if applied {
-                room.touch();
-                room.broadcast(&frame_bytes, Some(sender)).await;
-            } else {
-                send_direct(room, sender, error_frame(room.id, WireCode::ProtocolError));
+            // Deterministic election (spec §5.8): only the lowest
+            // joined_at_seq peer currently in the room may compact the log.
+            // Anything else is refused before it can truncate history. The
+            // election, the membership check and the write are one critical
+            // section in the room.
+            match room.apply_snapshot_from(&frame_bytes, sender, header.epoch, covers) {
+                None => {}
+                Some(true) => room.touch(),
+                Some(false) => send_direct(room, sender, error_frame(room.id, WireCode::ProtocolError)),
             }
             Ok(())
         }
@@ -882,10 +855,13 @@ async fn process_frame(
         }
 
         FT_SHRED_REQUEST | FT_SHRED_VOTE | FT_SHRED_CANCEL => {
+            // A request is relayed and its cohort noted in one critical
+            // section with the sender's membership check.
             if header.frame_type == FT_SHRED_REQUEST {
-                room.note_shred_request();
+                room.relay_shred_request(&frame_bytes, sender);
+            } else {
+                gjallarhorn::relay(room, &frame_bytes, sender).await;
             }
-            gjallarhorn::relay(room, &frame_bytes, sender).await;
             Ok(())
         }
 
@@ -969,7 +945,11 @@ async fn process_frame(
                 if !(1..=720 * 3600).contains(&add) {
                     return Err(None);
                 }
-                let _total_ext = room.extend_ttl(add);
+                // Applied only while the sender is a live member, decided under
+                // the `peers` guard with the extension itself.
+                if room.extend_ttl_from(sender, add).is_none() {
+                    return Ok(());
+                }
                 room.touch();
                 let effective = match room.ttl.kind {
                     TtlKind::None => 0,
@@ -1072,5 +1052,226 @@ fn envelop_entry(entry: &LogEntry, index: Option<u64>) -> Bytes {
     match index {
         Some(i) => crate::runar::room::envelop_indexed(frame, entry.sender, i),
         None => crate::runar::room::envelop(frame, entry.sender),
+    }
+}
+
+/// What a connection the room has removed or is closing can still send while
+/// its last error drains. These call `process_frame` directly, with no socket
+/// and no timing: each state is set up first, then every kind of frame is
+/// processed as that sender, and nothing may reach anyone else, the log, the
+/// epoch or the room's timers.
+#[cfg(test)]
+mod closing_sender_tests {
+    use super::*;
+    use crate::config::Config;
+    use crate::heimdall::verifier::hash_auth_key;
+    use crate::runar::evict::{key_digest, Target};
+    use crate::runar::room::{test_salt, unix_now, CloseFlag, PeerTx, RoomClass, Ttl};
+
+    const ROOM: [u8; 16] = [0x7A; 16];
+
+    struct Peer {
+        id: [u8; 16],
+        flag: CloseFlag,
+        rx: mpsc::Receiver<Bytes>,
+    }
+
+    fn state() -> AppState {
+        // No step interval, so a step the guard missed would be applied and
+        // show up as a moved epoch rather than be refused for being early.
+        AppState::new(Config { epoch_min_interval: Duration::ZERO, ..Default::default() })
+    }
+
+    fn room() -> std::sync::Arc<Room> {
+        std::sync::Arc::new(Room::new(
+            ROOM,
+            RoomClass::Unlisted,
+            unix_now(),
+            Ttl::default(),
+            false,
+            Some(hash_auth_key(&[0x11; 32])),
+            65536,
+            3,
+            1,
+            test_salt(),
+            None,
+            1 << 20,
+            5,
+            32,
+        ))
+    }
+
+    fn key(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    fn peer(r: &Room, n: u8, with_kx: bool) -> Peer {
+        let (tx, rx) = mpsc::channel(64);
+        let tx = PeerTx::new(tx, 1 << 20);
+        let flag = tx.close_flag();
+        let kx = with_kx.then(|| PeerKx { pubkey: vec![4u8; 65], sig: vec![1u8; 64] });
+        let id = r.add_peer(Some(key(n)), kx, tx).unwrap().peer_id;
+        Peer { id, flag, rx }
+    }
+
+    fn frame(ft: u8, epoch: u32, body: &[u8]) -> Vec<u8> {
+        let mut f = Header::new(ft, ROOM, epoch, [1, 2, 3, 4], 0).encode();
+        f.extend_from_slice(body);
+        f
+    }
+
+    async fn process(state: &AppState, r: &std::sync::Arc<Room>, sender: [u8; 16], data: &[u8]) {
+        let slot = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let mut direct = Vec::new();
+        let caps = Caps { acks: true, heartbeat: true };
+        let _ = process_frame(state, r, sender, data, &slot, caps, &mut direct).await;
+    }
+
+    fn drain(p: &mut Peer) -> Vec<Bytes> {
+        let mut out = Vec::new();
+        while let Ok(f) = p.rx.try_recv() {
+            out.push(f);
+        }
+        out
+    }
+
+    fn commit(r: &Room, sender: [u8; 16], voters: &[(&Peer, u8)], target: Option<Target>) -> u32 {
+        let rr = ReRoot {
+            at_epoch: r.epoch(),
+            target,
+            voters: voters.iter().map(|(p, n)| (p.id, key(*n))).collect(),
+            verifier: hash_auth_key(&[0x22; 32]),
+            salt: [0x33; 16],
+            config_blob: None,
+        };
+        r.note_evict_request(sender);
+        r.commit_eviction(
+            &rr,
+            std::time::Instant::now(),
+            &Bytes::from(frame(FT_EVICT_COMMIT, rr.at_epoch, b"commit")),
+            sender,
+            &error_frame(ROOM, WireCode::Evicted),
+            &error_frame(ROOM, WireCode::ProtocolError),
+        )
+        .expect("the commit is applied")
+    }
+
+    /// Every frame a member can send, at the room's current epoch (a step at
+    /// the next), processed as `sender`. Afterwards nobody else has been sent
+    /// anything, and the log, the epoch and the room's timer are unchanged.
+    async fn assert_nothing_lands(state: &AppState, r: &std::sync::Arc<Room>, sender: [u8; 16], others: &mut [&mut Peer]) {
+        let epoch = r.epoch();
+        let probes: [(&str, Vec<u8>); 8] = [
+            ("DOC_UPDATE", frame(FT_DOC_UPDATE, epoch, b"late edit")),
+            ("AWARENESS", frame(FT_AWARENESS, epoch, b"late cursor")),
+            ("EVICT_REQUEST", frame(FT_EVICT_REQUEST, epoch, b"late request")),
+            ("EVICT_VOTE", frame(FT_EVICT_VOTE, epoch, b"late vote")),
+            ("SHRED_REQUEST", frame(FT_SHRED_REQUEST, epoch, b"late shred")),
+            ("EPOCH_KEY", frame(FT_EPOCH_KEY, epoch + 1, b"late step")),
+            ("SNAPSHOT", frame(FT_SNAPSHOT, epoch, &0u64.to_be_bytes())),
+            ("TTL_EXTEND", frame(FT_TTL_EXTEND, 0, br#"{"add_secs":600}"#)),
+        ];
+        for (name, data) in probes {
+            let (len, snap) = {
+                let log = r.log.read().unwrap();
+                (log.log_len(), log.has_snapshot())
+            };
+            let ttl = r.effective_ttl_secs();
+            process(state, r, sender, &data).await;
+            for o in others.iter_mut() {
+                let got = drain(o);
+                assert!(got.is_empty(), "{name} from a closing sender reached another member: {} frame(s)", got.len());
+            }
+            let log = r.log.read().unwrap();
+            assert_eq!(log.log_len(), len, "{name} from a closing sender was logged");
+            assert_eq!(log.has_snapshot(), snap, "{name} from a closing sender rebased the log");
+            drop(log);
+            assert_eq!(r.epoch(), epoch, "{name} from a closing sender moved the epoch");
+            assert_eq!(r.effective_ttl_secs(), ttl, "{name} from a closing sender extended the room");
+        }
+    }
+
+    /// The control: the same frames from a member are relayed, so the
+    /// assertions above are not passing because nothing is ever relayed.
+    #[tokio::test]
+    async fn the_probes_from_a_member_do_land() {
+        let s = state();
+        let r = room();
+        let a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        for ft in [FT_DOC_UPDATE, FT_AWARENESS, FT_EVICT_REQUEST, FT_SHRED_REQUEST] {
+            process(&s, &r, a.id, &frame(ft, 0, b"x")).await;
+            assert_eq!(drain(&mut b).len(), 1, "frame {ft:#x} from a member is relayed");
+        }
+        assert_eq!(r.log.read().unwrap().log_len(), 1);
+        process(&s, &r, a.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
+        assert_eq!(r.epoch(), 1);
+    }
+
+    #[tokio::test]
+    async fn after_a_commit_nothing_the_target_sends_lands() {
+        let s = state();
+        let r = room();
+        let mut t = peer(&r, 3, true);
+        let mut a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        let target = Some(Target { peer_id: t.id, key_digest: key_digest(&key(3)) });
+        assert_eq!(commit(&r, a.id, &[(&a, 1), (&b, 2)], target), 1);
+        assert_eq!(drain(&mut a).len(), 1);
+        assert_eq!(drain(&mut b).len(), 1, "b has the commit and nothing else");
+        assert_eq!(t.flag.get(), Some(WireCode::Evicted));
+        assert_eq!(drain(&mut t).len(), 1, "the target has its error");
+        assert_nothing_lands(&s, &r, t.id, &mut [&mut a, &mut b]).await;
+    }
+
+    /// The window the review found: the target's close flag is set and it is
+    /// still in the room's list. Before the fix, its frames passed a
+    /// membership check made on a separate lock and were relayed.
+    #[tokio::test]
+    async fn a_connection_whose_close_flag_is_set_is_not_heard_while_still_listed() {
+        let s = state();
+        let r = room();
+        // Joined first, so it would also be the one elected to snapshot.
+        let t = peer(&r, 3, true);
+        let mut a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        t.flag.set(WireCode::Evicted);
+        assert!(r.roster().iter().any(|p| p.peer_id == t.id), "the test needs it listed");
+        assert_nothing_lands(&s, &r, t.id, &mut [&mut a, &mut b]).await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_a_step_closes_with_4005_is_not_heard_and_leaves_the_roster() {
+        let s = state();
+        let r = room();
+        let mut k = peer(&r, 3, false);
+        let mut a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        process(&s, &r, a.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(k.flag.get(), Some(WireCode::ProtocolError));
+        assert!(!drain(&mut k).is_empty(), "the peer without a key has its error");
+        drain(&mut a);
+        drain(&mut b);
+        assert!(!r.roster().iter().any(|p| p.peer_id == k.id), "a peer closed with 4005 is out of the roster at once");
+        assert_eq!(r.peer_count(), 2);
+        assert_nothing_lands(&s, &r, k.id, &mut [&mut a, &mut b]).await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_a_commit_closes_with_4005_is_not_heard_and_leaves_the_roster() {
+        let s = state();
+        let r = room();
+        let mut k = peer(&r, 3, false);
+        let mut a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        assert_eq!(commit(&r, a.id, &[(&a, 1), (&b, 2)], None), 1);
+        assert_eq!(k.flag.get(), Some(WireCode::ProtocolError));
+        assert!(!drain(&mut k).is_empty(), "the peer without a key has its error");
+        drain(&mut a);
+        drain(&mut b);
+        assert!(!r.roster().iter().any(|p| p.peer_id == k.id), "a peer closed with 4005 is out of the roster at once");
+        assert_eq!(r.peer_count(), 2);
+        assert_nothing_lands(&s, &r, k.id, &mut [&mut a, &mut b]).await;
     }
 }

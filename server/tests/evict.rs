@@ -721,35 +721,60 @@ async fn evict_frames_are_relayed_to_the_others_and_held_to_the_epoch() {
     assert_eq!(json_body(&next_ft(&mut b.ws, 0x30).await)["code"], 4006);
 }
 
-/// A connection the room has just removed keeps reading until its 4014 error
-/// has gone out. The target writes without pause across the commit; whatever it
+/// A smoke test on the runtime the server runs in production: several worker
+/// threads, the target writing without pause across the commit. Whatever it
 /// got in before the commit was applied is relayed, and nothing after it is.
-#[tokio::test]
+/// The deterministic tests for this rule are in `bifrost::closing_sender_tests`
+/// and `runar::room::evict_tests`; this one checks the wiring end to end.
+///
+/// It cannot pass with nothing tested. The rate limits are raised so the
+/// flood cannot get the target closed for flooding before the commit; the
+/// commit goes out only once b has seen the flood arrive; and b must see the
+/// target leave with reason 4014 after the commit, which is only true if the
+/// target was still connected when the commit was applied.
+///
+/// The target never reads, but its writer is not what is exercised here: the
+/// writer runs in the same `select!` as the reader, so a writer stuck sending
+/// stops the reader too, and a reader that keeps going past a stalled writer
+/// cannot happen in this loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
-    let s = spawn(cfg()).await;
+    let s = spawn(runa_server::config::Config {
+        frames_per_conn_per_sec: 10_000_000,
+        bytes_per_conn_per_sec: 1 << 30,
+        ..cfg()
+    })
+    .await;
     let k = create(&s).await;
     let mut a = join(&s, &k, Signer::ed()).await;
     let mut b = join(&s, &k, Signer::ed()).await;
     let t = join(&s, &k, Signer::ed()).await;
+    let t_id = t.id;
     let c = Commit::new(0, named(&t));
     let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
     a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
     next_ft(&mut b.ws, 0x24).await;
+    let (flowing_tx, flowing_rx) = tokio::sync::oneshot::channel::<()>();
     // b reads from the start, so the flood never fills its queue.
     let collector = tokio::spawn(async move {
-        let mut seen = Vec::new();
+        let mut flowing = Some(flowing_tx);
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        let mut until = tokio::time::Instant::now() + Duration::from_secs(20);
         let mut left = false;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        let mut until = deadline;
         // Read until the target's departure has been announced, then a little
         // longer for anything still in flight.
         while let Ok(Some(Ok(m))) = tokio::time::timeout_at(until, b.ws.next()).await {
             if let Message::Binary(f) = m {
+                if f[3] == 0x03 {
+                    if let Some(tx) = flowing.take() {
+                        let _ = tx.send(());
+                    }
+                }
                 if f[3] == 0x08 && !left {
                     left = true;
                     until = tokio::time::Instant::now() + Duration::from_millis(500);
                 }
-                seen.push(f[3]);
+                seen.push(f.to_vec());
             }
         }
         seen
@@ -757,7 +782,7 @@ async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
     let hex = k.hex.clone();
     let mut tws = t.ws;
     let writer = tokio::spawn(async move {
-        for _ in 0..20_000 {
+        for _ in 0..200_000 {
             for ft in [0x03u8, 0x06, 0x24] {
                 if tws.send(frame(&hex, ft, 0, b"late")).await.is_err() {
                     return;
@@ -766,11 +791,116 @@ async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
             tokio::task::yield_now().await;
         }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(5), flowing_rx)
+        .await
+        .expect("the target's flood never reached b")
+        .unwrap();
     a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
     let seen = collector.await.unwrap();
     writer.abort();
-    let commit_at = seen.iter().position(|&t| t == 0x23).expect("b never got the commit");
-    let late: Vec<u8> = seen[commit_at..].iter().copied().filter(|t| [0x03, 0x06, 0x24].contains(t)).collect();
+    let commit_at = seen.iter().position(|f| f[3] == 0x23).expect("b never got the commit");
+    let leave_at = seen
+        .iter()
+        .position(|f| f[3] == 0x08 && json_body(f)["peer_id"] == B64.encode(t_id))
+        .expect("b never saw the target leave");
+    assert!(leave_at > commit_at, "the target left before the commit, so nothing was tested");
+    assert_eq!(json_body(&seen[leave_at])["reason"], 4014, "the target left for another reason, so nothing was tested");
+    assert!(seen[..commit_at].iter().any(|f| f[3] == 0x03), "the flood was live before the commit");
+    let late: Vec<u8> = seen[commit_at..]
+        .iter()
+        .map(|f| f[3])
+        .filter(|t| [0x03, 0x06, 0x24].contains(t))
+        .collect();
     assert!(late.is_empty(), "frames from a removed connection were relayed after the commit: {late:?}");
+}
+
+/// The commit arm's own refusals (review I-3): the config blob limit, an
+/// implausible verifier, and a voter who is not connected.
+async fn commit_with_config(len: usize) -> (String, Keys, Member, Commit) {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    let mut c = Commit::new(0, named(&t));
+    c.config = vec![0x5A; len];
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    propose_and_commit(&k, &mut a, 0, &body).await;
+    (s, k, a, c)
+}
+
+#[tokio::test]
+async fn a_config_blob_one_byte_over_the_limit_is_refused() {
+    let (s, k, mut a, _) = commit_with_config(4097).await;
+    assert_refused(&s, &k, &mut a).await;
+}
+
+#[tokio::test]
+async fn a_config_blob_at_the_limit_is_accepted() {
+    let (s, k, mut a, c) = commit_with_config(4096).await;
+    next_ft(&mut a.ws, 0x23).await;
+    let ack = try_join(&s, &k.hex, c.new_auth).await.unwrap();
+    assert_eq!(ack["root_epoch"], 1);
+    assert_eq!(ack["config_blob"], B64.encode(&c.config));
+}
+
+#[tokio::test]
+async fn an_implausible_new_verifier_is_refused() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    // Every vote signs this verifier, so the signatures are good and only the
+    // verifier itself is wrong: nobody could ever present a key it accepts.
+    let mut c = Commit::new(0, named(&t));
+    c.verifier = [0u8; 32];
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    propose_and_commit(&k, &mut a, 0, &body).await;
+    assert_refused(&s, &k, &mut a).await;
+}
+
+#[tokio::test]
+async fn a_vote_from_someone_no_longer_connected_is_refused() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let c_member = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
+    let b_key = b.key.clone();
+    let b_id = b.id;
+    drop(b);
+    // Wait until the room has seen b go.
+    let left = next_ft(&mut a.ws, 0x08).await;
+    assert_eq!(json_body(&left)["peer_id"], B64.encode(b_id));
+    // a and c alone are above half of the two others still here, so b's vote
+    // is the only thing wrong with this commit.
+    let c = Commit::new(0, named(&t));
+    let body = c.body(&k.id, &[(&a.key, a.id), (&b_key, b_id), (&c_member.key, c_member.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "a commit with an absent voter was applied");
+    let without_b = c.body(&k.id, &[(&a.key, a.id), (&c_member.key, c_member.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &without_b)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &without_b[..]);
+}
+
+/// Review M-1: one vote of two others is exactly half, which is not above
+/// half. A floor written with `>=` would take it.
+#[tokio::test]
+async fn one_vote_of_two_others_is_not_enough() {
+    let s = spawn(cfg()).await;
+    let k = create(&s).await;
+    let mut a = join(&s, &k, Signer::ed()).await;
+    let b = join(&s, &k, Signer::ed()).await;
+    let t = join(&s, &k, Signer::ed()).await;
+    let c = Commit::new(0, named(&t));
+    let one = c.body(&k.id, &[(&a.key, a.id)], false);
+    propose_and_commit(&k, &mut a, 0, &one).await;
+    assert!(frames_of(&mut a.ws, 0x23, 400).await.is_empty(), "one vote of two others was taken");
+    // Both of the two is enough, so the room was otherwise ready to commit.
+    let both = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
+    a.ws.send(frame(&k.hex, 0x23, 0, &both)).await.unwrap();
+    assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &both[..]);
 }
