@@ -42,7 +42,8 @@ export function newLinkWayIn(): WayIn {
 /// Runs Argon2id, which takes seconds on a phone. The caller checks the
 /// passphrase's strength first, with the create form's check.
 export async function newPassWayIn(phrase: string): Promise<WayIn> {
-  if (!phrase || phrase.length > MAX_PHRASE_LEN) throw new Error("a passphrase is required");
+  if (!phrase) throw new Error("a passphrase is required");
+  if (phrase.length > MAX_PHRASE_LEN) throw new Error(`the passphrase is too long: at most ${MAX_PHRASE_LEN} characters`);
   const salt = randomSalt();
   const { material } = await passphraseMaterial(phrase, salt);
   if (!material) throw new Error("a passphrase is required");
@@ -51,6 +52,8 @@ export async function newPassWayIn(phrase: string): Promise<WayIn> {
 
 /// The new root, derived exactly as a new room's is, from the same function.
 export async function deriveReRoot(way: WayIn): Promise<ReRootKeys> {
+  if (way.secret.length !== SECRET_LEN) throw new Error("a way in's secret is 32 bytes");
+  if (way.salt.length !== SALT_LEN) throw new Error("a way in's salt is 16 bytes");
   const pass = way.kind === "pass" ? way.secret.slice() : null;
   const link = way.kind === "link" ? way.secret.slice() : null;
   try {
@@ -74,6 +77,11 @@ export function encodeWayIn(w: WayIn): Uint8Array {
   return cbor2.encode(shape(w));
 }
 
+/// The caller keeps `bytes`, the opened wrap, and wipes it. The returned way
+/// in holds fresh copies, owned by the caller from then on. Nothing else this
+/// function made that held the secret outlives it: the canonical re-encode is
+/// zeroed on every path, and so is the decoder's copy of the secret if it
+/// made one rather than a view into `bytes`.
 export function decodeWayIn(bytes: Uint8Array): WayIn | null {
   let raw: unknown;
   try {
@@ -83,18 +91,25 @@ export function decodeWayIn(bytes: Uint8Array): WayIn | null {
   }
   if (typeof raw !== "object" || raw === null || Array.isArray(raw) || raw instanceof Uint8Array) return null;
   const o = raw as Record<string, unknown>;
-  if (o.kind !== "link" && o.kind !== "pass") return null;
-  if (!(o.secret instanceof Uint8Array) || o.secret.length !== SECRET_LEN) return null;
-  if (!(o.salt instanceof Uint8Array) || o.salt.length !== SALT_LEN) return null;
-  if (typeof o.phrase !== "string" || o.phrase.length > MAX_PHRASE_LEN) return null;
-  if ((o.kind === "link") !== (o.phrase === "")) return null;
-  const w: WayIn = { kind: o.kind, secret: o.secret.slice(), salt: o.salt.slice(), phrase: o.phrase };
-  const again = cbor2.encode(shape(w));
-  if (again.length !== bytes.length || again.some((b, i) => b !== bytes[i])) {
-    w.secret.fill(0);
-    return null;
+  const decoded = o.secret instanceof Uint8Array ? o.secret : null;
+  let again: Uint8Array | null = null;
+  try {
+    if (o.kind !== "link" && o.kind !== "pass") return null;
+    if (!decoded || decoded.length !== SECRET_LEN) return null;
+    if (!(o.salt instanceof Uint8Array) || o.salt.length !== SALT_LEN) return null;
+    if (typeof o.phrase !== "string" || o.phrase.length > MAX_PHRASE_LEN) return null;
+    if ((o.kind === "link") !== (o.phrase === "")) return null;
+    const w: WayIn = { kind: o.kind, secret: decoded.slice(), salt: o.salt.slice(), phrase: o.phrase };
+    again = cbor2.encode(shape(w));
+    if (again.length !== bytes.length || again.some((b, i) => b !== bytes[i])) {
+      w.secret.fill(0);
+      return null;
+    }
+    return w;
+  } finally {
+    again?.fill(0);
+    if (decoded && decoded.buffer !== bytes.buffer) decoded.fill(0);
   }
-  return w;
 }
 
 /// The AES-GCM tag every wrap's ciphertext carries after the sealed bytes.
@@ -103,6 +118,8 @@ const GCM_TAG_LEN = 16;
 /// The longest ciphertext a wrap can hold: the largest way in `encodeWayIn`
 /// can produce, a passphrase of `MAX_PHRASE_LEN` code units of three bytes each
 /// in UTF-8, plus the tag. The commit's encoder and decoder both use this.
+/// The bound holds only while a wrap's ciphertext is a bare AES-GCM seal of
+/// `encodeWayIn`'s output, with a 16-byte tag and no other framing or padding.
 export const MAX_WRAP_CT =
   encodeWayIn({
     kind: "pass",

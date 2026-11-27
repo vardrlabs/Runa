@@ -1,8 +1,23 @@
 import * as cbor2 from "cbor2";
 import fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { parseFragment } from "../keys-session";
 import { bytesEqual } from "./statement";
+
+/// Every buffer cbor2 encodes in this file, so a test can see whether the
+/// decoder's canonical re-encode of a secret was zeroed.
+const encoded = vi.hoisted(() => [] as Uint8Array[]);
+vi.mock("cbor2", async (importOriginal) => {
+  const real = await importOriginal<typeof import("cbor2")>();
+  return {
+    ...real,
+    encode: (...args: Parameters<typeof real.encode>) => {
+      const out = real.encode(...args);
+      encoded.push(out);
+      return out;
+    },
+  };
+});
 import {
   decodeWayIn,
   deriveReRoot,
@@ -37,7 +52,11 @@ describe("a new way into a room", () => {
   });
 
   it("refuses an empty passphrase", async () => {
-    await expect(newPassWayIn("")).rejects.toThrow();
+    await expect(newPassWayIn("")).rejects.toThrow("a passphrase is required");
+  });
+
+  it("says a passphrase over the limit is too long", async () => {
+    await expect(newPassWayIn("x".repeat(MAX_PHRASE_LEN + 1))).rejects.toThrow("too long");
   });
 
   it("is zeroed by wipeWayIn", () => {
@@ -101,5 +120,34 @@ describe("deriveReRoot", () => {
     expect(a.confirm).toEqual(b.confirm);
     const other = await deriveReRoot(newLinkWayIn());
     expect(bytesEqual(a.verifier, other.verifier)).toBe(false);
+  });
+
+  it("refuses a secret or a salt of the wrong length", async () => {
+    const w = newLinkWayIn();
+    await expect(deriveReRoot({ ...w, secret: new Uint8Array(31) })).rejects.toThrow();
+    await expect(deriveReRoot({ ...w, salt: new Uint8Array(17) })).rejects.toThrow();
+  });
+});
+
+describe("decodeWayIn leaves no copy of the secret behind", () => {
+  it("zeroes its canonical re-encode when the way in decodes", () => {
+    const w = newLinkWayIn();
+    const bytes = encodeWayIn(w);
+    encoded.length = 0;
+    const back = decodeWayIn(bytes)!;
+    expect(back.secret).toEqual(w.secret);
+    expect(encoded).toHaveLength(1);
+    expect(encoded[0].every((x) => x === 0)).toBe(true);
+    // The caller's bytes are the caller's to wipe.
+    expect(bytes).toEqual(encodeWayIn(w));
+  });
+
+  it("zeroes it, and the copy it made, when the bytes are not canonical", () => {
+    const secret = new Uint8Array(32).fill(0x5a);
+    const reordered = cbor2.encode({ secret, kind: "link", salt: new Uint8Array(16), phrase: "" });
+    encoded.length = 0;
+    expect(decodeWayIn(reordered)).toBeNull();
+    expect(encoded).toHaveLength(1);
+    expect(encoded[0].every((x) => x === 0)).toBe(true);
   });
 });

@@ -37,6 +37,11 @@ export type LeaveReason = "proposer-left" | "voter-left";
 /// How long members wait for the commit once every approval is in.
 export const COMMIT_WAIT_MS = 15_000;
 
+/// How many request ids one member remembers in one epoch. Past it the oldest
+/// is let go, and from then until the epoch moves a commit for any id it
+/// cannot place is refused rather than judged as one it never saw.
+export const MAX_SEEN_REQUESTS = 64;
+
 /// What a ballot signs. The eviction statement by default; Unit B (a room's
 /// timer shortened by quorum) supplies its own and leaves `target` and
 /// `targetKeyDigest` empty. `targetKeyDigest` is SHA-256 of the target's
@@ -92,8 +97,51 @@ export class EvictMachine {
   private p: Proposal | null = null;
   /// Approvals by voter (hex), with their signatures, for the commit.
   private approvals = new Map<string, Uint8Array>();
+  /// Every request id this member received or made in the current epoch,
+  /// with the proposal it froze, or null for one it refused. A commit for one
+  /// of them is judged against that proposal and never as one this member
+  /// did not see, even after a newer request replaced it here. Bounded by
+  /// `MAX_SEEN_REQUESTS` and emptied when the epoch moves. It lives here, not
+  /// in the coordinator, because `commitSatisfies` is what decides which set
+  /// a commit is held to, and `open` is the one place a proposal is frozen.
+  private seenEpoch = -1;
+  private seenIds = new Map<string, Proposal | null>();
+  private seenOverflowed = false;
 
   constructor(private d: MachineDeps) {}
+
+  private seenTable(): Map<string, Proposal | null> {
+    const epoch = this.d.epoch();
+    if (epoch !== this.seenEpoch) {
+      this.seenEpoch = epoch;
+      this.seenIds.clear();
+      this.seenOverflowed = false;
+    }
+    return this.seenIds;
+  }
+
+  private markSeen(id: Uint8Array, p: Proposal | null): void {
+    const table = this.seenTable();
+    const key = hexOf(id);
+    if (!table.has(key) && table.size >= MAX_SEEN_REQUESTS) {
+      const oldest = table.keys().next().value;
+      if (oldest !== undefined) table.delete(oldest);
+      this.seenOverflowed = true;
+    }
+    table.set(key, p);
+  }
+
+  /// Whether this member received or made a request with this id in the
+  /// current epoch, whatever became of it.
+  wasSeen(id: Uint8Array): boolean {
+    return this.seenOverflowed || this.seenTable().has(hexOf(id));
+  }
+
+  /// The proposal this member froze for that id in the current epoch, if it
+  /// opened one.
+  requestFor(id: Uint8Array): Proposal | null {
+    return this.seenTable().get(hexOf(id)) ?? null;
+  }
 
   private statementFor(s: Statement, voter: Uint8Array): Uint8Array {
     return this.d.statement
@@ -120,6 +168,8 @@ export class EvictMachine {
   /// Throws while another vote is open: one sender's request never replaces
   /// another's. A vote that has finished may be started over.
   start(req: EvictRequest, me: Uint8Array, roster: RosterEntry[], targetKeyDigest: Uint8Array | null): void {
+    // A vote past its deadline is over whether or not tick has run.
+    this.pastDeadline();
     if (this.isOpen()) throw new Error("another vote is already open");
     this.reset();
     this.open(req, targetKeyDigest, me, roster);
@@ -140,6 +190,7 @@ export class EvictMachine {
       deadlineAt: this.d.now() + req.deadline,
       approvedAt: null,
     };
+    this.markSeen(req.id, this.p);
     this.approvals.set(hexOf(proposer), req.sig.slice());
     this.state = "VOTING";
     this.evaluate();
@@ -174,7 +225,13 @@ export class EvictMachine {
   }
 
   async onRequest(req: EvictRequest, sender: Uint8Array): Promise<Guard | null> {
+    this.pastDeadline();
+    // An id already received in this epoch is never opened again: a relayed
+    // copy of a request this member refused would otherwise ask it again.
+    if (this.seenTable().has(hexOf(req.id))) return "busy";
     if (SETTLED.includes(this.state)) this.reset();
+    // Received, so never judged later as a request this member did not see.
+    this.markSeen(req.id, null);
     if (this.state !== "IDLE") return "busy";
     if (req.policy !== "UNANIMOUS") return "policy-not-permitted";
     if (req.deadline <= 0 || req.deadline > MAX_DEADLINE_MS) return "malformed";
@@ -267,7 +324,7 @@ export class EvictMachine {
   /// The argument is kept for callers but not read: the deadline and the
   /// commit wait are both measured on the injected clock, so the machine has
   /// one clock and a caller's `now` cannot drift from it.
-  tick(_now?: number): { state: EvictState; reason?: string } | null {
+  tick(_now: number): { state: EvictState; reason?: string } | null {
     const now = this.d.now();
     const p = this.p;
     if (!p || !this.isOpen()) return null;
@@ -297,16 +354,22 @@ export class EvictMachine {
   /// Whether a commit's votes are exactly what the policy needed: every
   /// member of the roster the request froze, without the target, each with a
   /// valid signature, and nobody else; and whether it names the target's key
-  /// as the request did (SHA-256 of `request.targetKey`). A member that never
-  /// saw the request requires the digest to be that of the key its roster
-  /// shows for the named target, if it is still listed, and checks against
-  /// its own roster without the named target, every entry whose key has the
-  /// commit's digest, and itself.
+  /// as the request did (SHA-256 of `request.targetKey`). That holds for any
+  /// request this member opened in the current epoch, not only the one open
+  /// now. A request it received but refused is never satisfied, and neither
+  /// is an id it cannot place once its record has overflowed. A member that
+  /// never saw the request requires the digest to be that of the key its
+  /// roster shows for the named target, if it is still listed, and checks
+  /// against its own roster without the named target, every entry whose key
+  /// has the commit's digest, and itself.
   async commitSatisfies(c: Statement & { votes: Ballot[] }): Promise<boolean> {
-    const p = this.p;
     if ((c.target === null) !== (c.targetKeyDigest === null)) return false;
+    const table = this.seenTable();
+    const key = hexOf(c.id);
+    if (table.has(key) ? table.get(key) === null : this.seenOverflowed) return false;
+    const p = table.get(key) ?? null;
     let set: RosterEntry[];
-    if (p && eq(p.request.id, c.id)) {
+    if (p) {
       const sameTarget = p.request.target === null ? c.target === null : c.target !== null && eq(p.request.target, c.target);
       const sameKey =
         p.targetKeyDigest === null ? c.targetKeyDigest === null : c.targetKeyDigest !== null && eq(p.targetKeyDigest, c.targetKeyDigest);

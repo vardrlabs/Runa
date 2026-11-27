@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { generateIdentity, signPayload, type Identity } from "../crypto/identity";
 import type { RosterEntry } from "../shred/roster";
 import type { EvictRequest, EvictVote } from "./frame";
-import { COMMIT_WAIT_MS, EvictMachine, requestStatement } from "./machine";
+import { COMMIT_WAIT_MS, EvictMachine, MAX_SEEN_REQUESTS, requestStatement } from "./machine";
 import { keyDigest, rosterDigest, voteStatement } from "./statement";
 
 const ROOM = new Uint8Array(16).fill(9);
@@ -564,5 +564,126 @@ describe("request limits", () => {
     expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 0 }), a.id)).toBe("malformed");
     expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 3_600_001 }), a.id)).toBe("malformed");
     expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { deadline: 3_600_000 }), a.id)).toBeNull();
+  });
+});
+
+describe("a commit for a request this member saw (fix wave 1, A2)", () => {
+  /// A proposes R1 against T; B refuses (or never answers) and A's R2
+  /// replaces it in B's machine. A commit for R1 carries every vote but B's.
+  async function replaced(refuse: "reject" | "expire") {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const r1 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x31), deadline: 5_000 });
+    const m = machineFor(room, b);
+    expect(await m.onRequest(r1, a.id)).toBeNull();
+    if (refuse === "reject") m.rejectOwn();
+    else room.clock.now += 5_000;
+    const r2 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x32) });
+    expect(await m.onRequest(r2, a.id)).toBeNull();
+    expect(m.current()!.request.id).toEqual(r2.id);
+    const votes = [
+      { voter: a.id, sig: r1.sig },
+      { voter: c.id, sig: await sign(c, r1) },
+    ];
+    return { m, r1, votes };
+  }
+
+  it("judges it against that request's frozen set, which holds this member, after a refusal", async () => {
+    const { m, r1, votes } = await replaced("reject");
+    expect(await m.commitSatisfies({ ...(await requestStatement(r1)), votes })).toBe(false);
+  });
+
+  it("does the same for a request it never answered", async () => {
+    const { m, r1, votes } = await replaced("expire");
+    expect(await m.commitSatisfies({ ...(await requestStatement(r1)), votes })).toBe(false);
+  });
+
+  it("still accepts that request's commit when it carries every vote it froze", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const r1 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x31) });
+    const m = machineFor(room, b);
+    await m.onRequest(r1, a.id);
+    m.recordOwn(await sign(b, r1));
+    m.fail();
+    await m.onRequest(await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x32) }), a.id);
+    const votes = [
+      { voter: a.id, sig: r1.sig },
+      { voter: b.id, sig: await sign(b, r1) },
+    ];
+    expect(await m.commitSatisfies({ ...(await requestStatement(r1)), votes })).toBe(true);
+  });
+
+  it("refuses a commit for a request it received but could not open", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const m = machineFor(room, b);
+    await m.onRequest(await requestBy(room, a, t), a.id);
+    // c's request arrives while a's is open and is refused as busy.
+    const theirs = await requestBy(room, c, t, { id: new Uint8Array(16).fill(0x33) });
+    expect(await m.onRequest(theirs, c.id)).toBe("busy");
+    const votes = [
+      { voter: c.id, sig: theirs.sig },
+      { voter: a.id, sig: await sign(a, theirs) },
+    ];
+    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes })).toBe(false);
+  });
+
+  it("never opens the same request id twice in one epoch, and forgets the ids when the epoch moves", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const m = machineFor(room, b);
+    const r1 = await requestBy(room, a, t);
+    expect(await m.onRequest(r1, a.id)).toBeNull();
+    m.rejectOwn();
+    expect(await m.onRequest(r1, a.id)).toBe("busy");
+    expect(m.state).toBe("REJECTED");
+    room.epoch.value = 1;
+    expect(await m.onRequest(await requestBy(room, a, t, { epoch: 1 }), a.id)).toBeNull();
+  });
+
+  it("keeps a bounded record, and once it has let go of one refuses every commit it cannot place", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const m = machineFor(room, b);
+    // A request b never saw, signed by everyone but b: the never-saw path takes it.
+    const unseen = await requestBy(room, a, t, { id: new Uint8Array(16).fill(0xfe) });
+    const votes = [
+      { voter: a.id, sig: unseen.sig },
+      { voter: c.id, sig: await sign(c, unseen) },
+    ];
+    const st = await requestStatement(unseen);
+    expect(await m.commitSatisfies({ ...st, votes })).toBe(true);
+    for (let i = 0; i <= MAX_SEEN_REQUESTS; i++) {
+      const id = new Uint8Array(16);
+      new DataView(id.buffer).setUint32(0, i + 1);
+      const r = await requestBy(room, a, t, { id });
+      expect(await m.onRequest(r, a.id)).toBeNull();
+      m.rejectOwn();
+    }
+    expect(await m.commitSatisfies({ ...st, votes })).toBe(false);
+  });
+});
+
+describe("a vote past its deadline that tick has not seen (fix wave 1, C1)", () => {
+  it("does not make the next request busy", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const m = machineFor(room, b);
+    await m.onRequest(await requestBy(room, a, t, { deadline: 5_000 }), a.id);
+    room.clock.now += 5_000;
+    expect(await m.onRequest(await requestBy(room, a, t, { id: new Uint8Array(16).fill(0x41) }), a.id)).toBeNull();
+    expect(m.state).toBe("VOTING");
+  });
+
+  it("does not stop this member starting its own", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const m = machineFor(room, b);
+    await m.onRequest(await requestBy(room, a, t, { deadline: 5_000 }), a.id);
+    room.clock.now += 5_000;
+    const mine = await requestBy(room, b, t, { id: new Uint8Array(16).fill(0x42) });
+    expect(() => m.start(mine, b.id, room.roster, null)).not.toThrow();
+    expect(m.current()!.request.id).toEqual(mine.id);
   });
 });

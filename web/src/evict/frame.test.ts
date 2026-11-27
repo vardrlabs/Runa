@@ -80,11 +80,24 @@ describe("EVICT_REQUEST", () => {
       request({ targetKey: null }),
       request({ targetKey: new Uint8Array(40) }),
       request({ target: null, targetKey: new Uint8Array(32) }),
-      request({ policy: "INITIATOR" as never }),
-      request({ policy: "MAJORITY" }),
-      request({ policy: "THRESHOLD" }),
     ]) {
       expect(decodeRequest(encodeRequest(bad))).toBeNull();
+    }
+    // encodeRequest refuses these itself, so they are built by hand in its layout.
+    for (const policy of ["INITIATOR", "MAJORITY", "THRESHOLD"]) {
+      const r = request();
+      const raw = cbor2.encode({
+        type: "EVICT_REQUEST", id: r.id, epoch: r.epoch, target: r.target, targetKey: r.targetKey,
+        verifier: r.verifier, roster: r.roster, policy, deadline: r.deadline, sig: r.sig,
+      });
+      expect(decodeRequest(raw)).toBeNull();
+      expect(decodeRequest(cbor2.encode({ ...cbor2.decode(raw) as object, policy: "UNANIMOUS" }))).not.toBeNull();
+    }
+  });
+
+  it("cannot be encoded with a policy its readers refuse", () => {
+    for (const policy of ["MAJORITY", "THRESHOLD"]) {
+      expect(() => encodeRequest(request({ policy: policy as EvictRequest["policy"] }))).toThrow();
     }
   });
 

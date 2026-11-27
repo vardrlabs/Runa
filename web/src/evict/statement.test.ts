@@ -1,5 +1,6 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
+import { rosterHash, toB64 } from "../shred/roster";
 import { bytesEqual, hexOf, keyDigest, rosterDigest, voteStatement, ZERO_KEY_DIGEST, ZERO_PEER } from "./statement";
 
 const h = (s: string): Uint8Array => Uint8Array.from(s.match(/../g)!.map((x) => parseInt(x, 16)));
@@ -75,9 +76,14 @@ describe("keyDigest", () => {
 
 describe("rosterDigest", () => {
   it("is SHA-256 of the canonical roster bytes, so it matches the shred hash", async () => {
-    const roster = [{ peerId: new Uint8Array(16).fill(1), pubkey: new Uint8Array(32).fill(2), joinedAtSeq: 1 }];
+    const roster = [
+      { peerId: new Uint8Array(16).fill(1), pubkey: new Uint8Array(32).fill(2), joinedAtSeq: 1 },
+      { peerId: new Uint8Array(16).fill(3), pubkey: new Uint8Array(32).fill(4), joinedAtSeq: 2 },
+    ];
     const d = await rosterDigest(roster);
     expect(d.length).toBe(32);
+    expect(toB64(d)).toBe(await rosterHash(roster));
+    expect(toB64(await rosterDigest([roster[1], roster[0]]))).toBe(await rosterHash(roster));
     expect(await rosterDigest([...roster])).toEqual(d);
     expect(await rosterDigest([])).not.toEqual(d);
   });

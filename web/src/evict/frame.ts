@@ -118,6 +118,8 @@ function requestShape(r: EvictRequest) {
 }
 
 export function encodeRequest(r: EvictRequest): Uint8Array {
+  // The decoder refuses every other policy, so none is ever sent.
+  if (r.policy !== "UNANIMOUS") throw new Error("an eviction is decided by UNANIMOUS only");
   return cbor2.encode(requestShape(r));
 }
 
