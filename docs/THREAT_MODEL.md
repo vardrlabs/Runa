@@ -170,11 +170,16 @@ What that buys is narrow, so here it is exactly:
   anyway.
 - **A vote to remove someone holds key changes back.** While a request to
   remove someone or change the link is open, the server applies no key change,
-  for up to 150 seconds, and one member's requests can hold the room for at
-  most 300 seconds in any 900 however often they ask. If someone leaves
-  during a hold, the key changes once the hold ends, so a member can let a
-  person who left read on for that long. Any member could already pass them
-  the new key itself.
+  for up to 150 seconds. The server counts the limit on that per connection:
+  one connection's requests can hold the room for at most 300 seconds in any
+  900, but someone who reconnects starts with a fresh allowance, and each of
+  their connections has its own, so several connections can hold key changes
+  back without a gap for as long as they keep asking. A request is withdrawn
+  only when the person who asked cancels it, so a vote that is refused, runs
+  out or fails holds key changes for the whole 150 seconds. If someone leaves
+  during a hold, the key changes within about 15 seconds of the hold ending,
+  so a member can let a person who left read on for that long. Any member
+  could already pass them the new key itself.
 - **A tab opened before key rotation existed is kept out once the key has
   changed.** It cannot be handed a new key, so the server refuses it with a
   version error. The older page does not explain that error: it keeps trying to
@@ -220,12 +225,12 @@ passphrase. Removing them takes it away. The person who asks has already made
 the replacement: a new link, or for a shared-name room a passphrase they typed
 or generated, held to the same strength check as a new room's. Everyone else in
 the room has to approve, any one of them can refuse, and a vote that nobody
-settles fails after a minute by default, or after as long as two minutes if
-the person asking chose that. The server checks this too: it applies the change
-only when everyone the request was put to has approved. Once everyone has
-approved, each member receives the new link or passphrase sealed to them
-alone, the server replaces what it checks a JOIN against, and the room's key
-starts again from the new link or passphrase. Changing the link is the same
+settles fails after a minute. The app always sets a minute and offers no choice;
+two minutes is the longest the protocol allows. The server checks this too: it
+applies the change only when everyone the request was put to has approved. Once
+everyone has approved, each member receives the new link or passphrase sealed to
+them alone, the server replaces what it checks a JOIN against, and the room's
+key starts again from the new link or passphrase. Changing the link is the same
 vote with nobody removed. It is what an everyday room can do about someone who
 once had its link, since an everyday room does not change its key when people
 leave. The design is in PROTOCOL amendment K.
@@ -269,33 +274,55 @@ What that buys, exactly:
   visible to everyone in the room. They read everything written until the
   change, and they can vote on other things. Nobody asks for their approval,
   and it would not count if they gave it. They cannot change the room's key
-  while the vote is open, because the server holds every key change while a
-  request to remove someone is open. What they can still do is change the key
+  while the vote is open, because the server holds key changes while a request
+  to remove someone is open, within the limits below. What they can still do is change the key
   just before a vote starts and leave someone out of the new key on purpose.
   That person's tab joins again to be handed the key, and a vote asked for
   before it has done so fails when its old connection leaves; the next request
   can go ahead once it has. The hold lasts at most 150 seconds, and one
-  person's requests get it for at most 300 seconds in any 900, so a vote asked
-  for past that runs without it and can be stopped that way. A server that
-  does not hold key changes lets them do it during any vote, and then they can
-  make every vote fail; the remedy then is a new room.
+  connection's requests get it for at most 300 seconds in any 900, so a vote
+  asked for from the same tab past that runs without it and can be stopped
+  that way. A server that does not hold key changes lets them do it during any
+  vote, and then they can make every vote fail; the remedy then is a new room.
+  A member can also send a key change just before a vote starts that hands one
+  of the people who will approve a copy of the new key they cannot open. If
+  that person approves and the change lands, their tab is told it was left
+  out and stops. That needs blind timing, because nobody sees a request
+  before the server has noted it.
+
+  A member who is determined to stay can still block their own removal, in
+  two ways, and neither depends on timing. They can keep a request of their
+  own open. A member answers one request at a time, so while theirs is open
+  nobody else's can start, and a modified client can send a new one the
+  moment the last one ends. The room can see it happening, because the same
+  person keeps asking. Or they can join under a second identity before anyone
+  asks. That second identity is a member, its approval is needed, and it can
+  refuse or leave. Neither identity can then be removed without the other's
+  approval. A copy of another member's public key works the same way, and it
+  looks like that member's second tab. So removal by unanimous vote works
+  against someone who isn't running a modified client and hasn't prepared a
+  second identity, and it doesn't work against a member who is determined to
+  stay. What a removal guarantees once it lands is unchanged: the removed
+  person's old link or passphrase no longer opens the room, and nothing
+  written afterwards reaches them. Changing the link while the unwanted person
+  isn't connected is affected by neither route, because someone who isn't
+  connected has no vote.
 - **Someone being removed cannot dodge it by reconnecting: a new connection is
   not given the new link.** The room changes its link whether or not they are
   still connected, and only the people who approved receive the new one.
-- **Connections opened after a vote started are not asked.** The server
-  checks that everyone who was connected when the request passed through it,
-  and is still connected, approved, so nobody can hold the vote down by
-  opening connections once it has begun. Connections the person being removed
-  holds under their own signing key are never asked. They could only add to
-  the people who must approve by opening connections under other keys before
-  anyone asked, and those show in the room as extra people, who would then
-  have to be asked too. Several connections that share one signing key, other
-  than the removed person's, are each asked separately. The server cannot
-  read a request, so it counts a commit against its sender's latest one: a
-  member who asked while alone in the room could, within 150 seconds, change
-  the link with their own approval alone, and everyone who arrived since would
-  be left out. That is no more than a member can already do to a room by
-  breaking its key.
+- **Connections opened after a vote started are not asked.** The server checks
+  that everyone who was connected when the request passed through it, and is
+  still connected, approved, so nobody can hold the vote down by opening
+  connections once it has begun. Connections the person being removed holds
+  under their own signing key are never asked. Connections they opened under
+  other keys before anyone asked show in the room as extra people, have to be
+  asked too, and can refuse, as described above. Several connections that share
+  one signing key, other than the removed person's, are each asked separately.
+  The server cannot read a request, so it counts a commit against its sender's
+  latest one: a member who asked while alone in the room could, within 150
+  seconds, change the link with their own approval alone, and everyone who
+  arrived since would be left out. That is no more than a member can already do
+  to a room by breaking its key.
 - **A copy of someone's signing key counts as them.** A JOIN carries no proof
   that the connection holds the private half of the signing key it presents,
   so the server treats a connection that presents a copy of someone's public

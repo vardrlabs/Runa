@@ -122,7 +122,8 @@ known limits.
 - EVICT_REQUEST, EVICT_VOTE, EVICT_CANCEL: relay verbatim to other peers
   (sender excluded), like SHRED_*, held to the room's epoch. For an
   EVICT_REQUEST the server first notes who was connected, as it does for a
-  SHRED_REQUEST (amendment K).
+  SHRED_REQUEST, and holds key changes in the room; an EVICT_CANCEL ends its
+  sender's hold (amendment K).
 - EVICT_COMMIT: check the votes and, if they pass, replace the room's verifier,
   salt and config, move it to a new root and close every connection still open
   that holds the target's signing key, all at once. See amendment K.
@@ -507,7 +508,12 @@ once the hold has ended or when the request started none; a request made after
 everyone the step left out has joined again can go ahead. A server that does
 not hold steps lets the target end every vote this way. The target leaving
 does not stop it: the room still moves to the new way in, and a connection the
-target opens again is never given it.
+target opens again is never given it. The target can still block its own
+removal in two ways: a member answers one request at a time, so a target that
+keeps a request of its own open keeps every other request from being asked,
+and a connection it opened under another signing key before the request is a
+member whose approval is needed like any other, so it can refuse or leave. The
+threat model states what follows from this.
 
 *The new way in.* The proposer makes it before asking. For a private room it is
 a new 32-byte link secret and a new 16-byte salt. For a shared-name room it is a
@@ -534,16 +540,22 @@ step (a header epoch one above the room's) and drops it without an answer, as
 it drops a step that lost to another. A handover is relayed as before, and an
 EVICT_COMMIT is not held. A sender's hold ends early when a commit is applied,
 when that sender sends an EVICT_CANCEL (the server cannot read which request
-it cancels), or when that sender's connection leaves or is closed. The room is
-held while any sender's hold is open. One sender's requests hold the room for
-at most 300 seconds in any 900: a request starts a hold only if the time that
-sender's holds covered in the last 750 seconds, plus 150, is at most 300. A
+it cancels), or when that sender's connection leaves or is closed. A member
+sends EVICT_CANCEL only to withdraw a request of its own, so a request that is
+refused, expires or fails holds steps for the whole 150 seconds. The room is
+held while any sender's hold is open. Each connection's requests hold the room
+for at most 300 seconds in any 900: a request starts a hold only if the time
+that connection's holds covered in the last 750 seconds, plus 150, is at most
+300. The allowance is kept per connection, by peer id: a member that connects
+again starts with a new one, and each of its connections has its own, so a
+member with several connections can hold steps back without a gap. A
 request beyond that is still relayed and recorded, and starts no hold. For
 each connected sender the server keeps the start and end of each of its holds
 that can still count toward that bound, at most 16 (a request from a sender
 that already has 16 starts no hold either), and forgets them when the sender
-leaves. A member whose step was dropped sends it again later, as it does after
-any step that is not echoed.
+leaves. A member whose step was dropped sends it again 15 seconds after its last
+send, as it does after any step that is not echoed, so a held step lands up to
+about 15 seconds after the hold ends.
 
 The plaintexts of EVICT_REQUEST, EVICT_VOTE and EVICT_CANCEL are canonical
 CBOR maps:
