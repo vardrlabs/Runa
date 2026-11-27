@@ -1,3 +1,4 @@
+import * as cbor2 from "cbor2";
 import { describe, expect, it } from "vitest";
 import { decryptWithExplicitNonce, encryptWithExplicitNonce } from "../crypto/aead";
 import { deriveChainKey } from "../crypto/epoch";
@@ -6,10 +7,19 @@ import { generateKx, sealWrap, wrapKey, type KxPair } from "../crypto/kx";
 import type { MemberView } from "../epoch/coordinator";
 import { Keyring } from "../epoch/keyring";
 import { encodeHeader, FT, PROTOCOL_VERSION } from "../transport/frame";
-import { COMMIT_ECHO_MS, EvictCoordinator, type EvictPrompt, type ReRooted, type SealedConfig } from "./coordinator";
-import { decodeCommit, encodeCommit } from "./frame";
+import { encryptRoomConfig } from "../keys-session";
+import {
+  COMMIT_ECHO_MS,
+  EARLY_HOLD_MS,
+  EvictCoordinator,
+  MAX_EARLY_IDS,
+  type EvictPrompt,
+  type ReRooted,
+  type SealedConfig,
+} from "./coordinator";
+import { decodeCommit, decodeRequest, decodeVote, encodeCancel, encodeCommit, encodeVote, MAX_VOTES } from "./frame";
 import { COMMIT_WAIT_MS, type EvictState } from "./machine";
-import { deriveReRoot, encodeWayIn, newLinkWayIn } from "./reroot";
+import { deriveReRoot, encodeWayIn, newLinkWayIn, type WayIn } from "./reroot";
 import { bytesEqual, hexOf, keyDigest } from "./statement";
 
 const ROOM = new Uint8Array(16).fill(7);
@@ -46,8 +56,11 @@ class Hub {
   captured: { from: Peer; h: Uint8Array; body: Uint8Array }[] = [];
   /// Peers nobody can agree a key with.
   unverified = new Set<Peer>();
+  /// Every sealed frame, in the order it was sent.
+  sent: { from: Peer; ft: number; pt: Uint8Array }[] = [];
 
   sealed(from: Peer, ft: number, pt: Uint8Array): boolean {
+    this.sent.push({ from, ft, pt });
     for (const p of this.peers) if (p !== from) this.pending.push(p.ev.receiveFrame(ft, from.id, pt));
     return true;
   }
@@ -104,6 +117,8 @@ class Peer {
   private queue: Promise<unknown> = Promise.resolve();
   /// Stands in for a socket that throws instead of answering.
   sendThrows = false;
+  /// Stands in for a page whose state callback throws.
+  stateThrows = false;
 
   constructor(
     readonly hub: Hub,
@@ -135,7 +150,10 @@ class Peer {
       sealedConfig: () => this.config,
       applyReRoot: (r) => this.applied.push(r),
       prompt: (p) => this.prompts.push(p),
-      state: (s) => this.states.push(s),
+      state: (s) => {
+        if (this.stateThrows) throw new Error("the page threw");
+        this.states.push(s);
+      },
       refused: (reason) => this.refusals.push(reason),
       leftOut: () => {
         this.leftOut += 1;
@@ -163,6 +181,26 @@ class Peer {
     return { peerId: this.id, pubkey: this.identity.publicKeyRaw, kxPub: this.kx.publicKeyRaw, joinedAtSeq: this.seq };
   }
 }
+
+/// Sealed frames go nowhere until a test hands each one over itself, in the
+/// order the test chooses: decrypts that resolve out of order.
+function holdFrames(hub: Hub): { from: Peer; ft: number; pt: Uint8Array }[] {
+  const held: { from: Peer; ft: number; pt: Uint8Array }[] = [];
+  hub.sealed = (from, ft, pt) => {
+    held.push({ from, ft, pt });
+    return true;
+  };
+  return held;
+}
+
+async function rootKeys(): Promise<{ content: CryptoKey; chain: CryptoKey }> {
+  const content = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(42), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+  const chain = await deriveChainKey(new Uint8Array(32).fill(43), new Uint8Array(16).fill(44));
+  return { content, chain };
+}
+
+/// A copy of a way in that a call taking ownership cannot wipe.
+const keep = (w: WayIn): WayIn => ({ ...w, secret: w.secret.slice(), salt: w.salt.slice() });
 
 async function room(n: number): Promise<{ hub: Hub; peers: Peer[] }> {
   const hub = new Hub();
@@ -321,7 +359,7 @@ describe("EvictCoordinator (amendment K)", () => {
     expect(b.keyring.rootEpoch).toBe(0);
   });
 
-  it("gives up and wipes the new way in when the commit is never echoed", async () => {
+  it("gives up at 10 seconds when the commit is never echoed, and wipes the new way in once members stop waiting", async () => {
     const { hub, peers } = await room(3);
     const [a, b, c] = peers;
     hub.dropCommits = true;
@@ -331,11 +369,52 @@ describe("EvictCoordinator (amendment K)", () => {
     await b.ev.vote("APPROVE");
     await hub.flush();
     expect(hub.captured).toHaveLength(1);
-    hub.now += COMMIT_ECHO_MS + 1;
+    hub.now += COMMIT_ECHO_MS - 1;
+    await a.ev.tick();
+    expect(a.ev.isOpen()).toBe(true);
+    hub.now += 1;
     await a.ev.tick();
     expect(a.states.at(-1)).toBe("FAILED");
-    expect(way.secret.every((x) => x === 0)).toBe(true);
     expect(a.ev.isOpen()).toBe(false);
+    // Kept, closed, while a late echo could still come back.
+    expect(way.secret.every((x) => x === 0)).toBe(false);
+    hub.now += COMMIT_WAIT_MS - COMMIT_ECHO_MS - 1;
+    await a.ev.tick();
+    expect(way.secret.every((x) => x === 0)).toBe(false);
+    hub.now += 1;
+    await a.ev.tick();
+    expect(way.secret.every((x) => x === 0)).toBe(true);
+    // An echo after that finds nothing of its own to apply.
+    hub.deliver(a, hub.captured[0].h, hub.captured[0].body);
+    await hub.flush();
+    expect(a.applied).toHaveLength(0);
+    expect(a.keyring.rootEpoch).toBe(0);
+  });
+
+  it("applies its own commit when the echo comes back after it gave up", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    hub.dropCommits = true;
+    const way = newLinkWayIn();
+    const secret = way.secret.slice();
+    await a.ev.propose(c.view(), way);
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    hub.now += COMMIT_ECHO_MS;
+    await a.ev.tick();
+    expect(a.states.at(-1)).toBe("FAILED");
+    hub.now += COMMIT_WAIT_MS - COMMIT_ECHO_MS - 1;
+    hub.deliver(a, hub.captured[0].h, hub.captured[0].body);
+    await hub.flush();
+    for (const p of [a, b]) {
+      expect(p.keyring.rootEpoch).toBe(1);
+      expect(p.applied).toHaveLength(1);
+    }
+    expect(a.applied[0].way.secret).toEqual(secret);
+    expect(a.states.at(-1)).toBe("DONE");
+    expect(a.leftOut).toBe(0);
+    expect(a.refusals).toEqual([]);
   });
 
   it("removes a target that reconnected mid-vote, and does not hand its new connection the new way in", async () => {
@@ -602,11 +681,25 @@ describe("EvictCoordinator (amendment K)", () => {
   it("refuses a request that asks for a policy other than unanimity, and a malformed frame", async () => {
     const { hub, peers } = await room(3);
     const [a, b, c] = peers;
-    hub.dropCommits = true;
-    await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, new Uint8Array([1, 2, 3]));
-    expect(b.refusals).toContain("malformed");
+    const held = holdFrames(hub);
+    await a.ev.propose(c.view(), newLinkWayIn());
+    const req = decodeRequest(held[0].pt)!;
+    // The request as signed, with only its policy changed, built in the
+    // frame's own layout since encodeRequest refuses to write it.
+    const majority = cbor2.encode({
+      type: "EVICT_REQUEST", id: req.id, epoch: req.epoch, target: req.target, targetKey: req.targetKey,
+      verifier: req.verifier, roster: req.roster, policy: "MAJORITY", deadline: req.deadline, sig: req.sig,
+    });
+    await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, majority);
+    expect(b.refusals).toEqual(["malformed"]);
     expect(b.ev.isOpen()).toBe(false);
-    void c;
+    expect(b.prompts).toHaveLength(0);
+    await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, new Uint8Array([1, 2, 3]));
+    expect(b.refusals).toEqual(["malformed", "malformed"]);
+    expect(b.ev.isOpen()).toBe(false);
+    // The same request under unanimity opens the vote.
+    await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, held[0].pt);
+    expect(b.prompts).toHaveLength(1);
   });
 
   it("refuses a commit that fails to parse, from a member, without touching its keyring", async () => {
@@ -617,7 +710,263 @@ describe("EvictCoordinator (amendment K)", () => {
     expect(b.keyring.rootEpoch).toBe(0);
   });
 
-  it("says it was left out when a commit names a later epoch than its own", async () => {
+  it("says it was left out when a commit a member signed names a later epoch than its own", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    hub.dropCommits = true;
+    await a.ev.propose(c.view(), newLinkWayIn());
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    const real = decodeCommit(hub.captured[0].body)!;
+    const h3 = header(FT.EVICT_COMMIT, 3);
+    const later = await encodeCommit(h3, real.clear, { ...real.tail, root: 4 }, a.identity);
+    await b.ev.receiveCommit(h3, 3, a.id, later);
+    expect(b.leftOut).toBe(1);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+});
+
+describe("frames that arrive before their request (fix wave 1, A1)", () => {
+  it("holds a cancel until its request comes: nothing is left open and nobody is asked", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(c.view(), newLinkWayIn());
+    await a.ev.cancel();
+    const [req, cancel] = held;
+    expect(cancel.ft).toBe(FT.EVICT_CANCEL);
+    await b.ev.receiveFrame(cancel.ft, a.id, cancel.pt);
+    await b.ev.receiveFrame(req.ft, a.id, req.pt);
+    expect(b.prompts).toHaveLength(0);
+    expect(b.ev.isOpen()).toBe(false);
+    expect(b.states.at(-1)).toBe("CANCELLED");
+    expect(b.refusals).toEqual([]);
+  });
+
+  it("holds a refusal until its request comes: the vote ends at once and nobody is asked", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    const req = held[0];
+    await c.ev.receiveFrame(req.ft, a.id, req.pt);
+    await c.ev.vote("REJECT");
+    const reject = held[1];
+    expect(decodeVote(reject.pt)!.vote).toBe("REJECT");
+    await b.ev.receiveFrame(reject.ft, c.id, reject.pt);
+    await b.ev.receiveFrame(req.ft, a.id, req.pt);
+    expect(b.prompts).toHaveLength(0);
+    expect(b.ev.isOpen()).toBe(false);
+    expect(b.states.at(-1)).toBe("REJECTED");
+    expect(b.refusals).toEqual([]);
+  });
+
+  it("holds an approval until its request comes, so the member reaches APPROVED and waits 15 seconds", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    const req = held[0];
+    await c.ev.receiveFrame(req.ft, a.id, req.pt);
+    await c.ev.vote("APPROVE");
+    const approval = held[1];
+    await b.ev.receiveFrame(approval.ft, c.id, approval.pt);
+    await b.ev.receiveFrame(req.ft, a.id, req.pt);
+    expect(b.prompts).toHaveLength(1);
+    expect(b.refusals).toEqual([]);
+    await b.ev.vote("APPROVE");
+    expect(b.states.at(-1)).toBe("APPROVED");
+    hub.now += COMMIT_WAIT_MS - 1;
+    await b.ev.tick();
+    expect(b.states.at(-1)).toBe("APPROVED");
+    hub.now += 1;
+    await b.ev.tick();
+    expect(b.states.at(-1)).toBe("FAILED");
+    expect(b.ev.isOpen()).toBe(false);
+  });
+
+  it("verifies a held approval when it replays it, and never counts a forged one", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    const req = held[0];
+    const id = decodeRequest(req.pt)!.id;
+    const forged = encodeVote({ id, vote: "APPROVE", sig: new Uint8Array(64).fill(9) });
+    await b.ev.receiveFrame(FT.EVICT_VOTE, c.id, forged);
+    await b.ev.receiveFrame(req.ft, a.id, req.pt);
+    expect(b.refusals).toEqual(["bad-signature"]);
+    await b.ev.vote("APPROVE");
+    expect(b.states.at(-1)).toBe("VOTING");
+  });
+
+  it("holds a bounded number of frames, lets them go in time, and junk never holds the member busy", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    const junk = (): Uint8Array =>
+      encodeVote({ id: crypto.getRandomValues(new Uint8Array(16)), vote: "APPROVE", sig: crypto.getRandomValues(new Uint8Array(64)) });
+    for (let i = 0; i < 100; i++) await b.ev.receiveFrame(FT.EVICT_VOTE, c.id, junk());
+    for (let i = 0; i < 20; i++) await b.ev.receiveFrame(FT.EVICT_CANCEL, c.id, encodeCancel({ id: crypto.getRandomValues(new Uint8Array(16)) }));
+    expect(b.ev.heldFrames()).toBe(MAX_EARLY_IDS);
+    expect(b.ev.isOpen()).toBe(false);
+    hub.now += EARLY_HOLD_MS;
+    await b.ev.tick();
+    expect(b.ev.heldFrames()).toBe(0);
+
+    // One id: at most one vote per sender, MAX_VOTES votes and one cancel.
+    const id = crypto.getRandomValues(new Uint8Array(16));
+    const vote = encodeVote({ id, vote: "REJECT", sig: null });
+    for (let i = 0; i < MAX_VOTES + 8; i++) await b.ev.receiveFrame(FT.EVICT_VOTE, new Uint8Array(16).fill(0x80 + i), vote);
+    await b.ev.receiveFrame(FT.EVICT_VOTE, new Uint8Array(16).fill(0x80), vote);
+    for (let i = 0; i < 3; i++) await b.ev.receiveFrame(FT.EVICT_CANCEL, c.id, encodeCancel({ id }));
+    expect(b.ev.heldFrames()).toBe(MAX_VOTES + 1);
+    expect(b.refusals).toEqual([]);
+
+    // A real request is not delayed by any of it.
+    hub.sealed = Hub.prototype.sealed;
+    expect(await a.ev.propose(c.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(b.prompts).toHaveLength(1);
+    expect(b.ev.isOpen()).toBe(true);
+  });
+
+  it("lets every held frame go when the epoch moves", async () => {
+    const { peers } = await room(3);
+    const [, b, c] = peers;
+    await b.ev.receiveFrame(FT.EVICT_CANCEL, c.id, encodeCancel({ id: new Uint8Array(16).fill(3) }));
+    expect(b.ev.heldFrames()).toBe(1);
+    const { content, chain } = await rootKeys();
+    expect(await b.keyring.reroot(1, content, chain)).not.toBeNull();
+    await b.ev.tick();
+    expect(b.ev.heldFrames()).toBe(0);
+  });
+});
+
+describe("a member that refused is never made to apply the commit (fix wave 1, A2)", () => {
+  /// A proposes R1 against T. C approves; B refuses or never answers. A then
+  /// sends R2, which replaces R1 in B's machine, and sends a commit for R1
+  /// carrying every vote but B's.
+  async function scenario(how: "reject" | "unanswered", wrapForB: boolean) {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    const w1 = newLinkWayIn();
+    const copy = keep(w1);
+    await a.ev.propose(t.view(), w1, 5_000);
+    const r1 = held[0];
+    for (const p of [b, c]) await p.ev.receiveFrame(r1.ft, a.id, r1.pt);
+    await c.ev.vote("APPROVE");
+    const cVote = decodeVote(held[1].pt)!;
+    await a.ev.receiveFrame(held[1].ft, c.id, held[1].pt);
+    if (how === "reject") {
+      await b.ev.vote("REJECT");
+      await a.ev.receiveFrame(held[2].ft, b.id, held[2].pt);
+      expect(a.states.at(-1)).toBe("REJECTED");
+    } else {
+      hub.now += 5_000;
+      await a.ev.tick();
+      expect(a.states.at(-1)).toBe("EXPIRED");
+    }
+    const before = held.length;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await b.ev.receiveFrame(held[before].ft, a.id, held[before].pt);
+    expect(b.prompts).toHaveLength(2);
+    expect(b.ev.isOpen()).toBe(true);
+
+    const req = decodeRequest(r1.pt)!;
+    const keys = await deriveReRoot(keep(copy));
+    const config = await encryptRoomConfig(keys.contentKey, b.config.ttl, b.config.ceilingOptout, b.config.level);
+    const h = header(FT.EVICT_COMMIT, 0);
+    const wraps = [];
+    for (const p of wrapForB ? [b, c] : [c]) {
+      const key = await wrapKey(a.kx, p.kx.publicKeyRaw, ROOM, 1, a.id, p.id);
+      wraps.push({ p: p.id, ...(await sealWrap(key, h, encodeWayIn(copy))) });
+    }
+    const body = await encodeCommit(
+      h,
+      {
+        requestId: req.id,
+        target: req.target,
+        targetKeyDigest: await keyDigest(req.targetKey!),
+        verifier: req.verifier,
+        salt: copy.salt,
+        config,
+        votes: [
+          { voter: a.id, sig: req.sig },
+          { voter: c.id, sig: cVote.sig! },
+        ],
+      },
+      { root: 1, sender: a.id, confirm: keys.confirm, wraps },
+      a.identity,
+    );
+    await b.ev.receiveCommit(h, 0, a.id, body);
+    return b;
+  }
+
+  for (const how of ["reject", "unanswered"] as const) {
+    for (const wrapForB of [true, false]) {
+      it(`refuses it on policy after a ${how === "reject" ? "refusal" : "vote it never answered"}, ${wrapForB ? "with" : "without"} a wrap for it`, async () => {
+        const b = await scenario(how, wrapForB);
+        expect(b.refusals).toEqual(["commit-policy"]);
+        expect(b.applied).toHaveLength(0);
+        expect(b.leftOut).toBe(0);
+        expect(b.keyring.rootEpoch).toBe(0);
+        expect(b.keyring.current.epoch).toBe(0);
+      });
+    }
+  }
+});
+
+describe("a commit naming a later epoch is checked before it is believed (fix wave 1, A3 and B2)", () => {
+  async function laterCommit() {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    hub.dropCommits = true;
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await c.ev.vote("APPROVE");
+    await hub.flush();
+    const real = decodeCommit(hub.captured[0].body)!;
+    return { a, b, c, t, real, h3: header(FT.EVICT_COMMIT, 3) };
+  }
+
+  it("says nothing about junk, a wrong root, a wrong sender, a non-voter or a signer it does not know", async () => {
+    const { a, b, c, t, real, h3 } = await laterCommit();
+    const stranger = await generateIdentity();
+    const strangerId = new Uint8Array(16).fill(0x5e);
+    const cases: [Uint8Array, Uint8Array][] = [
+      [a.id, new Uint8Array(200).fill(7)],
+      // Signed for epoch 0, delivered under a header that says 3.
+      [a.id, await encodeCommit(header(FT.EVICT_COMMIT, 0), real.clear, { ...real.tail, root: 4 }, a.identity)],
+      [a.id, await encodeCommit(h3, real.clear, { ...real.tail, root: 9 }, a.identity)],
+      [c.id, await encodeCommit(h3, real.clear, { ...real.tail, root: 4 }, a.identity)],
+      [c.id, await encodeCommit(h3, real.clear, { ...real.tail, root: 4 }, c.identity)],
+      [t.id, await encodeCommit(h3, real.clear, { ...real.tail, root: 4, sender: t.id }, t.identity)],
+      [strangerId, await encodeCommit(h3, real.clear, { ...real.tail, root: 4, sender: strangerId }, stranger)],
+    ];
+    for (const [sender, body] of cases) await b.ev.receiveCommit(h3, 3, sender, body);
+    expect(b.leftOut).toBe(0);
+    expect(b.refusals).toHaveLength(cases.length);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+
+  it("reads the epoch from the header, and refuses a separate one that disagrees", async () => {
+    const { a, b, real, h3 } = await laterCommit();
+    const body0 = await encodeCommit(header(FT.EVICT_COMMIT, 0), real.clear, real.tail, a.identity);
+    await b.ev.receiveCommit(header(FT.EVICT_COMMIT, 0), 3, a.id, body0);
+    const body3 = await encodeCommit(h3, real.clear, { ...real.tail, root: 4 }, a.identity);
+    await b.ev.receiveCommit(h3, 0, a.id, body3);
+    expect(b.leftOut).toBe(0);
+    expect(b.applied).toHaveLength(0);
+    expect(b.refusals).toEqual(["malformed-commit", "malformed-commit"]);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+});
+
+describe("fix wave 1, the Minors", () => {
+  it("the named target that sees the commit says it was removed (B1)", async () => {
     const { hub, peers } = await room(3);
     const [a, b, c] = peers;
     hub.dropCommits = true;
@@ -626,8 +975,190 @@ describe("EvictCoordinator (amendment K)", () => {
     await b.ev.vote("APPROVE");
     await hub.flush();
     const { h, body } = hub.captured[0];
-    await b.ev.receiveCommit(h, 3, a.id, body);
-    expect(b.leftOut).toBe(1);
+    await c.ev.receiveCommit(h, 0, a.id, body);
+    expect(c.removedCount).toBe(1);
+    expect(c.applied).toHaveLength(0);
+    expect(c.keyring.rootEpoch).toBe(0);
+    // A commit it cannot verify says nothing of the kind.
+    const flipped = body.slice();
+    flipped[body.length - 3] ^= 1;
+    await c.ev.receiveCommit(h, 0, a.id, flipped);
+    expect(c.removedCount).toBe(1);
+  });
+
+  it("ignores a vote or a cancel for a vote that is already done (B5)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await c.ev.vote("APPROVE");
+    await hub.flush();
+    expect(b.states.at(-1)).toBe("DONE");
+    const cVote = hub.sent.find((x) => x.from === c && x.ft === FT.EVICT_VOTE)!;
+    const req = decodeRequest(hub.sent[0].pt)!;
+    await b.ev.receiveFrame(cVote.ft, c.id, cVote.pt);
+    await b.ev.receiveFrame(FT.EVICT_CANCEL, a.id, encodeCancel({ id: req.id }));
+    expect(b.refusals).toEqual([]);
+    // Nor held as if their request were still to come.
+    expect(b.ev.heldFrames()).toBe(0);
+    expect(b.states.at(-1)).toBe("DONE");
+  });
+
+  it("does not send a request when the roster changed while it was being made (B6)", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, d] = peers;
+    hub.peers = hub.peers.filter((p) => p !== d);
+    const cfg = a.config;
+    Object.defineProperty(a, "config", {
+      get: () => {
+        if (!hub.peers.includes(d)) hub.peers.push(d);
+        return cfg;
+      },
+    });
+    const way = newLinkWayIn();
+    expect(await a.ev.propose(c.view(), way)).toBe("roster-changed");
+    await hub.flush();
+    expect(way.secret.every((x) => x === 0)).toBe(true);
+    expect(a.ev.isOpen()).toBe(false);
+    expect(hub.sent).toHaveLength(0);
+    expect(b.prompts).toHaveLength(0);
+  });
+
+  it("does not send a request when this member reconnected or the epoch moved while it was being made", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , c] = peers;
+    const cfg = a.config;
+    let side: () => void = () => undefined;
+    Object.defineProperty(a, "config", {
+      get: () => {
+        side();
+        side = () => undefined;
+        return cfg;
+      },
+    });
+    const w1 = newLinkWayIn();
+    const id = a.id;
+    side = () => {
+      a.id = new Uint8Array(16).fill(0xab);
+    };
+    expect(await a.ev.propose(c.view(), w1)).toBe("failed");
+    expect(w1.secret.every((x) => x === 0)).toBe(true);
+    a.id = id;
+    const { content, chain } = await rootKeys();
+    side = () => void a.keyring.reroot(1, content, chain);
+    const w2 = newLinkWayIn();
+    expect(await a.ev.propose(c.view(), w2)).toBe("busy");
+    expect(a.keyring.current.epoch).toBe(1);
+    expect(w2.secret.every((x) => x === 0)).toBe(true);
+    expect(hub.sent).toHaveLength(0);
+    expect(a.ev.isOpen()).toBe(false);
+  });
+
+  it("a page callback that throws never wipes the way in of a live vote (B7)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    a.stateThrows = true;
+    const way = newLinkWayIn();
+    expect(await a.ev.propose(c.view(), way)).toBeNull();
+    expect(way.secret.every((x) => x === 0)).toBe(false);
+    expect(a.ev.isOpen()).toBe(true);
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    expect(a.keyring.rootEpoch).toBe(1);
+    expect(b.keyring.rootEpoch).toBe(1);
+  });
+
+  it("does not wrap for a member whose roster key is no longer the one it voted with (B8)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    hub.dropCommits = true;
+    await a.ev.propose(c.view(), newLinkWayIn());
+    await hub.flush();
+    const other = (await generateIdentity()).publicKeyRaw;
+    const view = b.view.bind(b);
+    b.view = () => ({ ...view(), pubkey: other });
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.captured).toHaveLength(1);
+    expect(decodeCommit(hub.captured[0].body)!.tail.wraps).toHaveLength(0);
+  });
+});
+
+describe("checks that a test pins (fix wave 1, B9)", () => {
+  async function approved(n: 3 | 4) {
+    const { hub, peers } = await room(n);
+    const t = peers[n - 1];
+    hub.dropCommits = true;
+    await peers[0].ev.propose(t.view(), newLinkWayIn());
+    await hub.flush();
+    for (const p of peers.slice(1, n - 1)) await p.ev.vote("APPROVE");
+    await hub.flush();
+    const { h, body } = hub.captured[0];
+    return { hub, peers, t, h, body, real: decodeCommit(body)! };
+  }
+
+  it("refuses a commit sent by someone who did not vote, the target here", async () => {
+    const { peers, t, h, real } = await approved(3);
+    const b = peers[1];
+    const forged = await encodeCommit(h, real.clear, { ...real.tail, sender: t.id }, t.identity);
+    await b.ev.receiveCommit(h, 0, t.id, forged);
+    expect(b.refusals).toEqual(["commit-policy"]);
+    expect(b.leftOut).toBe(0);
+    expect(b.removedCount).toBe(0);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+
+  it("refuses a commit whose tail names a sender other than the one it came from", async () => {
+    const { peers, h, real } = await approved(4);
+    const [, b, c] = peers;
+    // c voted and signs it, but the tail still says the proposer sent it.
+    const forged = await encodeCommit(h, real.clear, real.tail, c.identity);
+    await b.ev.receiveCommit(h, 0, c.id, forged);
+    expect(b.refusals).toEqual(["malformed-commit"]);
+    expect(b.leftOut).toBe(0);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+
+  it("refuses a commit whose config changes the room's expiry", async () => {
+    const { peers, h, body } = await approved(3);
+    const b = peers[1];
+    b.config = { ...b.config, ttl: { ...b.config.ttl, secs: b.config.ttl.secs + 1 } };
+    await b.ev.receiveCommit(h, 0, peers[0].id, body);
+    expect(b.refusals).toEqual(["commit-config"]);
+    expect(b.keyring.rootEpoch).toBe(0);
+  });
+
+  it("tells a member that arrived during the vote, and never saw the request, that it was left out", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, t, d] = peers;
+    hub.peers = hub.peers.filter((p) => p !== d);
+    await a.ev.propose(t.view(), newLinkWayIn());
+    await hub.flush();
+    hub.peers.push(d);
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    expect(b.keyring.rootEpoch).toBe(1);
+    expect(d.leftOut).toBe(1);
+    expect(d.refusals).toEqual([]);
+    expect(d.keyring.rootEpoch).toBe(0);
+  });
+
+  it("applies nothing when this member reconnected while it checked the commit", async () => {
+    const { peers, h, body } = await approved(3);
+    const [a, b] = peers;
+    const cfg = b.config;
+    Object.defineProperty(b, "config", {
+      get: () => {
+        b.id = new Uint8Array(16).fill(0xba);
+        return cfg;
+      },
+    });
+    await b.ev.receiveCommit(h, 0, a.id, body);
+    expect(b.applied).toHaveLength(0);
     expect(b.keyring.rootEpoch).toBe(0);
   });
 });
