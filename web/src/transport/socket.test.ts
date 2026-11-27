@@ -10,7 +10,7 @@ import { PART_MARKER, RunaSocket, readPart, splitIntoParts, toB64, type SocketEv
 
 /// Stands in for the browser's WebSocket. `dead` models a connection that has
 /// died without the browser noticing: it stays OPEN, sends vanish, and nothing
-/// arrives — which is what a laptop waking or a phone changing networks does.
+/// arrives, which is what a laptop waking or a phone changing networks does.
 class FakeWebSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
@@ -464,7 +464,7 @@ describe("the log index of every entry", () => {
     await waitFor(() => applied.length === 1);
     expect([...taken].sort((a, b) => a - b)).toEqual(parts.map((_, i) => 10 + i));
 
-    // A part sent again after the update was whole — its first ack was lost —
+    // A part sent again after the update was whole (its first ack was lost)
     // is taken at once rather than starting an assembly that never ends.
     rws.deliver(relayIndexed(parts[0], 50));
     await waitFor(() => taken.includes(50));

@@ -90,7 +90,7 @@ export interface SocketEvents {
   /// An EVICT_COMMIT, unopened: the evict coordinator checks and applies it.
   onEvictCommit?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
   onDisconnected(): void;
-  /// This many of our document frames are now in the room log — or, against
+  /// This many of our document frames are now in the room log, or, against
   /// a server without acks, have been sent. The snapshot index is estimated
   /// from it.
   onUpdatesStored?(count: number): void;
@@ -165,12 +165,12 @@ const ACK_TIMEOUT_MS = 10_000;
 
 /// How often a connection is pinged. Acks only cover a connection something
 /// is being sent on, so one that died while nobody typed was noticed at the
-/// next keystroke — and until then the page said it was connected while
+/// next keystroke, and until then the page said it was connected while
 /// everyone else's edits went nowhere.
 const HEARTBEAT_MS = 15_000;
 
 /// Split updates this client has finished assembling, remembered so that a
-/// part arriving again afterwards — a resend of one whose ack was lost — is
+/// part arriving again afterwards (a resend of one whose ack was lost) is
 /// recognised instead of starting an assembly that can never complete.
 const COMPLETED_PARTS_REMEMBERED = 256;
 
@@ -181,7 +181,7 @@ const COMPACT_WHILE_OFFLINE_AT = 256;
 const REASSEMBLY_MAX_BYTES = 64 * 1024 * 1024;
 const REASSEMBLY_MAX_GROUPS = 32;
 /// A message whose parts stop arriving is abandoned after this long. Parts
-/// can be orphaned legitimately — a sender whose connection died mid-message,
+/// can be orphaned legitimately: a sender whose connection died mid-message,
 /// or a snapshot that compacted away the first parts of one already applied.
 const REASSEMBLY_STALE_MS = 120_000;
 
@@ -493,7 +493,7 @@ export class RunaSocket {
     if (this.closedByUs || this.reconnectTimer) return;
     const jitterBytes = new Uint32Array(1);
     crypto.getRandomValues(jitterBytes);
-    // `% 0` is NaN, and setTimeout(NaN) fires immediately — a hot reconnect
+    // `% 0` is NaN, and setTimeout(NaN) fires immediately: a hot reconnect
     // loop for any backoff under ~4 ms.
     const spread = Math.max(1, Math.floor(this.backoffMs * 0.3));
     const jitter = jitterBytes[0] % spread;
@@ -608,7 +608,7 @@ export class RunaSocket {
     this.inflight = [];
   }
 
-  /// Stop retrying without tearing down keys — used when the server says the
+  /// Stop retrying without tearing down keys, used when the server says the
   /// room is gone, where reconnecting can only ever fail again.
   stopReconnecting(): void {
     this.closedByUs = true;
@@ -643,7 +643,7 @@ export class RunaSocket {
   /// Best-effort by nature: the cipher object keeps its own reference, and
   /// nulling that would leave every send path dereferencing null. What
   /// actually ends the key's life is the navigation to the tombstone that
-  /// follows immediately — the keys are non-extractable `CryptoKey` handles,
+  /// follows immediately: the keys are non-extractable `CryptoKey` handles,
   /// so they cannot leave the tab in the first place, and tearing down the
   /// realm takes them with it.
   dropKeys(): void {
@@ -811,7 +811,7 @@ export class RunaSocket {
         this.abandonConnection();
         return;
       }
-      // 4001 covers "wrong key" and "no such room" — both are terminal. Left
+      // 4001 covers "wrong key" and "no such room": both are terminal. Left
       // to reconnect, a purged room turned every open tab into a client that
       // hammered the server every 15 seconds indefinitely.
       if (code === 4001 || code === 4010 || code === 4011 || code === 4014) {
@@ -1111,7 +1111,7 @@ export class RunaSocket {
 
   /// Nothing encrypted may leave before JOIN_ACK. Until then the cipher is
   /// labelled with this client's public key instead of the peer id receivers
-  /// will check it against, so every receiver rejects the frame — while the
+  /// will check it against, so every receiver rejects the frame, while the
   /// server, which cannot tell, stores a document update in the log for good
   /// and would compact history under a snapshot nobody can read.
   private canSendDocuments(): boolean {
@@ -1119,7 +1119,7 @@ export class RunaSocket {
   }
 
   /// Queue an update for the room. It is sent once the connection is joined,
-  /// and kept — across reconnects — until the server says it stored it.
+  /// and kept, across reconnects, until the server says it stored it.
   async sendUpdate(plaintext: Uint8Array): Promise<void> {
     if (this.closedByUs) return;
     this.outbox.push({ wrapped: plaintext, parts: null, acked: 0, sent: 0, refused: false });

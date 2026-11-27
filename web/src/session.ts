@@ -31,7 +31,7 @@ import { bytesEqual } from "./evict/statement";
 const DIVERGENCE_QUIET_MS = 5_000;
 
 /// How long a repair is given to work before the disagreement is called real.
-/// Long enough for the server's replay to arrive and apply — the presence
+/// Long enough for the server's replay to arrive and apply: the presence
 /// heartbeat that re-evaluates this runs every ten seconds.
 const DIVERGENCE_REPAIR_SETTLE_MS = 15_000;
 
@@ -41,9 +41,9 @@ export type DivergenceAction = "none" | "repair" | "warn" | "clear";
 ///
 /// The warning used to be the whole response: it appeared and sat there, and
 /// the only thing that actually fixed a stale copy was reloading the page.
-/// But the relay can already repair this — `tail_from(0)` returns the snapshot
+/// But the relay can already repair this: `tail_from(0)` returns the snapshot
 /// and the entire tail, and applying it twice is harmless because Yjs is
-/// idempotent — so the first response to a disagreement should be to fix it,
+/// idempotent, so the first response to a disagreement should be to fix it,
 /// and the warning should be what happens when fixing it did not work.
 ///
 /// Pulled out of the heartbeat so the policy can be tested without a socket, a
@@ -69,7 +69,7 @@ export function divergenceAction(input: {
 /// Has the server shortened an absolute TTL behind the encrypted config?
 ///
 /// `reported.secs` is the time *remaining*, which for a 24-hour room is
-/// necessarily less than the 86 400 the config blob records — so comparing the
+/// necessarily less than the 86 400 the config blob records, so comparing the
 /// two directly reported every such room as tampered with, seconds after it
 /// was made. A warning that is always on is worse than none: it teaches people
 /// to dismiss the one banner that should stop them.
@@ -77,8 +77,8 @@ export function divergenceAction(input: {
 /// The total the server is claiming is `remaining + elapsed`, and elapsed
 /// comes from the server rather than the local clock so that a disagreement
 /// between the two cannot look like tampering. A room may legitimately be
-/// *extended* — effective_ttl_secs is the configured value plus any
-/// extensions — so only a claim shorter than the configured duration is a
+/// *extended*: effective_ttl_secs is the configured value plus any
+/// extensions, so only a claim shorter than the configured duration is a
 /// contradiction.
 ///
 /// Without `elapsedSecs` the shortening cannot be checked at all, and this
@@ -104,8 +104,8 @@ export function absoluteTtlShortened(
 /// connection, so every reconnect left the previous connection's id behind for
 /// good: switching tabs twice left four entries where two people were.
 ///
-/// The roster is not decoration. It is the consensus denominator — a shred
-/// then asked three of four to approve with two people present — and its hash
+/// The roster is not decoration. It is the consensus denominator: a shred
+/// then asked three of four to approve with two people present, and its hash
 /// travels inside a shred request, so an inflated roster hashed differently
 /// from everybody else's and every receiver rejected the request as
 /// `roster-mismatch` and never showed the prompt. Reloading the page appeared
@@ -197,7 +197,7 @@ export function keyStatusReporter(
 ///
 /// Against a server that sends indexes this is exactly what the copy holds.
 /// Without them it can only be this client's own stored updates on top of its
-/// last snapshot — an undercount that falls further behind the more other
+/// last snapshot, an undercount that falls further behind the more other
 /// people type, and that the server refuses outright once it is below a
 /// snapshot someone else made, since a snapshot may never move backwards. A
 /// room whose oldest member mostly read therefore never compacted, and a long
@@ -332,7 +332,7 @@ export interface SessionConfig {
 }
 
 /// How long to keep presenting a ticket the server has not yet been able to
-/// take — a new process still starting, say. The server stops honouring one
+/// take, a new process still starting, say. The server stops honouring one
 /// after ten minutes anyway.
 const TICKET_PATIENCE_MS = 9 * 60_000;
 
@@ -466,8 +466,8 @@ export class Session {
       away.delete(id);
       // Say hello immediately. Presence is broadcast on the ten-second
       // heartbeat and on cursor movement, so without this a newcomer who
-      // joins and sits still is invisible to everyone — and everyone is
-      // invisible to them — for up to ten seconds. Measured at 10-12s
+      // joins and sits still is invisible to everyone, and everyone is
+      // invisible to them, for up to ten seconds. Measured at 10-12s
       // before this line existed.
       void sessionRef?.announcePresence();
       events.onPeersChanged(roster.size);
@@ -604,7 +604,7 @@ export class Session {
     const machine = new ShredMachine(identity, "", () => [...roster.values()], {
       // Record only. Wiping here would tear down the socket inside
       // castMyVote(), before respondToShred() has had a chance to transmit
-      // the very ballot that produced the approval — so the last peer to
+      // the very ballot that produced the approval, so the last peer to
       // approve would destroy its own copy while everyone else sat one vote
       // short. The session flushes this once the wire is clear.
       onApproved: (requestId) => sessionRef?.markPurgeApproved(requestId),
@@ -614,8 +614,8 @@ export class Session {
         events.onShredState(waiting.length ? "STALLED" : "VOTING", waiting[0]),
       // Refusing to take part in a shred vote was discarded entirely: an empty
       // function, no log, no message. When a drifted roster made every peer
-      // reject a request, the initiator sat in VOTING forever and nobody —
-      // initiator or receiver — was told anything at all. A guard that fires
+      // reject a request, the initiator sat in VOTING forever and nobody,
+      // initiator or receiver, was told anything at all. A guard that fires
       // in silence cannot be diagnosed from the outside, which is exactly what
       // happened.
       onVoteRejectedByGuard: (reason) => {
@@ -737,8 +737,8 @@ export class Session {
     this.events.onConnectionRefused(null);
     this.indexed = ack.indexed === true;
     // A new log under the same room id is a room brought back after a
-    // restart (amendment I). It holds nothing yet — the server never had
-    // anything it could read — so this copy is the room now, as much as
+    // restart (amendment I). It holds nothing yet (the server never had
+    // anything it could read), so this copy is the room now, as much as
     // anyone's is: send all of it. Yjs merges it with everyone else's and
     // drops what repeats. Before any await, so it replaces the backlog before
     // the socket starts sending it.
@@ -768,7 +768,7 @@ export class Session {
     // is present.
     //
     // Merging is what shipped, and every reconnect therefore left the previous
-    // session's peer ids behind for good — a peer id is minted per connection,
+    // session's peer ids behind for good: a peer id is minted per connection,
     // so switching tabs twice left four entries where two people were. That
     // was not merely a wrong occupant count. The roster is the consensus
     // denominator, so a shred asked three of four to approve when two people
@@ -1165,7 +1165,7 @@ export class Session {
   private wiped = false;
 
   /// Absolute TTL anchors at join against the AEAD-protected config value
-  /// when present. Idle TTL is an activity-driven window — any local edit,
+  /// when present. Idle TTL is an activity-driven window: any local edit,
   /// remote update or peer change refreshes it, so a tab never
   /// self-destructs mid-session while the server still considers the room
   /// alive.
@@ -1227,7 +1227,7 @@ export class Session {
 
   /// `remainingSecs` is what the server says is left, not what we asked for.
   /// The server clamps extensions at a ceiling, so adding our own request to
-  /// the local clock would drift past the real deadline — and the extender
+  /// the local clock would drift past the real deadline, and the extender
   /// used to count its own request twice, once locally and once from the
   /// broadcast it also receives.
   handleTtlExtended(remainingSecs: number, addSecs: number, addedBy: string): void {
@@ -1342,7 +1342,7 @@ export class Session {
     this.steadyTimer = setInterval(() => {
       // Cover traffic goes out as AWARENESS, not DOC_UPDATE. The server
       // appends every DOC_UPDATE to the room log and cannot tell padded cover
-      // frames from padded real edits — that is the point of the padding — so
+      // frames from padded real edits (that is the point of the padding), so
       // sending it as an update quietly ate the room's log budget until real
       // edits started being refused. AWARENESS is relayed and never stored.
       void this.socket.sendAwareness(wrapWithLengthAndPad(new Uint8Array(0)));
@@ -1351,7 +1351,7 @@ export class Session {
 
   /// When each roster entry was first seen by this client. Presence is
   /// broadcast on a heartbeat, so a peer who has just arrived and not yet
-  /// spoken is genuinely absent from the awareness map — measured at 10-12
+  /// spoken is genuinely absent from the awareness map: measured at 10-12
   /// seconds before a peer became visible by liveness alone. Counting them
   /// during that window is what stops a correct arrival looking like a
   /// disconnection.
@@ -1389,7 +1389,7 @@ export class Session {
   /// The previous version compared the local hash *at this instant* against
   /// hashes peers had broadcast up to a heartbeat earlier, on every single
   /// remote update. Two people typing are never at the same state at the same
-  /// moment, so that fires constantly during ordinary editing — and because
+  /// moment, so that fires constantly during ordinary editing, and because
   /// the banner latched and never cleared, one transient mismatch left it up
   /// for the rest of the session. Measured: two clients whose documents were
   /// byte-identical both showed the warning.
@@ -1436,9 +1436,9 @@ export class Session {
   /// Ask the relay for everything again, on request.
   ///
   /// Returns nothing useful on purpose. The server allows one replay per
-  /// connection at a time and drops the rest without a reply — correct, since
-  /// otherwise a peer could make it clone the whole log at the frame rate —
-  /// so a request that arrives during another replay simply does not happen,
+  /// connection at a time and drops the rest without a reply. That is correct,
+  /// since otherwise a peer could make it clone the whole log at the frame
+  /// rate. So a request that arrives during another replay simply does not happen,
   /// and there is no way from here to tell which occurred. The caller must say
   /// it asked, not that it worked.
   resyncNow(): void {
@@ -1527,7 +1527,7 @@ export class Session {
 
     this.startSnapshotLoop();
     // Every cursor movement used to mean an AEAD encrypt plus a websocket
-    // frame — and typing moves the cursor on every keystroke, so the editor
+    // frame, and typing moves the cursor on every keystroke, so the editor
     // was doing crypto per character. Coalesce to at most one frame per
     // 120 ms; presence does not need to be sharper than that.
     let cursorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1576,7 +1576,7 @@ export class Session {
   }
 
   /// One presence broadcast, used on arrival and whenever somebody else
-  /// arrives. Cheap — it is the same frame the heartbeat sends — and it is
+  /// arrives. Cheap (it is the same frame the heartbeat sends), and it is
   /// what makes a liveness-derived count appear in about a second instead of
   /// on the next ten-second beat.
   async announcePresence(): Promise<void> {
@@ -1590,7 +1590,7 @@ export class Session {
   /// The roster size. This is the consensus denominator and must stay that
   /// way: a THRESHOLD request carries its bar inside the signed payload, and
   /// every receiver re-derives `supermajorityFor(ownRoster.length)` and
-  /// rejects anything lower — so a proposal computed from a smaller number
+  /// rejects anything lower, so a proposal computed from a smaller number
   /// would be refused by everyone it was sent to.
   get peerCount(): number {
     return this.internals.roster.size;
@@ -1600,7 +1600,7 @@ export class Session {
   ///
   /// The roster is a snapshot taken when this client joined, patched with the
   /// PEER_JOIN and PEER_LEAVE events it happened to receive afterwards. Miss
-  /// one — during a disconnect, say — and it over-counts for the rest of the
+  /// one, during a disconnect, say, and it over-counts for the rest of the
   /// session with nothing to correct it. Four devices in one room reported 5,
   /// 3, 3 and 3 people at the same moment, all from the same server.
   ///
@@ -1608,7 +1608,7 @@ export class Session {
   /// live presence is self-healing and every client converges on the same
   /// number because they are all watching the same traffic. A device that
   /// reconnects stops broadcasting under its old identity and drops out
-  /// without anything having to recognise that it is the same device — which
+  /// without anything having to recognise that it is the same device, which
   /// is how this avoids introducing a linkable cross-session identifier into a
   /// tool that deliberately stores nothing.
   ///

@@ -38,13 +38,13 @@ function waitForProcessExit(proc) {
   return new Promise((resolve) => proc.once("exit", resolve));
 }
 
-/// Open a page of the app — the front page or a room — recovering from a
+/// Open a page of the app, the front page or a room, recovering from a
 /// Playwright bug that strands Firefox navigations.
 ///
 /// On the Linux runner Firefox timed out opening a room page on four runs, at
 /// three different pages, and waiting only for commit instead of
 /// DOMContentLoaded changed nothing. When the stalled page could be asked, it
-/// had loaded perfectly — the room rendered, nothing in flight — while
+/// had loaded perfectly, the room rendered, nothing in flight, while
 /// Playwright still reported about:blank.
 ///
 /// That is microsoft/playwright#42183. In Firefox a small share of navigations
@@ -60,11 +60,11 @@ function waitForProcessExit(proc) {
 /// app takes the key out of the address bar as it starts (keyhandoff.ts): a
 /// room page that loaded correctly is at `/r/<id>`, never `/r/<id>#k=…`. Anything else keeps the original navigation
 /// and its verdict. Every recovery is written to the log, and the room still
-/// has to come up — each caller waits for the editor next.
+/// has to come up, each caller waits for the editor next.
 ///
 /// The front page goes through here too. Two Firefox runs on 2026-10-07 timed
 /// out on its very first load, waiting for DOMContentLoaded, with the server
-/// up — the same stranding, at a load that had no recovery.
+/// up, the same stranding, at a load that had no recovery.
 ///
 /// Request listeners were taken off these pages once the diagnosis was done:
 /// listeners attached before navigating are one of the conditions the upstream
@@ -299,7 +299,7 @@ async function main() {
         opened.push(ws);
         // Severed: refuse the connection. Closing while still CONNECTING means
         // onopen can never fire, so nothing reaches the server, and the client
-        // gets the close event after it has attached its handlers — the same
+        // gets the close event after it has attached its handlers, the same
         // thing it sees when the network is really gone.
         // Two more ways a network fails, for the tests that need them. A
         // connection that has died without the browser noticing stays OPEN:
@@ -348,14 +348,14 @@ async function main() {
   ///
   /// `context.setOffline` is not that. Running the suite on three engines was
   /// what showed how far apart they are: all three refuse new *HTTP* requests
-  /// while offline, but only Chromium tears down an established WebSocket —
+  /// while offline, but only Chromium tears down an established WebSocket,
   /// Gecko leaves it up, and WebKit will happily open a brand new one while
   /// `navigator.onLine` is false. The offline peer there reconnected inside
   /// the same tick, stayed in sync, and the split-brain test then failed its
   /// own precondition rather than passing on a setup that never happened.
   ///
   /// So do neither engine's version of offline. From inside the page, close
-  /// the socket that is up and refuse every new one until restored — the
+  /// the socket that is up and refuse every new one until restored, the
   /// patched constructor in makePage does the refusing. The client sees a
   /// close it did not ask for and retries on its backoff, which is what a lost
   /// network actually looks like.
@@ -363,7 +363,7 @@ async function main() {
   /// Not `page.routeWebSocket`, which was the first version of this. It relays
   /// every frame of every routed socket through the Playwright driver, so the
   /// sync tests were measuring traffic that took a detour through the test
-  /// harness rather than the connection they claim to test — and on the Linux
+  /// harness rather than the connection they claim to test, and on the Linux
   /// runner Firefox then hung loading the second peer while the first one's
   /// frames were being relayed. Cause not proven; the detour is wrong anyway.
   async function severNetwork(page) {
@@ -392,7 +392,7 @@ async function main() {
   // Scope, honestly: this catches fixed widths, wide tables and unbreakable
   // strings. It does NOT catch the bug that prompted it. On iOS Safari a
   // <select> grows to fit its longest <option> and drags the page sideways;
-  // Chromium clamps it — headless and under device emulation alike — so the
+  // Chromium clamps it, headless and under device emulation alike, so the
   // failure is unreproducible here. Measured: the same page that scrolled
   // 214px sideways on a real iPhone reports zero overflow in this engine.
   //
@@ -1130,7 +1130,7 @@ async function main() {
   // Vertical companion to the check above, and a different failure entirely:
   // content stranded ABOVE the scroll origin, which no scrolling can reach
   // because scrollTop stops at 0. .landing centres itself with
-  // justify-content:center inside #root, which is `height: 100%` — so once
+  // justify-content:center inside #root, which is `height: 100%`, so once
   // the named-room form expands past the viewport, .landing is a flex item
   // with negative free space, gets shrunk, and min-height:100dvh clamps it at
   // exactly one viewport while its content is taller. Centring then splits
@@ -1139,7 +1139,7 @@ async function main() {
   //
   // Unlike the sideways guard above, this one DOES reproduce in Chromium:
   // verified by reverting the fix, which puts .masthead at -90px at 375x812.
-  // This check is load-bearing, not decorative — it is checked in the
+  // This check is load-bearing, not decorative: it is checked in the
   // expanded state on purpose, because the default state never overflows and
   // measuring only that is what let the bug through.
   for (const [width, height] of [[320, 568], [375, 667], [375, 812], [414, 896]]) {
@@ -1310,7 +1310,7 @@ async function main() {
   // A 24-hour room must not accuse its own server of tampering. For an
   // absolute TTL the server reports the time *remaining*, which is necessarily
   // less than the duration the config blob records, and the client compared
-  // the two directly — so every such room raised the mismatch banner within a
+  // the two directly, so every such room raised the mismatch banner within a
   // minute of being created. A security warning that is always on is worse
   // than none.
   //
@@ -1327,7 +1327,7 @@ async function main() {
     await ttlPage.waitForSelector(".statusbar", { timeout: 30_000 });
 
     // The comparison runs once, on JOIN_ACK. Joining the instant the room is
-    // made leaves elapsed at zero, where even the broken comparison is quiet —
+    // made leaves elapsed at zero, where even the broken comparison is quiet,
     // which is why a version of this check that only created and looked passed
     // against the unfixed client. The fault appears on a *later* join, which
     // is exactly how it was reported: a long session, a reconnect, then the
@@ -1389,7 +1389,7 @@ async function main() {
   // The convergence check above compares the *rendered preview*, which
   // normalises whitespace: two sources whose blank lines sit in different
   // places render to identical text. A real divergence report showed exactly
-  // that shape — the same words, differently placed — so the preview could
+  // that shape, the same words, differently placed, so the preview could
   // never have caught it. Compare the editor's own lines instead.
   /// Put the caret in a page's editor, and make sure it got there.
   ///
@@ -1450,7 +1450,7 @@ async function main() {
 
   // And the divergence warning must not be crying wolf. It compared the local
   // hash at that instant against hashes peers had broadcast up to a heartbeat
-  // earlier, on every update, and latched forever on the first mismatch — so
+  // earlier, on every update, and latched forever on the first mismatch, so
   // two byte-identical documents both showed it. Waited past the quiet window
   // and a heartbeat so a false positive has every chance to appear.
   await alice.waitForTimeout(13_000);
@@ -1465,8 +1465,8 @@ async function main() {
 
   // Split brain: a peer edits while disconnected, the other edits meanwhile,
   // and both must reconverge on reconnect. This is the highest-risk path in
-  // the whole design — it exercises the resync request, the server's log
-  // replay and Yjs's merge at once — and it is the shape a real report will
+  // the whole design, it exercises the resync request, the server's log
+  // replay and Yjs's merge at once, and it is the shape a real report will
   // most often have, since a phone that locks or a laptop that sleeps looks
   // exactly like this.
   await severNetwork(bob);
@@ -1479,7 +1479,7 @@ async function main() {
   const splitA = await editorText(alice);
   const splitB = await editorText(bob);
   if (splitA === splitB) {
-    throw new Error("[sync] peers did not actually diverge while one was offline — the test proves nothing");
+    throw new Error("[sync] peers did not actually diverge while one was offline: the test proves nothing");
   }
   await restoreNetwork(bob);
   let reA = "";
@@ -1513,8 +1513,8 @@ async function main() {
 
   // A connection that dies without the browser noticing. This is the common
   // case, not the exotic one: a laptop waking, a phone moving between wifi and
-  // mobile data. The socket stays OPEN for as long as TCP takes to give up —
-  // minutes — and every edit sent into it in that time vanished, with nothing
+  // mobile data. The socket stays OPEN for as long as TCP takes to give up,
+  // minutes, and every edit sent into it in that time vanished, with nothing
   // to notice and nothing to send it again. The split-brain test above cannot
   // catch that, because closing the socket is exactly what does not happen.
   await bob.evaluate(() => {
@@ -1523,7 +1523,7 @@ async function main() {
   await bob.click(".monaco-editor .view-lines");
   await bob.keyboard.type("\ntyped-into-a-dead-connection\n", { delay: 8 });
   if (await aliceSees("typed-into-a-dead-connection", 3)) {
-    throw new Error("[sync] the connection was not actually dead — the test proves nothing");
+    throw new Error("[sync] the connection was not actually dead: the test proves nothing");
   }
   if (!(await aliceSees("typed-into-a-dead-connection", 45))) {
     throw new Error("[sync] an edit typed into a silently dead connection never reached the other peer");
@@ -1564,7 +1564,7 @@ async function main() {
   // The edit is flushed within 80 ms of the last keystroke, so the join has to
   // land well after that for the edit to have gone out before it.
   if (joinLandedAt === null || joinLandedAt < typedAt + 300) {
-    throw new Error("[sync] the join landed before the typing was sent — the test proves nothing");
+    throw new Error("[sync] the join landed before the typing was sent: the test proves nothing");
   }
   if (!(await aliceSees("typed-before-the-join-landed", 30))) {
     throw new Error("[sync] an edit typed before the join was confirmed never reached the other peer");
@@ -1573,7 +1573,7 @@ async function main() {
   // The status bar counts who is actually here, not who the roster still
   // lists. A roster is a join-time snapshot patched with the events a client
   // happened to receive, so a missed PEER_LEAVE over-counts for the rest of
-  // the session — four devices in one room reported 5, 3, 3 and 3 people at
+  // the session, four devices in one room reported 5, 3, 3 and 3 people at
   // the same moment. Presence expires on its own, so the count has to come
   // back down by itself with no event to prompt it, and come back up when the
   // peer returns. Asserted as a round trip because a count that only ever
@@ -1617,7 +1617,7 @@ async function main() {
 
   // Maths must render as maths, not as flattened text. $E = mc^2$ came out
   // reading "E=mc2" on a real screen while the unit test asserting /katex/i
-  // passed the whole time — the wrapper class survives sanitising whether or
+  // passed the whole time, the wrapper class survives sanitising whether or
   // not anything inside it renders. Structure alone is still not proof, so
   // this measures the rendered geometry: an exponent has to sit higher than
   // its base and be drawn smaller. That is the property that was broken, and
@@ -1639,7 +1639,7 @@ async function main() {
   if (!mathBox) throw new Error("[alice] display math never produced MathML in the preview");
   if (!(mathBox.expTop < mathBox.baseTop)) {
     throw new Error(
-      `[alice] exponent is not raised above its base (exp top ${Math.round(mathBox.expTop)} vs base ${Math.round(mathBox.baseTop)}) — math is rendering flat`,
+      `[alice] exponent is not raised above its base (exp top ${Math.round(mathBox.expTop)} vs base ${Math.round(mathBox.baseTop)}): math is rendering flat`,
     );
   }
   if (!(mathBox.expH < mathBox.baseH)) {
@@ -1679,7 +1679,7 @@ async function main() {
   // Collapsing the shared borders by deleting each tab's right border left
   // Split and Editor outlined on three sides with a gap on the fourth, while
   // Preview looked correct because it is :last-child and kept its own right
-  // border — so eyeballing the control in its default state showed nothing
+  // border, so eyeballing the control in its default state showed nothing
   // wrong. Measured rather than looked at, in all three positions.
   for (const mode of ["Split", "Editor", "Preview"]) {
     await alice.click(`.mode-tab:has-text("${mode}")`);
@@ -1746,14 +1746,14 @@ async function main() {
   }
 
   // The dialog is a confirmation step, not a progress display. Everything
-  // gated on the IDLE state — the consensus policy selector above all — has
+  // gated on the IDLE state, the consensus policy selector above all, has
   // to be on screen when it opens. It previously was not: pressing Shred
   // proposed immediately, so the state was already VOTING by first paint and
   // the selector never rendered. The policy was silently always UNANIMOUS.
   const policySelect = await alice.$('[role="alertdialog"] #shred-policy');
   if (!policySelect) {
     throw new Error(
-      "shred modal opened without the consensus policy selector — the dialog " +
+      "shred modal opened without the consensus policy selector: the dialog " +
         "is proposing before it confirms",
     );
   }
@@ -1780,7 +1780,7 @@ async function main() {
   );
   if (stillMajority !== "MAJORITY") {
     throw new Error(
-      `policy selection did not stick — expected MAJORITY, got ${stillMajority}`,
+      `policy selection did not stick: expected MAJORITY, got ${stillMajority}`,
     );
   }
 
@@ -1819,7 +1819,7 @@ async function main() {
   // The room must fit the window exactly. It did not: the editor pane was a
   // plain block holding the markdown ribbon and an editor sized at height:100%
   // of that same block, so the two came to a ribbon's height more than the
-  // window. The document scrolled as a whole — a second scrollbar beside the
+  // window. The document scrolled as a whole, a second scrollbar beside the
   // editor's own, and the status bar and ribbon sliding off the top, which
   // looked like rows pinning themselves under the toolbar.
   //
@@ -1851,7 +1851,7 @@ async function main() {
   // link arrives looking like a blank page: two empty pane backgrounds with
   // the text off in the top-left. Reported from a Realme handset, where the
   // cause was Android's "Desktop site" toggle forcing a 980px layout viewport
-  // — a width no phone reports natively, so no phone-width check could see
+  // (a width no phone reports natively), so no phone-width check could see
   // it. The same band catches any handset turned sideways (932px at the
   // widest) and a small tablet in portrait (834px).
   for (const [width, wantSplit] of [[834, false], [932, false], [980, false], [1024, true]]) {
@@ -1891,8 +1891,8 @@ async function main() {
 
   await alice.click('[role="alertdialog"] button:has-text("Cancel")');
 
-  // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in a standalone Monaco — bold and
-  // italic are commands VS Code supplies for markdown — so in a markdown
+  // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in a standalone Monaco, bold and
+  // italic are commands VS Code supplies for markdown, so in a markdown
   // editor they failed silently, which reads as broken rather than absent.
   // Checked through the keyboard rather than by asking whether the action is
   // registered: a registered action with the wrong keybinding would satisfy
@@ -1900,7 +1900,7 @@ async function main() {
   //
   // The modifier comes from the page, not the host. Monaco decides whether
   // CtrlCmd means Cmd by looking for "Macintosh" in the user agent, and
-  // Playwright's WebKit reports a macOS user agent on every host — while
+  // Playwright's WebKit reports a macOS user agent on every host, while
   // `ControlOrMeta` is resolved from the machine running the test. On a Linux
   // runner that pressed Ctrl into an editor listening for Cmd, and the
   // shortcut looked dead in exactly the one engine where it was fine.
@@ -1987,7 +1987,7 @@ async function main() {
   // Turning Monaco's menu off everywhere left right-click useless: on
   // Monaco's rendered text the platform menu is a generic page menu with no
   // Cut or Copy, since the glyphs are divs and the real input is hidden. And
-  // in Firefox and Safari Monaco's own Paste can never be one click — it reads
+  // in Firefox and Safari Monaco's own Paste can never be one click, it reads
   // the clipboard from script, which those two answer with a Paste button of
   // their own. So Chromium keeps Monaco's menu, and Firefox and WebKit get the
   // browser's own menu, opened over a stand-in holding the selection, whose
@@ -1996,7 +1996,7 @@ async function main() {
   // A native menu cannot be driven from here, so the WebKit and Firefox half
   // proves what the menu depends on instead: that the menu event really lands
   // on the stand-in and is left to open, that the stand-in holds the
-  // selection selected — what makes the browser enable Cut and Copy — and
+  // selection selected, what makes the browser enable Cut and Copy, and
   // that the copy and paste events the menu's items produce reach the editor.
   //
   // Those events are replayed with a clipboard object the test can read. A
@@ -2034,7 +2034,7 @@ async function main() {
   if (ctx === null) throw new Error("[contextmenu] no contextmenu event reached the page");
   if (ENGINE_NAME === "chromium") {
     if (ctx.prevented !== true) {
-      throw new Error("[contextmenu] the editor has no context menu of its own — right-click falls back to a generic page menu with no Cut or Copy");
+      throw new Error("[contextmenu] the editor has no context menu of its own: right-click falls back to a generic page menu with no Cut or Copy");
     }
     const menuItems = (await alice.locator(".monaco-menu .action-label").allTextContents()).filter((t) => t.trim());
     for (const needed of ["Cut", "Copy", "Paste"]) {
@@ -2095,7 +2095,7 @@ async function main() {
 
   // A shred request must survive a reconnect. Reported from two machines: a
   // laptop that had switched tabs a couple of times proposed a shred, showed
-  // the right occupant count, and the other machine — online the entire time —
+  // the right occupant count, and the other machine, online the entire time,
   // never saw the prompt at all. Only a full page reload restored it.
   //
   // The cause was that JOIN_ACK's authoritative roster was merged into the
@@ -2124,13 +2124,13 @@ async function main() {
 
   // Scope: this now does reproduce the roster merge that caused the reported
   // failure, which it could not before. The previous note here said so
-  // honestly — a brief setOffline blip never produced a real socket close, so
+  // honestly, a brief setOffline blip never produced a real socket close, so
   // there was no second JOIN_ACK to merge a stale peer id out of, and the test
   // stayed green with the fix reverted. severNetwork() does produce one.
   // Rechecked the only way worth trusting: drop the `target.clear()` from
   // replaceRoster and this fails with a denominator of 5 for two people.
   //
-  // So the path is covered end to end — a shred proposed after a real
+  // So the path is covered end to end, a shred proposed after a real
   // interruption reaches the other side, and the bar it asks for describes the
   // people actually in the room. session.roster.test.ts still asserts the
   // merge directly; this is the same bug seen from the outside. Bob proposes
@@ -2155,7 +2155,7 @@ async function main() {
   try {
     await alice.waitForSelector('text=SHRED REQUESTED BY A PEER', { timeout: 15000 });
   } catch {
-    throw new Error("[shred] the peer was never prompted — the request was dropped in silence");
+    throw new Error("[shred] the peer was never prompted: the request was dropped in silence");
   }
   await alice.click('[role="alertdialog"] button:has-text("Reject")');
   await bob.waitForTimeout(500);
@@ -2163,7 +2163,7 @@ async function main() {
   // Export offered PDF at one fixed size and nothing else: a long document
   // became sixty-odd pages with no way to change it, and there was no way to
   // get the source back out at all. The dialog now offers both, and this
-  // checks the markdown path end to end — a download that never arrives is
+  // checks the markdown path end to end, a download that never arrives is
   // indistinguishable from a button that does nothing.
   alice.on("dialog", (d) => void d.accept());
   await alice.click('button:has-text("Export")');
@@ -2205,10 +2205,10 @@ async function main() {
     prev = goneBody;
     goneBody = goneBody.replace(/<!--[\s\S]*?-->/g, "");
   }
-  // It used to read "ROOM —— · SHREDDED —— UTC", with the dashes standing in
-  // for values no script ever supplied — the element was referenced nowhere —
+  // It used to read "ROOM, two dashes, SHREDDED, two dashes, UTC", the dashes standing in
+  // for values no script ever supplied (the element was referenced nowhere),
   // so every reader saw the placeholders themselves.
-  if (/——/.test(goneBody)) {
+  if (/\u2014\u2014/.test(goneBody)) {
     throw new Error("gone.html still shows unfilled placeholders");
   }
   // And it must stay anonymous: this page is served with Clear-Site-Data, so
@@ -2226,7 +2226,7 @@ async function main() {
   }
 
   // iOS Safari zooms the page when focus lands on a control computing under
-  // 16px, and never undoes it — so tapping a line to type left the reader
+  // 16px, and never undoes it, so tapping a line to type left the reader
   // zoomed in, and the shred dialog (position:fixed, laid out against the
   // layout viewport) then rendered cropped at both edges. Monaco's hidden
   // input was 12px and is written inline by Monaco, so no stylesheet rule
@@ -2263,7 +2263,7 @@ async function main() {
   }
 
   // A restart warns every open room before the process stops. The two peers
-  // are still in their room, so SIGTERM — what systemd sends on a redeploy —
+  // are still in their room, so SIGTERM, what systemd sends on a redeploy,
   // has to reach both as a countdown, and the server has to wait it out rather
   // than vanish with their documents.
   //
@@ -2271,7 +2271,7 @@ async function main() {
   // mid-session; now the stopping process hands each member a ticket and the
   // new one takes the room back from them. Written before the restart, this
   // marker must be readable afterwards by someone who was never in the room
-  // before — the only way it can reach them is through the new server's log,
+  // before, the only way it can reach them is through the new server's log,
   // refilled from the members' own copies.
   const marker = `kept-across-restart-${Date.now().toString(36)}`;
   // The whole document, from the preview: the editor renders only the lines
@@ -2448,8 +2448,8 @@ main().catch(async (e) => {
       console.error(`${label.toUpperCase()} STATE:`, JSON.stringify(state));
     } catch {}
   }
-  // Grouped by page. One peer's expected noise — a severed socket logs a
-  // connection error on every retry — used to fill the whole allowance and
+  // Grouped by page. One peer's expected noise, a severed socket logs a
+  // connection error on every retry, used to fill the whole allowance and
   // hide the one error from the other page that explained the failure.
   const byPage = new Map();
   for (const err of errors) {
