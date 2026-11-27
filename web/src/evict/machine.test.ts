@@ -498,7 +498,7 @@ describe("checking a commit against the policy", () => {
     expect(await m.commitSatisfies({ ...st, targetKeyDigest: await keyDigest(b.identity.publicKeyRaw), votes })).toBe(false);
   });
 
-  it("for a member that never saw the request, checks its own roster without the target and itself", async () => {
+  it("for a member that never saw the request, checks what a dishonest commit can fail, and not whether the votes cover its roster", async () => {
     const room = await makeRoom(4);
     const [a, b, c, t] = room.people;
     const req = await requestBy(room, a, t);
@@ -509,7 +509,17 @@ describe("checking a commit against the policy", () => {
     const m = machineFor(room, c);
     const st = await requestStatement(req);
     expect(await m.commitSatisfies({ ...st, votes })).toBe(true);
-    expect(await m.commitSatisfies({ ...st, votes: votes.slice(0, 1) })).toBe(false);
+    // Fewer votes than its roster holds: honest rosters drift, so this is
+    // only a room that moved without it.
+    expect(await m.commitSatisfies({ ...st, votes: votes.slice(0, 1) })).toBe(true);
+    // A voter it no longer lists is not checked.
+    const gone = { voter: new Uint8Array(16).fill(0xee), sig: new Uint8Array(64).fill(1) };
+    expect(await m.commitSatisfies({ ...st, votes: [...votes, gone] })).toBe(true);
+    // A listed voter's bad signature, this member, the target, or a repeat is refused.
+    expect(await m.commitSatisfies({ ...st, votes: [votes[0], { voter: b.id, sig: req.sig }] })).toBe(false);
+    expect(await m.commitSatisfies({ ...st, votes: [...votes, { voter: c.id, sig: await sign(c, req) }] })).toBe(false);
+    expect(await m.commitSatisfies({ ...st, votes: [...votes, { voter: t.id, sig: await sign(t, req) }] })).toBe(false);
+    expect(await m.commitSatisfies({ ...st, votes: [...votes, votes[1]] })).toBe(false);
     // A digest that is not the key its roster shows for the named target.
     const otherKey = { ...st, targetKeyDigest: await keyDigest(c.identity.publicKeyRaw) };
     const signedOther = [
@@ -633,7 +643,8 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
     expect(m.wasSeen(theirs.id)).toBe(true);
     expect(m.requestFor(theirs.id)).toBeNull();
     expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes })).toBe(true);
-    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes: votes.slice(0, 1) })).toBe(false);
+    const forged = [votes[0], { voter: a.id, sig: theirs.sig }];
+    expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes: forged })).toBe(false);
   });
 
   it("never opens the same request id twice under one root, and forgets the ids when the root moves", async () => {

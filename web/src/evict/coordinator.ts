@@ -649,7 +649,8 @@ export class EvictCoordinator {
     // name (a connection opened again under a new peer id, say), so it was
     // removed whatever its peer id is now, and whatever it made of the
     // request. It says so only after the checks above, which hold the commit
-    // to the request it saw or, if it cannot place one, to its own roster.
+    // to the request it saw or, if it cannot place one, to what a dishonest
+    // commit can fail.
     // The server closes such a connection with 4014; if it sees the commit
     // anyway, it has no wrap, and says so itself.
     if (holdsTargetKey || (clear.target !== null && eq(clear.target, me))) {
@@ -662,8 +663,10 @@ export class EvictCoordinator {
 
     // A commit for a request this member never saw, refused, or no longer
     // holds: the checks a member that never saw it can make passed, so the
-    // room's way in changed without it. No wrap is opened and the keyring is
-    // not touched.
+    // room's way in changed without it, whether or not the votes cover the
+    // roster it sees now (people who joined during the vote, a voter that
+    // left before this was read). No wrap is opened and the keyring is not
+    // touched.
     if (!placed) return this.leftOutOfCommit();
     // A backstop to the request's own check: the votes were held to a policy
     // set that needed this member's approval under this tab's own key. One

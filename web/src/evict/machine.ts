@@ -392,38 +392,29 @@ export class EvictMachine {
   /// member of the roster the request froze, without the target, each with a
   /// valid signature, and nobody else; and whether it names the target's key
   /// as the request did (SHA-256 of `request.targetKey`). That holds for any
-  /// request this member opened under the current root, not only the one open
-  /// now. For an id it cannot place (never received, refused, or let go of)
-  /// it makes the checks of a member that never saw the request: the digest
-  /// is that of the key its roster shows for the named target, if it is still
-  /// listed, and the votes cover its own roster without the named target,
-  /// every entry whose key has the commit's digest, and itself. Passing those
-  /// only tells such a member that the room moved without it: `requestFor`
+  /// request this member opened under the current root, not only the one
+  /// open now.
+  ///
+  /// For an id it cannot place (never received, refused, or let go of) it
+  /// checks only what a dishonest commit can fail, since an honest roster
+  /// drifts (people join during a vote, a voter leaves before the commit is
+  /// read): if the named target is still listed, the digest is that of the
+  /// key its roster shows for it; every voter still listed signed under the
+  /// key its roster shows; no voter is the named target, holds the key the
+  /// commit names, or is this member; and no voter appears twice. Whether the
+  /// votes cover its own roster is not asked. The caller has checked that the
+  /// sender signed the commit, is listed and is one of the voters. Passing
+  /// tells such a member only that the room moved without it: `requestFor`
   /// returns null for that id, and the caller never applies the commit.
   async commitSatisfies(c: Statement & { votes: Ballot[] }): Promise<boolean> {
     if ((c.target === null) !== (c.targetKeyDigest === null)) return false;
     const p = this.requestFor(c.id);
-    let set: RosterEntry[];
-    if (p) {
-      const sameTarget = p.request.target === null ? c.target === null : c.target !== null && eq(p.request.target, c.target);
-      const sameKey =
-        p.targetKeyDigest === null ? c.targetKeyDigest === null : c.targetKeyDigest !== null && eq(p.targetKeyDigest, c.targetKeyDigest);
-      if (!sameTarget || !sameKey || !eq(p.request.verifier, c.verifier) || p.request.root !== c.root) return false;
-      set = p.policySet;
-    } else {
-      const me = this.d.me();
-      const roster = this.d.members();
-      const digests = await Promise.all(roster.map((r) => (r.pubkey ? keyDigest(r.pubkey) : Promise.resolve(null))));
-      const holdsTargetKey = (i: number): boolean => {
-        const d = digests[i];
-        return c.targetKeyDigest !== null && d !== null && eq(d, c.targetKeyDigest);
-      };
-      const namedAt = c.target ? roster.findIndex((r) => eq(r.peerId, c.target!)) : -1;
-      if (namedAt >= 0 && !holdsTargetKey(namedAt)) return false;
-      set = roster.filter(
-        (r, i) => !(c.target && eq(r.peerId, c.target)) && !holdsTargetKey(i) && !(me && eq(r.peerId, me)),
-      );
-    }
+    if (!p) return this.unplacedCommitSatisfies(c);
+    const sameTarget = p.request.target === null ? c.target === null : c.target !== null && eq(p.request.target, c.target);
+    const sameKey =
+      p.targetKeyDigest === null ? c.targetKeyDigest === null : c.targetKeyDigest !== null && eq(p.targetKeyDigest, c.targetKeyDigest);
+    if (!sameTarget || !sameKey || !eq(p.request.verifier, c.verifier) || p.request.root !== c.root) return false;
+    const set = p.policySet;
     if (set.length === 0 || c.votes.length !== set.length) return false;
     const seen = new Set<string>();
     for (const v of c.votes) {
@@ -431,6 +422,32 @@ export class EvictMachine {
       const key = hexOf(v.voter);
       if (!m?.pubkey || seen.has(key)) return false;
       seen.add(key);
+      if (!(await signedBy(m.pubkey, this.statementFor(c, v.voter), v.sig))) return false;
+    }
+    return true;
+  }
+
+  private async unplacedCommitSatisfies(c: Statement & { votes: Ballot[] }): Promise<boolean> {
+    if (c.votes.length === 0) return false;
+    const me = this.d.me();
+    const roster = this.d.members();
+    const digestOf = (r: RosterEntry): Promise<Uint8Array | null> => (r.pubkey ? keyDigest(r.pubkey) : Promise.resolve(null));
+    const holdsTargetKey = (d: Uint8Array | null): boolean => c.targetKeyDigest !== null && d !== null && eq(d, c.targetKeyDigest);
+    if (c.target) {
+      const named = roster.find((r) => eq(r.peerId, c.target!));
+      if (named && !holdsTargetKey(await digestOf(named))) return false;
+    }
+    const seen = new Set<string>();
+    for (const v of c.votes) {
+      const key = hexOf(v.voter);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      if ((me && eq(v.voter, me)) || (c.target && eq(v.voter, c.target))) return false;
+      const m = roster.find((r) => eq(r.peerId, v.voter));
+      // A voter no longer listed cannot be checked, and is not held against
+      // the commit: it may have left after voting.
+      if (!m) continue;
+      if (!m.pubkey || holdsTargetKey(await digestOf(m))) return false;
       if (!(await signedBy(m.pubkey, this.statementFor(c, v.voter), v.sig))) return false;
     }
     return true;

@@ -1760,3 +1760,86 @@ describe("a key step during a vote does not end it (amendment K, votes bind the 
     expect(b.refusals).toEqual(["wrong-root"]);
   });
 });
+
+describe("a commit for a request this member cannot place (amendment K, the never-saw checks)", () => {
+  /// a asks to remove t. `late` join after the request and before the last
+  /// approval, so none of them saw it; b and c approve. The commit is held so
+  /// a test can hand it to a newcomer itself.
+  async function joinedDuringVote(late: number) {
+    const { hub, peers } = await room(4 + late);
+    const [a, b, c, t, ...newcomers] = peers;
+    hub.peers = hub.peers.filter((p) => !newcomers.includes(p));
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    hub.peers.push(...newcomers);
+    hub.dropCommits = true;
+    for (const p of [b, c]) await p.ev.vote("APPROVE");
+    await hub.flush();
+    const { h, body } = hub.captured[0];
+    return { hub, a, b, c, t, newcomers, h, body, real: decodeCommit(body)! };
+  }
+
+  it("tells two people who joined during the vote that they were left out, with no alarm", async () => {
+    const { hub, a, h, body, newcomers } = await joinedDuringVote(2);
+    hub.dropCommits = false;
+    hub.deliver(a, h, body);
+    await hub.flush();
+    expect(hub.epoch).toBe(1);
+    expect(a.keyring.rootEpoch).toBe(1);
+    for (const d of newcomers) {
+      expect(d.refusals).toEqual([]);
+      expect(d.leftOut).toBe(1);
+      expect(d.applied).toHaveLength(0);
+      expect(d.keyring.rootEpoch).toBe(0);
+      expect(d.keyring.current.epoch).toBe(0);
+    }
+  });
+
+  it("tells a newcomer it was left out when a voter left before the commit's turn on its queue", async () => {
+    const { hub, a, c, h, body, newcomers } = await joinedDuringVote(1);
+    const [d] = newcomers;
+    // c's PEER_LEAVE is handled at once; the commit waits on d's queue.
+    hub.peers = hub.peers.filter((p) => p !== c);
+    await d.ev.receiveCommit(h, 0, a.id, body);
+    expect(d.refusals).toEqual([]);
+    expect(d.leftOut).toBe(1);
+    expect(d.applied).toHaveLength(0);
+  });
+
+  it("refuses a commit carrying a forged ballot from a voter it still lists", async () => {
+    const { a, b, c, h, real, newcomers } = await joinedDuringVote(1);
+    const [d] = newcomers;
+    const cSig = real.clear.votes.find((v) => bytesEqual(v.voter, c.id))!.sig;
+    const votes = real.clear.votes.map((v) => (bytesEqual(v.voter, b.id) ? { voter: b.id, sig: cSig } : v));
+    const forged = await encodeCommit(h, { ...real.clear, votes }, real.tail, a.identity);
+    await d.ev.receiveCommit(h, 0, a.id, forged);
+    expect(d.refusals).toEqual(["commit-policy"]);
+    expect(d.leftOut).toBe(0);
+  });
+
+  it("refuses a commit sent by someone who is not among its voters", async () => {
+    const { t, h, real, newcomers } = await joinedDuringVote(1);
+    const [d] = newcomers;
+    const forged = await encodeCommit(h, real.clear, { ...real.tail, sender: t.id }, t.identity);
+    await d.ev.receiveCommit(h, 0, t.id, forged);
+    expect(d.refusals).toEqual(["commit-policy"]);
+    expect(d.leftOut).toBe(0);
+  });
+
+  it("refuses a commit counting this member, or the target's key, among its voters", async () => {
+    const { a, t, h, real, newcomers } = await joinedDuringVote(1);
+    const [d] = newcomers;
+    const req = { id: real.clear.requestId, target: real.clear.target, digest: real.clear.targetKeyDigest!, verifier: real.clear.verifier };
+    const sign = (who: Peer) => signPayload(who.identity, voteStatement(ROOM, req.id, 0, req.target, req.digest, who.id, req.verifier));
+    for (const who of [d, t]) {
+      const votes = [...real.clear.votes, { voter: who.id, sig: await sign(who) }];
+      const forged = await encodeCommit(h, { ...real.clear, votes }, real.tail, a.identity);
+      await d.ev.receiveCommit(h, 0, a.id, forged);
+    }
+    // Twice the same voter.
+    const twice = await encodeCommit(h, { ...real.clear, votes: [...real.clear.votes, real.clear.votes[0]] }, real.tail, a.identity);
+    await d.ev.receiveCommit(h, 0, a.id, twice);
+    expect(d.refusals).toEqual(["commit-policy", "commit-policy", "commit-policy"]);
+    expect(d.leftOut).toBe(0);
+  });
+});
