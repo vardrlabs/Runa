@@ -318,6 +318,149 @@ describe("the evict machine fails closed (amendment K)", () => {
   });
 });
 
+describe("the deadline holds whether or not tick has run", () => {
+  it("does not count an approval that arrives after the deadline", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const req = await requestBy(room, a, t, { deadline: 5_000 });
+    const m = machineFor(room, b);
+    await m.onRequest(req, a.id);
+    m.recordOwn(await sign(b, req));
+    room.clock.now += 5_000;
+    expect(await m.onVote(await approve(c, req), c.id)).toBe("not-voting");
+    expect(m.state).toBe("EXPIRED");
+  });
+
+  it("does not count an approval whose signature check outlasts the deadline", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const req = await requestBy(room, a, t, { deadline: 5_000 });
+    const m = machineFor(room, b);
+    await m.onRequest(req, a.id);
+    m.recordOwn(await sign(b, req));
+    const late = m.onVote(await approve(c, req), c.id);
+    room.clock.now += 5_000;
+    expect(await late).toBe("not-voting");
+    expect(m.state).toBe("EXPIRED");
+  });
+
+  it("does not approve on the member's own vote after the deadline", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t, { deadline: 5_000 });
+    const m = machineFor(room, b);
+    await m.onRequest(req, a.id);
+    room.clock.now += 5_000;
+    m.recordOwn(await sign(b, req));
+    expect(m.state).toBe("EXPIRED");
+  });
+
+  it("still approves one millisecond before the deadline", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t, { deadline: 5_000 });
+    const m = machineFor(room, b);
+    await m.onRequest(req, a.id);
+    room.clock.now += 4_999;
+    m.recordOwn(await sign(b, req));
+    expect(m.state).toBe("APPROVED");
+  });
+});
+
+describe("starting a vote locally", () => {
+  it("refuses while another member's request is open, and keeps it", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const theirs = await requestBy(room, a, t);
+    const m = machineFor(room, b);
+    await m.onRequest(theirs, a.id);
+    const mine = await requestBy(room, b, t, { id: new Uint8Array(16).fill(5) });
+    expect(() => m.start(mine, b.id, room.roster, null)).toThrow(Error);
+    expect(m.state).toBe("VOTING");
+    expect(m.current()!.request.id).toEqual(theirs.id);
+  });
+
+  it("is allowed again once the earlier vote has finished", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const m = machineFor(room, b);
+    await m.onRequest(await requestBy(room, a, t), a.id);
+    m.rejectOwn();
+    const mine = await requestBy(room, b, t, { id: new Uint8Array(16).fill(5) });
+    m.start(mine, b.id, room.roster, await digestOf(mine));
+    expect(m.state).toBe("VOTING");
+    expect(m.current()!.request.id).toEqual(mine.id);
+  });
+});
+
+describe("calls that overlap", () => {
+  it("lets only one of two requests arriving together open the vote", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const m = machineFor(room, b);
+    const r1 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(1) });
+    const r2 = await requestBy(room, a, t, { id: new Uint8Array(16).fill(2) });
+    const results = await Promise.all([m.onRequest(r1, a.id), m.onRequest(r2, a.id)]);
+    // Whichever finishes its signature check first opens the vote.
+    expect([...results].sort()).toEqual(["busy", null]);
+    expect(m.current()!.request.id).toEqual(results[0] === null ? r1.id : r2.id);
+  });
+
+  it("counts one of two identical votes arriving together", async () => {
+    const room = await makeRoom(4);
+    const [a, b, c, t] = room.people;
+    const req = await requestBy(room, a, t);
+    const m = machineFor(room, a);
+    m.start(req, a.id, room.roster, await digestOf(req));
+    const v = await approve(b, req);
+    expect([...(await Promise.all([m.onVote(v, b.id), m.onVote(v, b.id)]))].sort()).toEqual(["duplicate-vote", null]);
+    expect(m.state).toBe("VOTING");
+    void c;
+  });
+
+  it("drops a vote whose signature check finishes after the proposal was cancelled", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t);
+    const m = machineFor(room, a);
+    m.start(req, a.id, room.roster, await digestOf(req));
+    const pending = m.onVote(await approve(b, req), b.id);
+    m.cancel();
+    expect(await pending).toBe("not-voting");
+    expect(m.state).toBe("CANCELLED");
+  });
+});
+
+describe("requests that cannot be read", () => {
+  it("refuses a request from someone the roster does not show", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t);
+    expect(await machineFor(room, b).onRequest(req, new Uint8Array(16).fill(0xee))).toBe("unknown-proposer");
+    const keyless = { ...a.entry, pubkey: undefined };
+    room.roster = [keyless, ...room.roster.slice(1)];
+    expect(await machineFor(room, b).onRequest(req, a.id)).toBe("unknown-proposer");
+  });
+
+  it("refuses as malformed when the statement cannot be built", async () => {
+    const room = await makeRoom(3);
+    const [a, b, t] = room.people;
+    const req = await requestBy(room, a, t);
+    const m = new EvictMachine({
+      roomId: ROOM,
+      me: () => b.id,
+      members: () => room.roster,
+      now: () => room.clock.now,
+      epoch: () => room.epoch.value,
+      statement: () => {
+        throw new Error("cannot build");
+      },
+    });
+    expect(await m.onRequest(req, a.id)).toBe("malformed");
+    expect(m.state).toBe("IDLE");
+  });
+});
+
 describe("checking a commit against the policy", () => {
   async function approvedRoom() {
     const room = await makeRoom(4);

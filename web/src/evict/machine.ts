@@ -117,7 +117,10 @@ export class EvictMachine {
 
   /// This member's own request. Its signature in the request is its approval.
   /// `targetKeyDigest` is the digest it signed: SHA-256 of `req.targetKey`.
+  /// Throws while another vote is open: one sender's request never replaces
+  /// another's. A vote that has finished may be started over.
   start(req: EvictRequest, me: Uint8Array, roster: RosterEntry[], targetKeyDigest: Uint8Array | null): void {
+    if (this.isOpen()) throw new Error("another vote is already open");
     this.reset();
     this.open(req, targetKeyDigest, me, roster);
   }
@@ -142,9 +145,18 @@ export class EvictMachine {
     this.evaluate();
   }
 
+  /// Whether the deadline has passed by the machine's own clock, whether or
+  /// not `tick` has run. A vote past it fails and never counts another approval.
+  private pastDeadline(): boolean {
+    const p = this.p;
+    if (!p || this.state !== "VOTING" || this.d.now() < p.deadlineAt) return false;
+    this.state = "EXPIRED";
+    return true;
+  }
+
   private evaluate(): void {
     const p = this.p;
-    if (!p || this.state !== "VOTING") return;
+    if (!p || this.state !== "VOTING" || this.pastDeadline()) return;
     if (p.policySet.every((r) => this.approvals.has(hexOf(r.peerId)))) {
       this.state = "APPROVED";
       p.approvedAt = this.d.now();
@@ -198,7 +210,7 @@ export class EvictMachine {
   async onVote(v: EvictVote, sender: Uint8Array): Promise<Guard | null> {
     const p = this.p;
     if (!p || !eq(v.id, p.request.id)) return "unknown-request";
-    if (this.state !== "VOTING") return "not-voting";
+    if (this.state !== "VOTING" || this.pastDeadline()) return "not-voting";
     const member = p.policySet.find((r) => eq(r.peerId, sender));
     if (!member?.pubkey) return "not-in-policy-set";
     if (this.approvals.has(hexOf(sender))) return "duplicate-vote";
@@ -208,7 +220,7 @@ export class EvictMachine {
     }
     const st: Statement = { ...p.request, targetKeyDigest: p.targetKeyDigest };
     if (!v.sig || !(await signedBy(member.pubkey, this.statementFor(st, sender), v.sig))) return "bad-signature";
-    if (this.p !== p || this.state !== "VOTING") return "not-voting";
+    if (this.p !== p || this.state !== "VOTING" || this.pastDeadline()) return "not-voting";
     if (this.approvals.has(hexOf(sender))) return "duplicate-vote";
     this.approvals.set(hexOf(sender), v.sig.slice());
     this.evaluate();
@@ -220,6 +232,7 @@ export class EvictMachine {
     const me = this.d.me();
     const p = this.p;
     if (!me || !p || this.state !== "VOTING" || !p.policySet.some((r) => eq(r.peerId, me))) return;
+    if (this.pastDeadline()) return;
     this.approvals.set(hexOf(me), sig.slice());
     this.evaluate();
   }
@@ -251,7 +264,11 @@ export class EvictMachine {
     return reason;
   }
 
-  tick(now: number): { state: EvictState; reason?: string } | null {
+  /// The argument is kept for callers but not read: the deadline and the
+  /// commit wait are both measured on the injected clock, so the machine has
+  /// one clock and a caller's `now` cannot drift from it.
+  tick(_now?: number): { state: EvictState; reason?: string } | null {
+    const now = this.d.now();
     const p = this.p;
     if (!p || !this.isOpen()) return null;
     if (this.d.epoch() !== p.request.epoch) {
