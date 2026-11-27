@@ -24,28 +24,29 @@ section, so this file is not documentation of the release, it is part of it.
   trying to connect until it is reloaded.
 - **People can be removed from a room, and a room's link can be changed.**
   Everyone else in the room has to agree, and any one of them can refuse; the
-  server checks that everyone agreed too. The person being removed isn't
-  asked, and while a vote is open the server holds back any change to the
-  room's key, so they can't end the vote by changing it. The threat model says
-  what they can still do. A tab still running an earlier version can't vote,
-  so nothing can be removed or changed while one is open until it's reloaded.
-  The person who asks makes the new link first, or for a shared room types or
+  server checks that everyone agreed too. The person being removed isn't asked.
+  They can't block it by changing the room's key, because while a request is
+  open the server holds key changes back for up to two and a half minutes, but a
+  member who is determined to stay can still block their own removal, and the
+  threat model says how. A tab still running an earlier version can't vote, so
+  nothing can be removed or changed while one is open until it's reloaded. The
+  person who asks makes the new link first, or for a shared room types or
   generates a new passphrase, held to the same strength check as a new room's.
   Once everyone has agreed, each member receives it sealed to them alone, the
   server stops accepting the old one, and the room's key starts again from the
-  new one. The removed person's page says they were removed, and their old
-  link or passphrase no longer opens the room. Their tab keeps what it already
-  had on screen, read-only, so they can still read, copy or export it, but
-  nothing written afterwards reaches it. Changing the link with nobody removed
-  is what an everyday room can do about someone who once had the link, and a
-  shared room changes its passphrase the same way. A member's tab applies a
-  change only for a request it saw itself; a tab that was left out of a change
-  says so, stops connecting, and keeps what it had, read-only. Anyone who was
-  away at that moment comes back to the same "this room is gone" page as for
-  an expired room, and needs the new link or passphrase from someone who was
-  there. The room's fingerprint changes, so it's worth comparing again. The
-  limits, including what a dishonest server can still do, are in
-  `docs/THREAT_MODEL.md`, and the design is in `docs/PROTOCOL.md` amendment K.
+  new one. The removed person's page says they were removed, and their old link
+  or passphrase no longer opens the room. Their tab keeps what it already had on
+  screen, read-only, so they can still read, copy or export it, but nothing
+  written afterwards reaches it. Changing the link with nobody removed is what
+  an everyday room can do about someone who once had the link, and a shared room
+  changes its passphrase the same way. A member's tab applies a change only for
+  a request it saw itself; a tab that was left out of a change says so, stops
+  connecting, and keeps what it had, read-only. Anyone who was away at that
+  moment comes back to the same "this room is gone" page as for an expired room,
+  and needs the new link or passphrase from someone who was there. The room's
+  fingerprint changes, so it's worth comparing again. The limits, including what
+  a dishonest server can still do, are in `docs/THREAT_MODEL.md`, and the design
+  is in `docs/PROTOCOL.md` amendment K.
 
 ### Fixed
 
