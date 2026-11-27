@@ -973,11 +973,11 @@ async fn a_member_who_has_left_is_no_longer_required() {
     assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
 }
 
-/// Review C1. The person being removed sees the vote start and steps the
-/// room's key. The votes name the room's root, which a step does not move,
-/// so the proposer sends the commit at the new epoch and it is applied.
+/// Review C1 and H1. The person being removed sees the vote start and steps
+/// the room's key. The server holds key changes while the request is open, so
+/// the step is dropped, and the commit at the same epoch is applied.
 #[tokio::test]
-async fn a_step_during_the_vote_does_not_end_it() {
+async fn a_step_during_the_vote_is_held_and_the_vote_goes_on() {
     let s = spawn(cfg()).await;
     let k = create(&s).await;
     let mut a = join(&s, &k, Signer::ed()).await;
@@ -986,21 +986,22 @@ async fn a_step_during_the_vote_does_not_end_it() {
     a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
     next_ft(&mut t.ws, 0x24).await;
     t.ws.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
-    next_ft(&mut a.ws, 0x20).await;
-    next_ft(&mut b.ws, 0x20).await;
+    assert!(frames_of(&mut a.ws, 0x20, 400).await.is_empty(), "a step was relayed while a request was open");
+    assert!(frames_of(&mut b.ws, 0x20, 50).await.is_empty(), "a step was relayed while a request was open");
     let c = Commit::new(0, named(&t));
     let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
-    a.ws.send(frame(&k.hex, 0x23, 1, &body)).await.unwrap();
+    a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
     assert_eq!(&next_ft(&mut a.ws, 0x23).await[48..], &body[..]);
     assert_eq!(&next_ft(&mut b.ws, 0x23).await[48..], &body[..]);
     assert_eq!(json_body(&next_ft(&mut t.ws, 0x30).await)["code"], 4014);
     let ack = try_join(&s, &k.hex, c.new_auth).await.unwrap();
-    assert_eq!(ack["epoch"], 2);
-    assert_eq!(ack["root_epoch"], 2);
+    assert_eq!(ack["epoch"], 1);
+    assert_eq!(ack["root_epoch"], 1);
 }
 
 /// After a step, a commit whose header still names the epoch before it is
-/// dropped; the same votes under the new epoch's header are applied.
+/// dropped; the same votes under the new epoch's header are applied. The step
+/// lands before the request: once the request is open, no step would.
 #[tokio::test]
 async fn a_commit_whose_header_names_the_epoch_before_a_step_is_dropped() {
     let s = spawn(cfg()).await;
@@ -1008,10 +1009,10 @@ async fn a_commit_whose_header_names_the_epoch_before_a_step_is_dropped() {
     let mut a = join(&s, &k, Signer::ed()).await;
     let mut b = join(&s, &k, Signer::ed()).await;
     let t = join(&s, &k, Signer::ed()).await;
-    a.ws.send(frame(&k.hex, 0x24, 0, b"sealed request")).await.unwrap();
-    next_ft(&mut b.ws, 0x24).await;
     b.ws.send(frame(&k.hex, 0x20, 1, b"step")).await.unwrap();
     next_ft(&mut a.ws, 0x20).await;
+    a.ws.send(frame(&k.hex, 0x24, 1, b"sealed request")).await.unwrap();
+    next_ft(&mut b.ws, 0x24).await;
     let c = Commit::new(0, named(&t));
     let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
     a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();

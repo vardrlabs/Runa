@@ -314,6 +314,17 @@ struct Epochs {
     /// (`note_evict_request_at`). A step leaves these alone and a re-root
     /// clears them: a vote names the room's root, so it survives a step.
     evict_opened: std::collections::HashMap<[u8; 16], (Instant, u64)>,
+    /// For each connected peer whose EVICT_REQUEST started a hold: the holds
+    /// it has started lately. While any of them is open the room applies no
+    /// EPOCH_KEY step (amendment K): the person being removed could otherwise
+    /// send a valid step that leaves one voter out of the new key, and that
+    /// voter's reconnect would end the vote. Under this lock because
+    /// `step_epoch` decides a step under it and `commit_eviction` ends every
+    /// hold under it. Kept only for connected senders, so a room never holds
+    /// more entries than it holds connections, and each entry is bounded by
+    /// `MAX_HOLDS_PER_SENDER`. A sender's entry goes when it leaves
+    /// (`remove_peer`), and all of them go with the room.
+    step_holds: std::collections::HashMap<[u8; 16], StepHolds>,
     /// Set once a restart ticket has been issued for the room. A ticket
     /// holds the room's epoch and way in as they were then, so from then on
     /// neither a step nor a commit may move them: the room the ticket brings
@@ -322,8 +333,92 @@ struct Epochs {
 }
 
 /// How long a recorded EVICT_REQUEST decides a commit's cohort: the longest
-/// vote a client accepts (one hour), and a minute for the commit to follow.
-const EVICT_REQUEST_WINDOW: Duration = Duration::from_secs(3_660);
+/// vote a client accepts (two minutes), and half a minute for the commit to
+/// follow.
+const EVICT_REQUEST_WINDOW: Duration = Duration::from_secs(150);
+
+/// How long one EVICT_REQUEST holds key changes in its room, unless the hold
+/// ends early: as long as the request's record lasts.
+const EVICT_STEP_HOLD: Duration = Duration::from_secs(150);
+
+/// One sender's requests hold the room for at most `EVICT_HOLD_BUDGET` in any
+/// `EVICT_HOLD_PERIOD`, so nobody can stop the room's key from changing by
+/// asking again and again. A request beyond that is still relayed and
+/// recorded, and starts no hold.
+const EVICT_HOLD_BUDGET: Duration = Duration::from_secs(300);
+const EVICT_HOLD_PERIOD: Duration = Duration::from_secs(900);
+
+/// The most holds remembered for one sender. A hold that ends at once (a
+/// request and its cancel) takes almost nothing from the budget, so without
+/// this a sender could make the list as long as it liked. Honest members
+/// never come near it: a request is a person asking. Once a sender has this
+/// many holds that still count, its next request starts no hold.
+const MAX_HOLDS_PER_SENDER: usize = 16;
+
+/// The holds one sender's requests have started, as (start, end), oldest
+/// first. Only the last can still be open: its end is when it lapses, or the
+/// moment it was ended early. Holds are kept only while they can still count
+/// toward the bound.
+#[derive(Default)]
+struct StepHolds {
+    spans: std::collections::VecDeque<(Instant, Instant)>,
+}
+
+impl StepHolds {
+    fn open_at(&self, now: Instant) -> bool {
+        self.spans.back().is_some_and(|(start, end)| *start <= now && now < *end)
+    }
+
+    /// End the open hold, if there is one, at `now`.
+    fn end(&mut self, now: Instant) {
+        if let Some((start, end)) = self.spans.back_mut() {
+            if now < *end {
+                *end = now.max(*start);
+            }
+        }
+    }
+
+    /// Start a hold at `now` if the bound allows it, ending the open one.
+    ///
+    /// A new hold lasts at most `EVICT_STEP_HOLD`, so the windows of
+    /// `EVICT_HOLD_PERIOD` it could push over the budget are those that
+    /// contain it. The check below counts what was held in the last
+    /// `EVICT_HOLD_PERIOD - EVICT_STEP_HOLD` and allows the new hold only if
+    /// that and a full new hold fit in the budget. A window that starts
+    /// earlier than that loses as much of the new hold off its end as it
+    /// gains of the past at its start, so it stays within the budget too.
+    fn start(&mut self, now: Instant) -> bool {
+        let from = now.checked_sub(EVICT_HOLD_PERIOD - EVICT_STEP_HOLD);
+        // A hold that ended before the lookback can never count again.
+        while self.spans.front().is_some_and(|(_, end)| from.is_some_and(|f| *end <= f)) {
+            self.spans.pop_front();
+        }
+        let held: Duration = self
+            .spans
+            .iter()
+            .map(|(start, end)| {
+                let s = from.map_or(*start, |f| (*start).max(f));
+                (*end).min(now).saturating_duration_since(s)
+            })
+            .sum();
+        let Some(until) = now.checked_add(EVICT_STEP_HOLD) else {
+            return false;
+        };
+        if held + EVICT_STEP_HOLD > EVICT_HOLD_BUDGET || self.spans.len() >= MAX_HOLDS_PER_SENDER {
+            return false;
+        }
+        self.end(now);
+        self.spans.push_back((now, until));
+        true
+    }
+}
+
+/// Whether a hold keeps the room from taking a step now: an open hold whose
+/// sender is still connected and not being closed. Read under the `epochs`
+/// and `peers` guards the caller holds.
+fn steps_held(epochs: &Epochs, peers: &[ConnectedPeer], now: Instant) -> bool {
+    epochs.step_holds.iter().any(|(id, h)| h.open_at(now) && live(peers, id).is_some())
+}
 
 /// The least number of senders' requests remembered. The real bound is the
 /// larger of this and the room's `max_peers`: only connected senders are
@@ -459,13 +554,6 @@ const SHRED_REQUEST_WINDOW: Duration = Duration::from_secs(3600);
 /// forever by replaying TTL_EXTEND, which defeats the entire expiry model.
 pub const MAX_TTL_EXTENSION_SECS: u64 = 720 * 3600;
 
-/// The entry for `id` if it is in the room's list and its connection is not
-/// being closed. A commit or a step sets a connection's close flag and takes
-/// it out of the list under the `peers` guard, so a caller that holds that
-/// guard for the whole of what it then does gets an answer that cannot go
-/// stale before it acts: either the frame is handled before the commit, or
-/// it is dropped. The flag is checked as well as the list so the rule holds
-/// for any code path that sets the flag without removing the peer.
 /// Every rule a commit must pass, read under the `epochs` and `peers` guards
 /// the caller holds (amendment K). `root` is the root the votes were checked
 /// against, or None before any signature has been verified. The cheap rules
@@ -517,6 +605,13 @@ fn check_commit(
     decide(target, voters, &views, since)
 }
 
+/// The entry for `id` if it is in the room's list and its connection is not
+/// being closed. A commit or a step sets a connection's close flag and takes
+/// it out of the list under the `peers` guard, so a caller that holds that
+/// guard for the whole of what it then does gets an answer that cannot go
+/// stale before it acts: either the frame is handled before the commit, or
+/// it is dropped. The flag is checked as well as the list so the rule holds
+/// for any code path that sets the flag without removing the peer.
 fn live<'a>(peers: &'a [ConnectedPeer], id: &[u8; 16]) -> Option<&'a ConnectedPeer> {
     peers.iter().find(|p| p.peer_id == *id && p.tx.close.get().is_none())
 }
@@ -603,6 +698,7 @@ impl Room {
                     generation: 0,
                 },
                 evict_opened: std::collections::HashMap::new(),
+                step_holds: std::collections::HashMap::new(),
                 handed_over: false,
             }),
             ttl_extension_secs: AtomicU64::new(0),
@@ -701,6 +797,36 @@ impl Room {
             }
         }
         opened.insert(sender, (now, seq));
+        // The request holds key changes in the room, if this sender's bound
+        // allows it (`StepHolds::start`). Only connected senders are kept, so
+        // the cap is never reached in a room within its `max_peers`; if it
+        // were, the request would start no hold rather than end someone
+        // else's.
+        let holds = &mut epochs.step_holds;
+        holds.retain(|id, _| connected.contains(id));
+        if holds.contains_key(&sender) || holds.len() < cap {
+            holds.entry(sender).or_default().start(now);
+        }
+    }
+
+    /// An EVICT_CANCEL from `sender` is being relayed (amendment K). The
+    /// server cannot read which request it cancels, so it ends whatever hold
+    /// this sender's requests have open.
+    pub fn note_evict_cancel(&self, sender: [u8; 16]) {
+        self.note_evict_cancel_at(sender, Instant::now());
+    }
+
+    fn note_evict_cancel_at(&self, sender: [u8; 16], now: Instant) {
+        // Lock order: `epochs`, then `peers`. A connection being closed is
+        // not heard, and its hold no longer counts anyway (`steps_held`).
+        let mut epochs = self.epochs.lock().unwrap();
+        let peers = self.peers.lock().unwrap();
+        if live(&peers, &sender).is_none() {
+            return;
+        }
+        if let Some(h) = epochs.step_holds.get_mut(&sender) {
+            h.end(now);
+        }
     }
 
     pub fn auth_allowed(&self, caller: &str) -> bool {
@@ -793,6 +919,10 @@ impl Room {
     }
 
     pub fn remove_peer(&self, peer_id: &[u8; 16]) -> bool {
+        // A sender's holds go when it leaves, so its hold ends and nothing of
+        // it is kept. Lock order: `epochs`, then `peers`.
+        let mut epochs = self.epochs.lock().unwrap();
+        epochs.step_holds.remove(peer_id);
         let mut peers = self.peers.lock().unwrap();
         self.drop_listed(&mut peers, std::slice::from_ref(peer_id))
     }
@@ -857,11 +987,12 @@ impl Room {
     /// * `Refused`: nothing is sent. So it is for a sender that is no longer
     ///   in the list or is being closed (see `live`): it is checked under the
     ///   same guard as the decision, before the epoch can move. So it is too
-    ///   once a restart ticket has been issued (`ticket_access`).
+    ///   once a restart ticket has been issued (`ticket_access`), and for a
+    ///   step while a removal request holds the room (`steps_held`).
     ///
     /// Peers closed with 4005, and any peer whose queue is full, are out of
     /// the list before the guard drops, so none of them stays in the roster,
-    /// a purge cohort or the next vote's floor while its writer drains.
+    /// a purge cohort or the next vote's cohort while its writer drains.
     pub fn step_epoch(
         &self,
         header_epoch: u32,
@@ -874,6 +1005,12 @@ impl Room {
         let mut epochs = self.epochs.lock().unwrap();
         let mut peers = self.peers.lock().unwrap();
         if live(&peers, &sender).is_none() || epochs.handed_over {
+            return Offer::Refused;
+        }
+        // While a removal request holds the room, a step (the next epoch) is
+        // dropped as a step that lost would be. A handover is not a change of
+        // key and still passes.
+        if epochs.state.epoch().checked_add(1) == Some(header_epoch) && steps_held(&epochs, &peers, now) {
             return Offer::Refused;
         }
         let offer = epochs.state.offer(header_epoch, now, min_interval);
@@ -965,8 +1102,12 @@ impl Room {
         if !epochs.state.reroot(r.at_epoch, now) {
             return Err(Refusal::LastEpoch);
         }
-        // Every open request named the root just left.
+        // Every open request named the root just left, and the vote they held
+        // the room for is over. The holds stay on record for the bound.
         epochs.evict_opened.clear();
+        for h in epochs.step_holds.values_mut() {
+            h.end(now);
+        }
         let generation = epochs.access.generation + 1;
         epochs.access = Access {
             verifier: Some(Secret::new(Box::new(r.verifier))),
@@ -2562,8 +2703,9 @@ mod evict_tests {
         let b = member(&r, 2, true);
         let err = Bytes::from_static(b"ERR");
         let step_frame = Bytes::from(vec![0x57u8; 32]);
-        r.note_evict_request(a.id);
+        // The step lands first: once the request is open, no step would.
         assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step_frame, b.id, &err), Offer::Advanced);
+        r.note_evict_request(a.id);
         let refused = commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &Bytes::from(vec![0xC0u8; 32]), a.id);
         assert_eq!(refused, Err(Refusal::WrongEpoch));
         assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
@@ -2768,23 +2910,30 @@ mod evict_tests {
         assert_eq!(commit(&r, &reroot(1, None, &[(&a, 1), (&b, 2), (&c, 3)]), &frame, a.id), Ok(2));
     }
 
-    /// Review C1 and S1: the person being removed steps the room's key while
-    /// the vote is open. A step does not move the root the votes name, and
-    /// does not clear the sender's request, so the commit sent at the new
-    /// epoch is applied.
+    /// Review C1 and S1: a step the room applies while a request is on
+    /// record does not move the root the votes name and does not clear the
+    /// sender's request, so the commit sent at the new epoch is applied. A
+    /// step lands while a record is live only when its sender's hold has
+    /// ended or its request started none; here a's third request in 300
+    /// seconds is past the bound, and the person being removed steps.
     #[tokio::test]
     async fn a_step_between_the_votes_and_the_commit_does_not_end_the_vote() {
         let r = room();
         let mut a = member(&r, 1, true);
         let b = member(&r, 2, true);
         let t = member(&r, 3, true);
-        r.note_evict_request(a.id);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        r.note_evict_request_at(a.id, t0 + Duration::from_secs(150));
+        r.note_evict_request_at(a.id, t0 + Duration::from_secs(300));
         let step = Bytes::from(vec![0x57u8; 32]);
-        assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, t.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
+        let now = t0 + Duration::from_secs(301);
+        assert_eq!(r.step_epoch(1, now, Duration::ZERO, &step, t.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
         assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
         let frame = Bytes::from(vec![0xC0u8; 40]);
         let rr = ReRoot { root: 0, ..reroot(1, target(t.id, 3), &[(&a, 1), (&b, 2)]) };
-        assert_eq!(commit(&r, &rr, &frame, a.id), Ok(2));
+        let (evicted, kx_less) = (Bytes::from_static(ERR_EVICTED), Bytes::from_static(ERR_KX_LESS));
+        assert_eq!(r.commit_eviction(&rr, now, &frame, a.id, &evicted, &kx_less), Ok(2));
         assert_eq!((r.epoch(), r.root_epoch()), (2, 2));
         assert_eq!(t.flag.get(), Some(WireCode::Evicted));
         assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
@@ -2796,9 +2945,10 @@ mod evict_tests {
         let r = room();
         let a = member(&r, 1, true);
         let b = member(&r, 2, true);
-        r.note_evict_request(a.id);
         let step = Bytes::from(vec![0x57u8; 32]);
+        // The step lands first: once the request is open, no step would.
         assert_eq!(r.step_epoch(1, Instant::now(), Duration::ZERO, &step, b.id, &Bytes::from_static(ERR_KX_LESS)), Offer::Advanced);
+        r.note_evict_request(a.id);
         let frame = Bytes::from(vec![0u8; 40]);
         assert_eq!(commit(&r, &reroot(0, None, &[(&a, 1), (&b, 2)]), &frame, a.id), Err(Refusal::WrongEpoch));
         assert_eq!((r.epoch(), r.root_epoch()), (1, 0));
@@ -2872,6 +3022,209 @@ mod evict_tests {
         assert_eq!((r.epoch(), r.root_epoch()), (u32::MAX, u32::MAX));
         assert_eq!(r.check_auth(&OLD_AUTH), Some(0), "the way in did not change");
         assert_eq!((a.flag.get(), b.flag.get()), (None, None));
+    }
+
+    // H1: the server holds key changes while a removal request is open. Every
+    // instant is passed in, so no test waits on a real clock.
+
+    fn step_at(r: &Room, to: u32, now: Instant, sender: [u8; 16]) -> Offer {
+        r.step_epoch(to, now, Duration::ZERO, &Bytes::from(vec![0x57u8; 32]), sender, &Bytes::from_static(ERR_KX_LESS))
+    }
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    #[tokio::test]
+    async fn a_step_during_a_hold_is_not_applied() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t = member(&r, 3, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        // The person being removed steps the key while the vote is open.
+        assert_eq!(step_at(&r, 1, t0 + secs(1), t.id), Offer::Refused);
+        assert_eq!(step_at(&r, 1, t0 + secs(2), b.id), Offer::Refused);
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert!(a.rx.try_recv().is_err(), "a held step was relayed");
+    }
+
+    #[tokio::test]
+    async fn a_handover_during_a_hold_is_relayed() {
+        let r = room();
+        let mut a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert_eq!(step_at(&r, 1, t0 + secs(1), b.id), Offer::Refused, "the room is held");
+        assert_eq!(step_at(&r, 0, t0 + secs(1), b.id), Offer::Handover);
+        assert_eq!(a.rx.recv().await.unwrap()[0], 0x57);
+        assert_eq!(r.epoch(), 0);
+    }
+
+    #[test]
+    fn a_commit_during_a_hold_is_applied_and_ends_it() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        let rr = reroot(0, None, &[(&a, 1), (&b, 2)]);
+        let none = Bytes::new();
+        assert_eq!(step_at(&r, 1, t0 + secs(1), b.id), Offer::Refused, "the room is held");
+        assert_eq!(r.commit_eviction(&rr, t0 + secs(1), &frame, a.id, &none, &none), Ok(1));
+        assert_eq!(step_at(&r, 2, t0 + secs(2), b.id), Offer::Advanced);
+        assert_eq!((r.epoch(), r.root_epoch()), (2, 1));
+    }
+
+    #[test]
+    fn the_hold_ends_on_its_senders_cancel_and_only_on_theirs() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        r.note_evict_cancel_at(b.id, t0 + secs(1));
+        assert_eq!(step_at(&r, 1, t0 + secs(2), b.id), Offer::Refused, "someone else's cancel ended the hold");
+        r.note_evict_cancel_at(a.id, t0 + secs(3));
+        assert_eq!(step_at(&r, 1, t0 + secs(4), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn the_hold_ends_when_its_sender_leaves_and_its_record_goes_with_it() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert_eq!(step_at(&r, 1, t0 + secs(1), b.id), Offer::Refused);
+        assert!(r.remove_peer(&a.id));
+        assert!(!r.epochs.lock().unwrap().step_holds.contains_key(&a.id), "a sender's holds outlived it");
+        assert_eq!(step_at(&r, 1, t0 + secs(2), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn the_hold_ends_when_its_senders_connection_is_being_closed() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert_eq!(step_at(&r, 1, t0, b.id), Offer::Refused, "the room is held");
+        a.flag.set(WireCode::ProtocolError);
+        assert_eq!(step_at(&r, 1, t0 + secs(1), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn the_hold_ends_after_150_seconds() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert_eq!(step_at(&r, 1, t0 + secs(149), b.id), Offer::Refused);
+        assert_eq!(step_at(&r, 1, t0 + secs(150), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn two_senders_holds_overlap() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let c = member(&r, 3, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        r.note_evict_request_at(b.id, t0 + secs(100));
+        r.note_evict_cancel_at(a.id, t0 + secs(110));
+        assert_eq!(step_at(&r, 1, t0 + secs(120), c.id), Offer::Refused, "b's hold is still open");
+        assert_eq!(step_at(&r, 1, t0 + secs(151), c.id), Offer::Refused, "b's hold is still open");
+        assert_eq!(step_at(&r, 1, t0 + secs(250), c.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn one_senders_requests_hold_the_room_for_at_most_300_seconds_in_900() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        // Asked again as the first hold lapses: 300 seconds held in all.
+        r.note_evict_request_at(a.id, t0 + secs(150));
+        assert_eq!(step_at(&r, 1, t0 + secs(299), b.id), Offer::Refused);
+        // A third request starts no hold, but it is still recorded.
+        r.note_evict_request_at(a.id, t0 + secs(300));
+        assert_eq!(step_at(&r, 1, t0 + secs(301), b.id), Offer::Advanced);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        let rr = ReRoot { root: 0, ..reroot(1, None, &[(&a, 1), (&b, 2)]) };
+        let none = Bytes::new();
+        assert_eq!(r.commit_eviction(&rr, t0 + secs(302), &frame, a.id, &none, &none), Ok(2));
+    }
+
+    #[test]
+    fn a_request_starts_a_hold_again_once_the_last_900_seconds_allow_it() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        r.note_evict_request_at(a.id, t0 + secs(150));
+        // At 899 seconds the hold from 150 to 300 and a new one would make
+        // 300 held between 149 and 1049, with 1 more from the first: refused.
+        r.note_evict_request_at(a.id, t0 + secs(899));
+        assert_eq!(step_at(&r, 1, t0 + secs(900), b.id), Offer::Advanced);
+        // From 900 on the first hold no longer counts: this one holds.
+        r.note_evict_request_at(a.id, t0 + secs(906));
+        assert_eq!(step_at(&r, 2, t0 + secs(1000), b.id), Offer::Refused);
+        assert_eq!(step_at(&r, 2, t0 + secs(1056), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn a_sender_that_asks_and_cancels_again_and_again_is_bounded() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert_eq!(step_at(&r, 1, t0, b.id), Offer::Refused, "the room is held");
+        for i in 0..100u64 {
+            r.note_evict_request_at(a.id, t0 + Duration::from_millis(i * 10));
+            r.note_evict_cancel_at(a.id, t0 + Duration::from_millis(i * 10 + 1));
+        }
+        let kept = r.epochs.lock().unwrap().step_holds.get(&a.id).map_or(0, |h| h.spans.len());
+        assert!(kept <= MAX_HOLDS_PER_SENDER, "{kept} holds kept for one sender");
+        assert_eq!(step_at(&r, 1, t0 + secs(2), b.id), Offer::Advanced);
+    }
+
+    #[test]
+    fn a_closing_sender_starts_no_hold() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        a.flag.set(WireCode::Evicted);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        assert!(!r.epochs.lock().unwrap().step_holds.contains_key(&a.id));
+        // The control: the same request from a live member holds the room.
+        r.note_evict_request_at(b.id, t0 + secs(1));
+        assert_eq!(step_at(&r, 1, t0 + secs(2), a.id), Offer::Refused);
+        assert_eq!(step_at(&r, 1, t0 + secs(2), b.id), Offer::Refused);
+    }
+
+    #[test]
+    fn a_commit_151_seconds_after_its_request_is_refused() {
+        let r = room();
+        let a = member(&r, 1, true);
+        let b = member(&r, 2, true);
+        let t0 = Instant::now();
+        r.note_evict_request_at(a.id, t0);
+        let frame = Bytes::from(vec![0xC0u8; 40]);
+        let rr = reroot(0, None, &[(&a, 1), (&b, 2)]);
+        let none = Bytes::new();
+        assert_eq!(r.commit_eviction(&rr, t0 + secs(151), &frame, a.id, &none, &none), Err(Refusal::NoOpenRequest));
+        assert_eq!((r.epoch(), r.root_epoch()), (0, 0));
+        assert_eq!(r.commit_eviction(&rr, t0 + secs(149), &frame, a.id, &none, &none), Ok(1));
     }
 
     /// Review M8: 4014 reads back as Evicted, any other code as a protocol

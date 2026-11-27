@@ -900,12 +900,17 @@ async fn process_frame(
 
         // Amendment K: sealed under the room's content key and relayed like
         // the shred frames. The server reads none of it; it only notes when a
-        // request passed, and the commit is where it checks the votes.
+        // request or a cancel passed, and the commit is where it checks the
+        // votes.
         FT_EVICT_REQUEST | FT_EVICT_VOTE | FT_EVICT_CANCEL => {
             // Before relaying, as for SHRED_REQUEST: who could see this
-            // request is the cohort its sender's commit is counted against.
-            if header.frame_type == FT_EVICT_REQUEST {
-                room.note_evict_request(sender);
+            // request is the cohort its sender's commit is counted against,
+            // and the request holds key changes in the room. A cancel from
+            // the same sender ends that hold.
+            match header.frame_type {
+                FT_EVICT_REQUEST => room.note_evict_request(sender),
+                FT_EVICT_CANCEL => room.note_evict_cancel(sender),
+                _ => {}
             }
             gjallarhorn::relay(room, &frame_bytes, sender).await;
             Ok(())
@@ -1244,13 +1249,43 @@ mod closing_sender_tests {
         let r = room();
         let a = peer(&r, 1, true);
         let mut b = peer(&r, 2, true);
-        for ft in [FT_DOC_UPDATE, FT_AWARENESS, FT_EVICT_REQUEST, FT_SHRED_REQUEST] {
+        // The request's hold would keep the step below from landing; the
+        // sender's own cancel ends it.
+        for ft in [FT_DOC_UPDATE, FT_AWARENESS, FT_EVICT_REQUEST, FT_EVICT_CANCEL, FT_SHRED_REQUEST] {
             process(&s, &r, a.id, &frame(ft, 0, b"x")).await;
             assert_eq!(drain(&mut b).len(), 1, "frame {ft:#x} from a member is relayed");
         }
         assert_eq!(r.log.read().unwrap().log_len(), 1);
         process(&s, &r, a.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
         assert_eq!(r.epoch(), 1);
+    }
+
+    /// H1, end to end through the frame handler: an EVICT_REQUEST holds every
+    /// step, a handover still passes, and the sender's EVICT_CANCEL lets the
+    /// next step through.
+    #[tokio::test]
+    async fn a_request_holds_steps_until_its_sender_cancels() {
+        let s = state();
+        let r = room();
+        let a = peer(&r, 1, true);
+        let mut b = peer(&r, 2, true);
+        let t = peer(&r, 3, true);
+        process(&s, &r, a.id, &frame(FT_EVICT_REQUEST, 0, b"request")).await;
+        drain(&mut b);
+        process(&s, &r, t.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
+        assert_eq!(r.epoch(), 0, "a step was applied while a request was open");
+        assert!(drain(&mut b).is_empty(), "a held step was relayed");
+        process(&s, &r, t.id, &frame(FT_EPOCH_KEY, 0, b"handover")).await;
+        assert_eq!(drain(&mut b).len(), 1, "a handover was held");
+        // Someone else's cancel does not end a's hold.
+        process(&s, &r, t.id, &frame(FT_EVICT_CANCEL, 0, b"cancel")).await;
+        process(&s, &r, t.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
+        assert_eq!(r.epoch(), 0);
+        process(&s, &r, a.id, &frame(FT_EVICT_CANCEL, 0, b"cancel")).await;
+        drain(&mut b);
+        process(&s, &r, t.id, &frame(FT_EPOCH_KEY, 1, b"step")).await;
+        assert_eq!(r.epoch(), 1);
+        assert_eq!(drain(&mut b).len(), 1);
     }
 
     #[tokio::test]
