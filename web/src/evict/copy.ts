@@ -34,7 +34,7 @@ export const EVICT_COPY = {
   removedBody: "You were removed from this room. The link you used no longer opens it.",
   copied: "The new link is copied. The part after the # is the key.",
   copiedPassphrase: "The new passphrase is copied. Send it separately from the room's address.",
-  authFailed: "The passphrase is wrong, or this room no longer exists. If someone changed its passphrase, ask them for the new one.",
+  authFailed: "This link does not open the room, or the room no longer exists. If someone changed its link, ask them for the new one.",
   gone: "It was shredded, it expired, the server restarted, or someone changed its link. If the link changed, ask someone who is still in the room for the new one. Rooms live only in memory, so there is no copy to recover.",
 } as const;
 
@@ -44,6 +44,7 @@ const PASS_COPY = {
   relinkButton: "Change passphrase",
   nobody: "Nobody, only the passphrase changes",
   removedBody: "You were removed from this room. The passphrase you used no longer opens it.",
+  authFailed: "The passphrase is wrong, or this room no longer exists. If someone changed its passphrase, ask them for the new one.",
   gone: "It was shredded, it expired, the server restarted, or someone changed its passphrase. If the passphrase changed, ask someone who is still in the room for the new one. Rooms live only in memory, so there is no copy to recover.",
 } as const;
 

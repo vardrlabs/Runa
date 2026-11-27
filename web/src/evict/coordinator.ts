@@ -812,6 +812,18 @@ export class EvictCoordinator {
     }, undefined);
   }
 
+  /// This tab joined again under a new peer id. Everyone else has seen its
+  /// previous connection leave, so a vote that needs it under that id, or
+  /// that it asked under that id, has failed for them already; it ends here
+  /// too, rather than holding this tab busy until its deadline.
+  rejoined(previous: Uint8Array): Promise<void> {
+    return this.run(async () => {
+      if (this.dead) return;
+      const reason = this.machine.memberLeft(previous);
+      if (reason) this.report(reason);
+    }, undefined);
+  }
+
   /// Once a second, from the session's timer.
   tick(): Promise<void> {
     return this.run(async () => {

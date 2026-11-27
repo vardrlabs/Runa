@@ -128,6 +128,7 @@ describe("the words a person reads (fix wave 1)", () => {
       evictCopy("pass").nobody,
       evictCopy("pass").removedBody,
       evictCopy("pass").gone,
+      evictCopy("pass").authFailed,
       voteTitle(null, "pass"),
       voteBody("TIN-HARBOUR", null, "pass"),
       voteBody("TIN-HARBOUR", "COPPER-LANTERN", "pass"),
@@ -152,6 +153,10 @@ describe("the words a person reads (fix wave 1)", () => {
     expect(voteBody("A", null)).toMatch(/link or passphrase/);
     expect(voteBody("A", null, "link")).not.toMatch(/passphrase/);
     expect(proposeErrorText("target-gone")).toMatch(/Change the link/);
+    // A private room whose boot failed was opened with a link, not a passphrase.
+    expect(evictCopy("link").authFailed).not.toMatch(/passphrase/i);
+    expect(evictCopy("link").authFailed).toMatch(/link/);
+    expect(evictCopy("pass").authFailed).toMatch(/passphrase/);
   });
 
   it("have no em dashes and never say 'we' in a shared room's words either", () => {

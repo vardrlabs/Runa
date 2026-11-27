@@ -196,7 +196,8 @@ async function joined(opts: { wayKind?: "link" | "pass"; restoreRoom?: SessionCo
       indexed: true,
       log_id: "log-1",
     }) as unknown as JoinAck;
-  const join = (roster: unknown[]) => (socket.events.onJoinAck as unknown as (a: JoinAck) => Promise<void>)(ack(roster));
+  const join = (roster: unknown[], peerId = ME) =>
+    (socket.events.onJoinAck as unknown as (a: JoinAck) => Promise<void>)({ ...ack(roster), peer_id: toB64(peerId) });
   await join([me, wire(a), wire(b)]);
   const evictDeps = (session.evict as unknown as { d: EvictDeps }).d;
   const keyring = (session as unknown as { keyring: Keyring }).keyring;
@@ -232,6 +233,9 @@ describe("Session.create wiring: removal (amendment K)", () => {
   it("ends the tab the same way when the evict coordinator finds this tab named in a commit", async () => {
     const { socket, seen, evictDeps } = await joined();
     evictDeps.removed();
+    // The dep does the work itself, before any 4014 arrives.
+    expect(seen.removed).toBe(1);
+    expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
     socket.events.onError(4014);
     expect(seen.removed).toBe(1);
     expect(socket.calls.filter((c) => c === "stopReconnecting")).toHaveLength(1);
@@ -279,6 +283,16 @@ describe("Session.create wiring: eviction frames and votes", () => {
     // Back after a reconnect: `a` is gone, and no PEER_LEAVE said so.
     await join([me, wire(b)]);
     await waitFor(() => expect(seen.states).toContainEqual(["FAILED", "voter-left"]));
+  });
+
+  it("ends its own open vote when it joins again under a new peer id (review M-2)", async () => {
+    const { session, seen, a, b, join } = await joined();
+    expect(await session.proposeEviction(null)).toBeNull();
+    expect(session.evict.isOpen()).toBe(true);
+    const again = new Uint8Array(16).fill(0x12);
+    await join([{ peer_id: toB64(again), pubkey: toB64(session.identity.publicKeyRaw), joined_at_seq: 4 }, wire(a), wire(b)], again);
+    await waitFor(() => expect(seen.states).toContainEqual(["FAILED", "proposer-left"]));
+    expect(session.evict.isOpen()).toBe(false);
   });
 
   it("holds a due key step while a vote is open, and sends it once the vote has ended without a commit", async () => {

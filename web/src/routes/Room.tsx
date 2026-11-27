@@ -801,7 +801,7 @@ function JoinableRoom(props: RoomProps) {
       <main className="landing">
         <h1 className="mono">RÚNA</h1>
         <div className="panel">
-          <p>{EVICT_COPY.authFailed}</p>
+          <p>{words.authFailed}</p>
           <a href="/">← Back</a>
         </div>
       </main>

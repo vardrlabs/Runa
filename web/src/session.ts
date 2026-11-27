@@ -449,10 +449,11 @@ export class Session {
     const internals: SocketInternals = { roster, away, myPeerId: "", myJoinedSeq: 0, joinPerfMs: 0 };
     let sessionRef: Session | null = null;
 
-    const peerJoined = (entry: RosterEntry): void => {
+    /// `announced` for a PEER_JOIN, not for a peer a roster refresh lists.
+    const peerJoined = (entry: RosterEntry, announced = false): void => {
       const id = toB64(entry.peerId);
       roster.set(id, entry);
-      sessionRef?.coordinator?.memberJoined(entry);
+      sessionRef?.coordinator?.memberJoined(entry, announced);
       sessionRef?.noteRosterSeen(id);
       // Names come from the key the roster binds to this peer, never from
       // what the peer says its name is.
@@ -546,7 +547,7 @@ export class Session {
         onSnapshot: (sender, covers, blob, epoch) => sessionRef?.handleSnapshot(sender, covers, blob, epoch),
         onAwareness: (sender, pt) => sessionRef?.awareness?.receive(sender, pt),
         onShredFrame: (ft, sender, pt) => void sessionRef?.handleShredFrame(ft, sender, pt),
-        onPeerJoin: (entry) => peerJoined(entry),
+        onPeerJoin: (entry) => peerJoined(entry, true),
         onPeerLeave: (peerId, reason) => peerLeft(peerId, reason),
         onPurge: (reason) => events.onPurge(reason),
         onTtlExtended: (remaining, effective, addedBy) =>
@@ -751,7 +752,11 @@ export class Session {
       this.socket.replaceBacklogWith(wrapWithLengthAndPad(Y.encodeStateAsUpdate(this.doc.ydoc)));
       this.events.onRoomCarriedOver?.();
     }
+    const previousPeerId = this.internals.myPeerId;
     this.internals.myPeerId = ack.peer_id;
+    // Joined again under a new peer id: a vote that named the previous one
+    // cannot finish (amendment K).
+    if (previousPeerId && previousPeerId !== ack.peer_id) void this.evict?.rejoined(fromB64(previousPeerId));
     this.internals.myJoinedSeq = ack.roster.find((r) => r.peer_id === ack.peer_id)?.joined_at_seq ?? 0;
     this.internals.joinPerfMs = performance.now();
     this.machine.setMyPeerId(ack.peer_id);

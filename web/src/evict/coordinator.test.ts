@@ -1868,3 +1868,33 @@ describe("a commit for a request this member cannot place (amendment K, the neve
     expect(d.leftOut).toBe(0);
   });
 });
+
+describe("a member that reconnects during a vote (review M-2)", () => {
+  it("ends the vote that names its previous peer id, so it can answer the next request", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(b.ev.isOpen()).toBe(true);
+    const old = b.view();
+    b.reconnectAs(new Uint8Array(16).fill(0xb2));
+    await b.ev.rejoined(old.peerId);
+    expect(b.ev.isOpen()).toBe(false);
+    expect(b.states.at(-1)).toBe("FAILED");
+    // Everyone else saw the old connection leave.
+    await a.ev.memberLeft(old);
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    expect(b.refusals).not.toContain("busy");
+    expect(b.prompts).toHaveLength(2);
+  });
+
+  it("changes nothing for a vote that does not name the previous peer id", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    await b.ev.rejoined(new Uint8Array(16).fill(0xee));
+    expect(b.ev.isOpen()).toBe(true);
+  });
+});

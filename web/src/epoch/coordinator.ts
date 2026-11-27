@@ -139,13 +139,19 @@ export class EpochCoordinator {
     return this.d.members().some((m) => !me || !eq(m.peerId, me));
   }
 
-  memberJoined(m: MemberView): void {
+  /// `announced` is true for a PEER_JOIN: a connection that has just joined,
+  /// not one a roster refresh lists, which may be an old connection of a
+  /// removed peer the server has not dropped yet.
+  memberJoined(m: MemberView, announced = false): void {
     this.noteMember(m).catch(() => undefined);
     if (m.pubkey) {
       const key = hex(m.pubkey);
       this.tracker.returned(key);
       this.departed.delete(key);
       this.seen.add(key);
+      // A key a re-root cut out that joins again was let in with the new way
+      // in: its next departure counts like anyone's.
+      if (announced) this.cutOut.delete(key);
     }
     const me = this.d.me();
     if (me && !eq(m.peerId, me) && this.d.keyring.current.epoch > this.d.keyring.rootEpoch) {
@@ -313,8 +319,9 @@ export class EpochCoordinator {
         },
         this.d.identity,
       );
-      // A step landed while this one was being built: it is stale.
-      if (this.d.keyring.current.epoch !== cur.epoch) return;
+      // A step landed while this one was being built: it is stale. A vote
+      // that opened meanwhile holds it, as it would have before the build.
+      if (this.d.keyring.current.epoch !== cur.epoch || this.d.stepsHeld?.()) return;
       // Recorded before sending: the server echoes the step back, and the echo
       // must find the secret waiting.
       this.pendingStep = { to, secret, confirm: next.confirm, sentAt: this.d.now() };
@@ -337,6 +344,9 @@ export class EpochCoordinator {
     if (!kxPub) return false;
     const ring = this.d.keyring;
     const cur = ring.current;
+    // Read with the secrets, before any await: they are the secrets since
+    // this root.
+    const root = ring.rootEpoch;
     const blob = ring.secretsBlob();
     try {
       if (blob.length === 0 || blob.length / 32 > MAX_HANDOVER_SECRETS) return false;
@@ -349,7 +359,7 @@ export class EpochCoordinator {
           kind: "handover",
           from: cur.epoch,
           to: cur.epoch,
-          root: ring.rootEpoch,
+          root,
           sender: me.slice(),
           roster: await rosterDigest(this.d.members()),
           confirm: cur.confirm,

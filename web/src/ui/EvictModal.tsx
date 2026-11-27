@@ -45,7 +45,10 @@ function useDialogFocus(first: RefObject<HTMLElement | null>, fallback?: FocusFa
   const fallbackRef = useRef(fallback);
   fallbackRef.current = fallback;
   useEffect(() => {
-    const back = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    // The page body is where focus falls when nothing has it, such as after a
+    // menu that opened the dialog folded away: it opened nothing.
+    const active = document.activeElement;
+    const back = active instanceof HTMLElement && active !== document.body ? active : null;
     first.current?.focus();
     return () => {
       if (back && onScreen(back)) {
@@ -101,15 +104,23 @@ export function EvictModal(props: {
     };
   }, []);
 
-  // Disabling the button that had focus drops focus to the page; once the
-  // request has gone out, it comes back to Cancel.
+  const locked = busy || evictInFlight(props.state);
+
+  // Disabling the button that had focus drops focus to the page in some
+  // browsers and leaves it on the disabled button in others; either way,
+  // once the keys are made, or while a vote in flight locks the form, it
+  // comes back to Cancel.
   useEffect(() => {
     if (busy) return;
     const active = document.activeElement;
-    if (!active || active === document.body) cancelRef.current?.focus();
-  }, [busy]);
-
-  const locked = busy || evictInFlight(props.state);
+    let disabled = false;
+    try {
+      disabled = active instanceof HTMLElement && active.matches(":disabled");
+    } catch {
+      disabled = active instanceof HTMLButtonElement && active.disabled;
+    }
+    if (!active || active === document.body || disabled) cancelRef.current?.focus();
+  }, [busy, locked]);
   const submit = async () => {
     if (locked) return;
     setError(null);

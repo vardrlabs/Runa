@@ -5,7 +5,7 @@ import { generateIdentity, signPayload, type Identity } from "../crypto/identity
 import { generateKx, kxStatement, sealWrap, wrapKey, type KxPair } from "../crypto/kx";
 import { encodeHeader, FT, PROTOCOL_VERSION } from "../transport/frame";
 import { EpochCoordinator, type KeyStatus, type MemberView } from "./coordinator";
-import { encodeEpochKey } from "./frame";
+import { decodeEpochKey, encodeEpochKey } from "./frame";
 import { Keyring } from "./keyring";
 import { LEAVE_GRACE_MS, ROTATOR_FALLBACK_MS } from "./rotation";
 
@@ -813,6 +813,69 @@ describe("EpochCoordinator and re-roots (amendment K)", () => {
     hub.now += LEAVE_GRACE_MS * 2;
     await tickAll(hub);
     expect(hub.epoch).toBe(0);
+  });
+
+  it("counts the departure of a key a re-root cut out once that key has joined again (review M-1)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    for (const p of [a, b]) p.coord.reRooted(c.identity.publicKeyRaw);
+    // Given the new link, c comes back: the server announces it.
+    const view = hub.members().find((m) => m.peerId === c.id)!;
+    for (const p of [a, b]) p.coord.memberJoined(view, true);
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS + ROTATOR_FALLBACK_MS;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(1);
+  });
+
+  it("still does not count it when the key only reappears in a roster refresh", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    for (const p of [a, b]) p.coord.reRooted(c.identity.publicKeyRaw);
+    const view = hub.members().find((m) => m.peerId === c.id)!;
+    for (const p of [a, b]) p.coord.memberJoined(view);
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS + ROTATOR_FALLBACK_MS;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(0);
+  });
+
+  it("does not send a step when an eviction vote opened while it was being built (review M-9)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    // Not held when the tick looks, held by the time the step is built.
+    let asked = 0;
+    Object.defineProperty(a, "held", { get: () => asked++ > 0, set: () => undefined });
+    await a.coord.tick();
+    await hub.flush();
+    expect(asked).toBeGreaterThan(1);
+    expect(hub.epoch).toBe(0);
+  });
+
+  it("names in a handover the root its secrets were read from, whatever happens to the keyring meanwhile (review M-10)", async () => {
+    const { hub, peers } = await room(3);
+    const [a, , c] = peers;
+    leave(hub, c);
+    hub.now += LEAVE_GRACE_MS;
+    await tickAll(hub);
+    expect(hub.epoch).toBe(1);
+    const d = await makePeer(hub);
+    arrive(hub, d);
+    hub.captured = [];
+    const deps = (a.coord as unknown as { d: { header(e: number): Uint8Array } }).d;
+    const content = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x61), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    const chain = await deriveChainKey(new Uint8Array(32).fill(0x62), new Uint8Array(16).fill(0x63));
+    deps.header = (e: number) => {
+      void a.keyring.reroot(2, content, chain);
+      return header(e);
+    };
+    await a.coord.tick();
+    const sent = hub.captured.find((f) => f.from === a);
+    expect(sent).toBeDefined();
+    expect(a.keyring.rootEpoch).toBe(2);
+    expect(decodeEpochKey(sent!.body)?.body.root).toBe(0);
   });
 
   it("holds a due step while an eviction vote is open, and sends it after", async () => {
