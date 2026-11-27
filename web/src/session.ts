@@ -301,6 +301,14 @@ export interface SessionEvents {
   /// The room removed this member. Said once, whether ERROR 4014, a close
   /// with 4014 or a commit naming this tab's key came first.
   onRemoved?(): void;
+  /// The room's way in changed and this tab was not given the new one: it can
+  /// no longer take part, and what it holds is all it has. Said once per
+  /// re-root, whichever way the evict coordinator found out: a commit this
+  /// tab could place but held no usable wrap in (raised after
+  /// `onEvictState("FAILED", "left-out")`), or a member's commit for an epoch
+  /// this tab has not reached (no evict state comes with it). Said again only
+  /// after a later re-root has let the tab back in.
+  onLeftOut?(): void;
 }
 
 /// What the server said to a restart ticket: the room is back (whoever
@@ -370,6 +378,8 @@ export class Session {
   private rerootGen = 0;
   /// The room removed this tab (amendment K).
   private removedSaid = false;
+  /// The page was told this tab was left out of the room's latest re-root.
+  private leftOutSaid = false;
   /// A forgetting of the old root's keys is queued on the epoch queue.
   private forgetting = false;
   /// The reason this tab's own commit just failed with, while the evict
@@ -648,7 +658,10 @@ export class Session {
       prompt: (p) => void session.raiseEvictPrompt(p),
       state: (st, reason) => session.evictStateChanged(st, reason),
       refused: (reason) => session.evictRefused(reason),
-      leftOut: () => session.reportKeyStatus("left-out"),
+      leftOut: () => {
+        session.reportKeyStatus("left-out");
+        session.leftOutOfReRoot();
+      },
       // This tab was the one removed, under an earlier connection or with no
       // 4014 reaching it: the same ending as ERROR 4014.
       removed: () => session.removedFromRoom(),
@@ -956,6 +969,8 @@ export class Session {
     quietly(() => this.machine.reset());
     quietly(() => this.events.onShredState("IDLE"));
     this.rerootGen += 1;
+    // Let in: a later re-root this tab is left out of is said again.
+    this.leftOutSaid = false;
     this.rerootAt = Date.now();
     this.rerootSnapshotSeen = false;
     quietly(() => this.snapshotSoon());
@@ -1063,6 +1078,14 @@ export class Session {
       });
     }
     this.events.onEvictState?.(state, reason);
+    if (state === "FAILED" && reason === "left-out") this.leftOutOfReRoot();
+  }
+
+  /// Tells the page, once per re-root, that this tab was left out of it.
+  private leftOutOfReRoot(): void {
+    if (this.leftOutSaid) return;
+    this.leftOutSaid = true;
+    quietly(() => this.events.onLeftOut?.());
   }
 
   /// A commit that failed a check may mean tampering: it is a key change

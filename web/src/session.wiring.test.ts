@@ -117,6 +117,8 @@ function recorder() {
     ignored: [] as string[],
     states: [] as [string, string | undefined][],
     keyStatus: [] as [string | null, boolean][],
+    leftOut: 0,
+    order: [] as string[],
   };
   const events: SessionEvents = {
     onJoinAck: () => {},
@@ -134,7 +136,14 @@ function recorder() {
     onServerRestart: () => {},
     onConnectionRefused: () => {},
     onKeyStatus: (m, a) => void seen.keyStatus.push([m, a]),
-    onEvictState: (st, reason) => void seen.states.push([st, reason]),
+    onEvictState: (st, reason) => {
+      seen.states.push([st, reason]);
+      seen.order.push(`state ${st}`);
+    },
+    onLeftOut: () => {
+      seen.leftOut += 1;
+      seen.order.push("leftOut");
+    },
     onEvictIgnored: (r) => void seen.ignored.push(r),
     onRemoved: () => {
       seen.removed += 1;
@@ -183,6 +192,17 @@ async function joined(opts: { wayKind?: "link" | "pass" } = {}) {
   const evictDeps = (session.evict as unknown as { d: EvictDeps }).d;
   const keyring = (session as unknown as { keyring: Keyring }).keyring;
   return { session, socket, seen, a, b, me, join, evictDeps, keyring };
+}
+
+/// Re-roots the real keyring to `root` on the epoch queue, as a commit does.
+async function reRoot(session: Session, keyring: Keyring, evictDeps: EvictDeps, root = 1): Promise<void> {
+  const way = newLinkWayIn();
+  const keys = await deriveReRoot(way);
+  await session.coordinator.exclusive(async () => {
+    const ok = await keyring.reroot(root, keys.contentKey, keys.chainKey);
+    if (!ok) throw new Error("re-root refused");
+    evictDeps.applyReRoot({ root, way, keys, target: null, targetKey: null });
+  });
 }
 
 const waitFor = (check: () => void) => vi.waitFor(check, { timeout: 3000, interval: 5 });
@@ -278,6 +298,57 @@ describe("Session.create wiring: eviction frames and votes", () => {
   });
 });
 
+describe("Session.create wiring: a tab left out of a re-root (amendment K)", () => {
+  // The evict coordinator has two routes to "left out", and the page must
+  // hear the same thing from both.
+  it("tells the page once when a member's commit names an epoch this tab has not reached", async () => {
+    const { seen, evictDeps } = await joined();
+    // The later-epoch route calls only the leftOut dep.
+    evictDeps.leftOut();
+    evictDeps.leftOut();
+    expect(seen.leftOut).toBe(1);
+    expect(seen.states).toEqual([]);
+    expect(seen.keyStatus.at(-1)?.[0]).toMatch(/link changed, and this tab was not given the new one/);
+  });
+
+  it("tells the page once when this tab holds no wrap it can use in a commit it can place", async () => {
+    const { seen, evictDeps } = await joined();
+    // The route through leftOutOfCommit: FAILED with left-out, then leftOut.
+    evictDeps.state("FAILED", "left-out");
+    evictDeps.leftOut();
+    expect(seen.leftOut).toBe(1);
+    expect(seen.order).toEqual(["state FAILED", "leftOut"]);
+  });
+
+  it("tells the page on a FAILED left-out alone, and not for any other failure", async () => {
+    const { seen, evictDeps } = await joined();
+    evictDeps.state("FAILED", "epoch-moved");
+    expect(seen.leftOut).toBe(0);
+    evictDeps.state("FAILED", "left-out");
+    expect(seen.leftOut).toBe(1);
+  });
+
+  it("tells the page again when a later re-root it was let into is followed by one it was left out of", async () => {
+    const { session, seen, evictDeps, keyring } = await joined();
+    evictDeps.leftOut();
+    await reRoot(session, keyring, evictDeps);
+    evictDeps.leftOut();
+    expect(seen.leftOut).toBe(2);
+  });
+
+  it("does not stop telling the page when the page's callback throws", async () => {
+    const { session, evictDeps } = await joined();
+    let calls = 0;
+    (session as unknown as { events: SessionEvents }).events.onLeftOut = () => {
+      calls += 1;
+      throw new Error("page callback threw");
+    };
+    expect(() => evictDeps.leftOut()).not.toThrow();
+    expect(() => evictDeps.state("FAILED", "left-out")).not.toThrow();
+    expect(calls).toBe(1);
+  });
+});
+
 describe("Session.create wiring: the end of the evict coordinator", () => {
   it("is ended when the keys are dropped: an open vote's way in goes, and no frame is taken after", async () => {
     const { session, socket, seen, a } = await joined();
@@ -301,17 +372,6 @@ describe("Session.create wiring: the end of the evict coordinator", () => {
 });
 
 describe("Session.create wiring: forgetting the keys from before a re-root (amendment K)", () => {
-  /// Re-roots the real keyring to epoch 1 on the epoch queue, as a commit does.
-  async function reRoot(session: Session, keyring: Keyring, evictDeps: EvictDeps): Promise<void> {
-    const way = newLinkWayIn();
-    const keys = await deriveReRoot(way);
-    await session.coordinator.exclusive(async () => {
-      const root = await keyring.reroot(1, keys.contentKey, keys.chainKey);
-      if (!root) throw new Error("re-root refused");
-      evictDeps.applyReRoot({ root: 1, way, keys, target: null, targetKey: null });
-    });
-  }
-
   const forget = (session: Session) => (session as unknown as { forgetOldRoot(): Promise<void> }).forgetOldRoot();
 
   it("does not count a snapshot sealed under the old root and delivered after the re-root, however long the overlap has passed", async () => {
