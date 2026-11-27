@@ -39,8 +39,13 @@ import { bytesEqual as eq, hexOf, keyDigest, rosterDigest, voteStatement } from 
 /// deadline checked in `tick`.
 
 export const DEFAULT_DEADLINE_MS = 60_000;
-/// How long a proposer waits for its commit to come back from the server.
+/// How long a proposer waits for its commit to come back from the server,
+/// from the first time it sent it.
 export const COMMIT_ECHO_MS = 10_000;
+/// How many times a proposer builds its commit again for a new epoch, when a
+/// key step lands after it sent the commit and before the commit came back.
+/// The votes name the root, which a step does not move, so they still hold.
+export const MAX_COMMIT_RESENDS = 3;
 /// How long a VOTE or CANCEL that arrived before its REQUEST is held for it.
 /// Frames reach the coordinator in the order their decrypts resolve, so the
 /// request is usually a moment behind; anything older is let go.
@@ -101,11 +106,18 @@ export interface EvictDeps {
 
 interface Pending {
   requestId: Uint8Array;
-  epoch: number;
+  /// The root the request named.
+  root: number;
   way: WayIn;
   keys: ReRootKeys;
   config: Uint8Array;
+  /// When the commit was first sent. The give-up is measured from it, however
+  /// often the commit is built again.
   sentAt: number | null;
+  /// The header epoch of the last commit sent.
+  sentEpoch: number | null;
+  /// How many times the commit has been sent.
+  sends: number;
 }
 
 /// Frames for one request id that came before the request did.
@@ -127,13 +139,13 @@ export class EvictCoordinator {
   private pending: Pending | null = null;
   /// A commit whose echo did not come back in time. Its way in is closed to
   /// any new use and kept only so a late echo of that commit still applies,
-  /// until members would also have stopped waiting for it or the epoch
-  /// moves; then it is wiped.
+  /// until members would also have stopped waiting for it or the root moves;
+  /// then it is wiped.
   private late: Pending | null = null;
   /// VOTE and CANCEL frames held for a request not yet received, by request
-  /// id, and the epoch they were held in.
+  /// id, and the root they were held under.
   private early = new Map<string, Early>();
-  private earlyEpoch = -1;
+  private earlyRoot = -1;
   /// The last state handed to `deps.state`, so a state the machine reached on
   /// its own (a vote that ran past its deadline, say) is reported once.
   private reported: EvictState = "IDLE";
@@ -146,7 +158,7 @@ export class EvictCoordinator {
       myKey: () => d.identity.publicKeyRaw,
       members: () => d.members(),
       now: () => d.now(),
-      epoch: () => d.keyring.current.epoch,
+      root: () => d.keyring.rootEpoch,
     });
   }
 
@@ -203,12 +215,12 @@ export class EvictCoordinator {
     if (s !== "IDLE") this.say(() => this.d.state(s, reason));
   }
 
-  /// Lets go of held frames that are too old or from another epoch.
+  /// Lets go of held frames that are too old or from under another root.
   private pruneEarly(): void {
-    const epoch = this.d.keyring.current.epoch;
-    if (epoch !== this.earlyEpoch) {
+    const root = this.d.keyring.rootEpoch;
+    if (root !== this.earlyRoot) {
       this.early.clear();
-      this.earlyEpoch = epoch;
+      this.earlyRoot = root;
     }
     const now = this.d.now();
     for (const [key, e] of this.early) if (now - e.at >= EARLY_HOLD_MS) this.early.delete(key);
@@ -294,7 +306,8 @@ export class EvictCoordinator {
       if (!me) return "not-joined";
       if (this.isOpen()) return "busy";
       if (!Number.isInteger(deadlineMs) || deadlineMs <= 0 || deadlineMs > MAX_DEADLINE_MS) return "failed";
-      const epoch = this.d.keyring.current.epoch;
+      // The votes name the root, so a key step during the vote changes nothing.
+      const root = this.d.keyring.rootEpoch;
       const members = this.d.members();
       let targetId: Uint8Array | null = null;
       let targetKey: Uint8Array | null = null;
@@ -313,10 +326,10 @@ export class EvictCoordinator {
       // Every vote names the target's key by its digest, so the server knows
       // every connection holding it, not only the one named.
       const targetKeyDigest = targetKey ? await keyDigest(targetKey) : null;
-      const sig = await signPayload(this.d.identity, voteStatement(this.d.roomId, id, epoch, targetId, targetKeyDigest, me, keys.verifier));
+      const sig = await signPayload(this.d.identity, voteStatement(this.d.roomId, id, root, targetId, targetKeyDigest, me, keys.verifier));
       const req: EvictRequest = {
         id,
-        epoch,
+        root,
         target: targetId,
         targetKey,
         verifier: keys.verifier,
@@ -329,12 +342,12 @@ export class EvictCoordinator {
       // Checked again after the last await: nothing above may have moved.
       const meNow = this.d.me();
       if (this.dead || !meNow || !eq(meNow, me)) return "failed";
-      if (this.isOpen() || this.d.keyring.current.epoch !== epoch) return "busy";
+      if (this.isOpen() || this.d.keyring.rootEpoch !== root) return "busy";
       // Someone joined or left meanwhile: every member would refuse the
       // request's roster digest, so it is not sent.
       if (!eq(canonicalRosterBytes(this.d.members()), canonicalRosterBytes(members))) return "roster-changed";
       this.machine.start(req, me, members, targetKeyDigest);
-      this.pending = { requestId: id, epoch, way, keys, config, sentAt: null };
+      this.pending = { requestId: id, root, way, keys, config, sentAt: null, sentEpoch: null, sends: 0 };
       kept = true;
       this.reported = "IDLE";
       let sent = false;
@@ -371,6 +384,8 @@ export class EvictCoordinator {
     if (this.dead || !p || !me || this.machine.state !== "VOTING") return;
     // The target is not asked, and the proposer's request already is its vote.
     if (eq(p.proposer, me) || !p.policySet.some((r) => eq(r.peerId, me))) return;
+    // Already approved, before a key step or not: its vote stands.
+    if (this.machine.hasApproved(me)) return;
     const r = p.request;
     if (choice === "REJECT") {
       this.machine.rejectOwn();
@@ -380,7 +395,7 @@ export class EvictCoordinator {
     }
     // The digest the machine took from the request's `targetKey`, which it
     // checked against this member's roster before the vote opened.
-    const sig = await signPayload(this.d.identity, voteStatement(this.d.roomId, r.id, r.epoch, r.target, p.targetKeyDigest, me, r.verifier));
+    const sig = await signPayload(this.d.identity, voteStatement(this.d.roomId, r.id, r.root, r.target, p.targetKeyDigest, me, r.verifier));
     if (this.dead || this.machine.current() !== p || this.machine.state !== "VOTING") return;
     this.machine.recordOwn(sig);
     this.report();
@@ -419,7 +434,7 @@ export class EvictCoordinator {
     if (frameType === FT.EVICT_REQUEST) {
       const req = decodeRequest(plaintext);
       if (!req) return this.refused("malformed");
-      // A vote that ran out, or whose epoch moved, is reported as such before
+      // A vote that ran out, or whose root moved, is reported as such before
       // a new request can replace it. Only a vote still collecting approvals:
       // an approved one waiting on its commit is the session timer's to end,
       // since the proposer's way in may still be kept for a late echo.
@@ -466,7 +481,7 @@ export class EvictCoordinator {
       if (this.dead) return;
       this.report();
       if (guard) return this.refused(guard);
-      if (this.machine.state === "APPROVED" && this.pending && this.pending.sentAt === null) await this.commitNow();
+      if (this.machine.state === "APPROVED" && this.pending && this.pending.sentEpoch === null) await this.commitNow();
       return;
     }
     const guard = this.machine.onCancel(id, sender);
@@ -485,18 +500,46 @@ export class EvictCoordinator {
     }
   }
 
+  /// A key step landed after this member sent its commit and before the
+  /// commit came back. The server takes a commit only at the room's current
+  /// epoch, so the one sent can never be echoed: it is built again for the new
+  /// epoch (a new header, tail root, wraps and signature) and sent again, at
+  /// most `MAX_COMMIT_RESENDS` times for one vote. The votes are reused as
+  /// they are, since they name the root. A commit that was never sent because
+  /// the epoch moved while it was built is sent here too.
+  private async resendIfStepped(): Promise<void> {
+    const pend = this.pending;
+    if (this.dead || !pend || this.machine.state !== "APPROVED") return;
+    if (pend.sentEpoch === this.d.keyring.current.epoch) return;
+    if (pend.sentAt !== null && pend.sends > MAX_COMMIT_RESENDS) return;
+    await this.commitNow();
+  }
+
+  /// Called after this member applied a key step, from inside the task that
+  /// applied it: the work is queued behind that task, never run inside it.
+  stepped(): Promise<void> {
+    return this.run(() => this.resendIfStepped(), undefined);
+  }
+
   private async buildAndSend(): Promise<void> {
     const pend = this.pending;
     const p = this.machine.current();
     const me = this.d.me();
-    if (this.dead || !pend || !p || !me || this.machine.state !== "APPROVED" || pend.sentAt !== null) return;
-    const epoch = p.request.epoch;
-    if (this.d.keyring.current.epoch !== epoch) return this.abandon("epoch-moved");
+    if (this.dead || !pend || !p || !me || this.machine.state !== "APPROVED") return;
+    // The votes name the root: a re-root ended this vote, a step did not.
+    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon("root-moved");
+    // The commit goes under the room's current epoch, and its tail names the
+    // root one above it. Sent once at this epoch already: nothing to do.
+    const epoch = this.d.keyring.current.epoch;
+    if (pend.sentEpoch === epoch) return;
     const root = epoch + 1;
     const header = this.d.header(FT.EVICT_COMMIT, epoch);
     const wraps: Wrap[] = [];
     // Only the members who approved get the new way in: nobody who arrived
     // during the vote, and not the target or a connection holding its key.
+    // Built again each time: the wrap key covers the root, and the header,
+    // which names the epoch, is each wrap's associated data. The encoded way
+    // in is zeroed after every build.
     const payload = encodeWayIn(pend.way);
     try {
       for (const m of p.policySet) {
@@ -535,8 +578,13 @@ export class EvictCoordinator {
     );
     // Checked again after the awaits above.
     if (this.dead || this.pending !== pend || this.machine.current() !== p || this.machine.state !== "APPROVED") return;
-    if (this.d.keyring.current.epoch !== epoch) return this.abandon("epoch-moved");
-    pend.sentAt = this.d.now();
+    if (this.d.keyring.rootEpoch !== p.request.root) return this.abandon("root-moved");
+    // A step landed while it was built: this one names an epoch the room has
+    // left. The next look (`stepped`, or the timer) builds it again.
+    if (this.d.keyring.current.epoch !== epoch) return;
+    pend.sentAt ??= this.d.now();
+    pend.sentEpoch = epoch;
+    pend.sends += 1;
     if (!this.d.sendSigned(header, body)) this.abandon("not-sent");
   }
 
@@ -572,9 +620,11 @@ export class EvictCoordinator {
       this.say(() => this.d.leftOut());
       return;
     }
+    // The votes must name this member's own root. A commit whose votes name
+    // a root the room has left fails their signatures here.
     const claim = {
       id: clear.requestId,
-      epoch,
+      root: ring.rootEpoch,
       target: clear.target,
       targetKeyDigest: clear.targetKeyDigest,
       verifier: clear.verifier,
@@ -686,9 +736,9 @@ export class EvictCoordinator {
     }
   }
 
-  /// A commit moved the room's epoch. The vote it was for is done; any other
-  /// vote still open here ends as one whose epoch moved, since it named the
-  /// epoch the room has left.
+  /// A commit re-rooted the room. The vote it was for is done; any other vote
+  /// still open here ends as one whose root moved, since it named the root the
+  /// room has left.
   private endVoteFor(requestId: Uint8Array): void {
     const cur = this.machine.current();
     if (cur && eq(cur.request.id, requestId)) {
@@ -696,7 +746,7 @@ export class EvictCoordinator {
       this.report();
     } else if (this.machine.isOpen()) {
       this.machine.fail();
-      this.report("epoch-moved");
+      this.report("root-moved");
     }
   }
 
@@ -757,7 +807,7 @@ export class EvictCoordinator {
       const now = this.d.now();
       this.pruneEarly();
       const late = this.late;
-      if (late && (late.sentAt === null || now - late.sentAt >= COMMIT_WAIT_MS || this.d.keyring.current.epoch !== late.epoch)) {
+      if (late && (late.sentAt === null || now - late.sentAt >= COMMIT_WAIT_MS || this.d.keyring.rootEpoch !== late.root)) {
         this.dropLate();
       }
       const pend = this.pending;
@@ -773,6 +823,8 @@ export class EvictCoordinator {
       }
       const changed = this.machine.tick(now);
       this.report(changed?.reason);
+      // A step this member applied without `stepped` reaching here.
+      await this.resendIfStepped();
     }, undefined);
   }
 

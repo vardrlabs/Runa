@@ -870,6 +870,10 @@ export class Session {
   /// A step or handover has given this tab the keys for `epoch`.
   keysAdopted(epoch: number): void {
     this.socket.adoptEpoch(epoch);
+    // A step does not end a vote, but a commit this tab sent before it names
+    // an epoch the room has left, and is built again (amendment K). Called
+    // from inside the task that applied the step, so it is only queued.
+    void this.evict?.stepped();
     if (this.syncDeferred && !this.socket.isAwaitingKeys) {
       this.syncDeferred = false;
       this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());

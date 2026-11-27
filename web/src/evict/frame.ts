@@ -21,7 +21,10 @@ const EMPTY = new Uint8Array(0);
 
 export interface EvictRequest {
   id: Uint8Array;
-  epoch: number;
+  /// The room's root epoch when the request was made: what every vote on it
+  /// signs. A member takes a request only at its own keyring's root. On the
+  /// wire it is the map's "epoch" key.
+  root: number;
   /// Null for a link change.
   target: Uint8Array | null;
   /// The target's signing key as the proposer's roster shows it.
@@ -106,7 +109,7 @@ function requestShape(r: EvictRequest) {
   return {
     type: "EVICT_REQUEST",
     id: r.id,
-    epoch: r.epoch,
+    epoch: r.root,
     target: r.target ?? ZERO_PEER,
     targetKey: r.targetKey ?? EMPTY,
     verifier: r.verifier,
@@ -135,7 +138,7 @@ export function decodeRequest(bytes: Uint8Array): EvictRequest | null {
   if (target ? keyLen !== 32 && keyLen !== 65 : keyLen !== 0) return null;
   const r: EvictRequest = {
     id: o.id,
-    epoch: o.epoch,
+    root: o.epoch,
     target,
     targetKey: target ? o.targetKey : null,
     verifier: o.verifier,

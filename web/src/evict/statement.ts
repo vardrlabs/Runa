@@ -4,10 +4,13 @@ import { canonicalRosterBytes, type RosterEntry } from "../shred/roster";
 /// The fixed statement each vote to remove someone or change the link signs
 /// (PROTOCOL.md amendment K). The server checks these signatures itself, so
 /// the layout is binary and fixed rather than CBOR:
-/// `"runa/v1/evict" || room_id || request_id || epoch (u32 BE) || target
-/// || target key digest || voter || verifier`. The digest is SHA-256 of the
-/// target's signing key (`keyDigest`); the server knows the target's other
-/// connections by it. A link change names neither, and both are all zero.
+/// `"runa/v1/evict" || room_id || request_id || root (u32 BE) || target
+/// || target key digest || voter || verifier`. The u32 is the room's root
+/// epoch when the request was made: it moves only on a re-root, so a vote
+/// survives the room's ordinary key steps and is never good after a re-root.
+/// The digest is SHA-256 of the target's signing key (`keyDigest`); the
+/// server knows the target's other connections by it. A link change names
+/// neither, and both are all zero.
 export const EVICT_DOMAIN = new TextEncoder().encode("runa/v1/evict");
 export const ZERO_PEER = new Uint8Array(16);
 export const ZERO_KEY_DIGEST = new Uint8Array(32);
@@ -18,7 +21,7 @@ const VERIFIER_LEN = 32;
 export function voteStatement(
   roomId: Uint8Array,
   requestId: Uint8Array,
-  epoch: number,
+  root: number,
   target: Uint8Array | null,
   targetKeyDigest: Uint8Array | null,
   voter: Uint8Array,
@@ -33,10 +36,10 @@ export function voteStatement(
     throw new Error("a key digest is 32 bytes, not all zero");
   }
   if (newVerifier.length !== VERIFIER_LEN) throw new Error("a verifier is 32 bytes");
-  if (!Number.isInteger(epoch) || epoch < 0 || epoch > 0xffffffff) throw new Error("an epoch is a u32");
-  const e = new Uint8Array(4);
-  new DataView(e.buffer).setUint32(0, epoch, false);
-  return concatBytes(EVICT_DOMAIN, roomId, requestId, e, target ?? ZERO_PEER, targetKeyDigest ?? ZERO_KEY_DIGEST, voter, newVerifier);
+  if (!Number.isInteger(root) || root < 0 || root > 0xffffffff) throw new Error("a root epoch is a u32");
+  const r = new Uint8Array(4);
+  new DataView(r.buffer).setUint32(0, root, false);
+  return concatBytes(EVICT_DOMAIN, roomId, requestId, r, target ?? ZERO_PEER, targetKeyDigest ?? ZERO_KEY_DIGEST, voter, newVerifier);
 }
 
 /// SHA-256 of a signing key's raw bytes (32 for Ed25519, the 65-byte

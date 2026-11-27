@@ -107,8 +107,8 @@ function failText(reason: string | undefined, way: WayKind | undefined): string 
       return "The person who asked left before the vote finished. Nothing changed.";
     case "voter-left":
       return "Someone left before the vote finished. Nothing changed.";
-    case "epoch-moved":
-      return "The room's key changed during the vote. Nothing changed, and you can ask again.";
+    case "root-moved":
+      return `Another request changed the room's ${wayWord(way)} during the vote, so this one ended. You can ask again.`;
     case "no-echo":
     case "no-commit":
       return "The server did not take the change, so nothing changed.";
@@ -154,8 +154,8 @@ export function ignoredText(reason: string, way?: WayKind): string {
   switch (reason) {
     case "busy":
       return `${request}, because another one is already open.`;
-    case "wrong-epoch":
-      return `${request}, because it was made before the room's key last changed.`;
+    case "wrong-root":
+      return `${request}, because it was not made under the room's current ${word}.`;
     case "roster-mismatch":
       return `${request}, because it was made with a different list of people than this tab sees.`;
     case "unknown-proposer":

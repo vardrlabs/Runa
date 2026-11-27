@@ -18,7 +18,7 @@ interface Room {
   people: Person[];
   roster: RosterEntry[];
   clock: { now: number };
-  epoch: { value: number };
+  root: { value: number };
 }
 
 async function makeRoom(n: number): Promise<Room> {
@@ -28,7 +28,7 @@ async function makeRoom(n: number): Promise<Room> {
     const id = new Uint8Array(16).fill(i + 1);
     people.push({ id, identity, entry: { peerId: id, pubkey: identity.publicKeyRaw, joinedAtSeq: i + 1 } });
   }
-  return { people, roster: people.map((p) => p.entry), clock: { now: 1_000_000 }, epoch: { value: 0 } };
+  return { people, roster: people.map((p) => p.entry), clock: { now: 1_000_000 }, root: { value: 0 } };
 }
 
 function machineFor(room: Room, me: Person): EvictMachine {
@@ -38,19 +38,19 @@ function machineFor(room: Room, me: Person): EvictMachine {
     myKey: () => me.identity.publicKeyRaw,
     members: () => room.roster,
     now: () => room.clock.now,
-    epoch: () => room.epoch.value,
+    root: () => room.root.value,
   });
 }
 
 const VERIFIER = new Uint8Array(32).fill(0x44);
 
-type Signed = { id: Uint8Array; epoch: number; target: Uint8Array | null; targetKey: Uint8Array | null; verifier: Uint8Array };
+type Signed = { id: Uint8Array; root: number; target: Uint8Array | null; targetKey: Uint8Array | null; verifier: Uint8Array };
 
 /// A signature over the statement, which names the target's key by its
 /// SHA-256, as every member computes it from the request's `targetKey`.
 async function sign(p: Person, req: Signed): Promise<Uint8Array> {
   const digest = req.target && req.targetKey ? await keyDigest(req.targetKey) : null;
-  return signPayload(p.identity, voteStatement(ROOM, req.id, req.epoch, req.target, digest, p.id, req.verifier));
+  return signPayload(p.identity, voteStatement(ROOM, req.id, req.root, req.target, digest, p.id, req.verifier));
 }
 
 /// The digest `start` is handed by the member who made the request.
@@ -59,15 +59,15 @@ const digestOf = (req: EvictRequest): Promise<Uint8Array | null> =>
 
 async function requestBy(room: Room, proposer: Person, target: Person | null, over: Partial<EvictRequest> = {}): Promise<EvictRequest> {
   // The signature covers the statement fields, overrides included, so a test
-  // that changes the id or the epoch still sends a request signed for it.
+  // that changes the id or the root still sends a request signed for it.
   const base: Signed = {
     id: new Uint8Array(16).fill(0x77),
-    epoch: room.epoch.value,
+    root: room.root.value,
     target: target?.id ?? null,
     targetKey: target?.identity.publicKeyRaw ?? null,
     verifier: VERIFIER,
     ...(over.id ? { id: over.id } : {}),
-    ...(over.epoch !== undefined ? { epoch: over.epoch } : {}),
+    ...(over.root !== undefined ? { root: over.root } : {}),
     ...(over.target !== undefined ? { target: over.target } : {}),
     ...(over.targetKey !== undefined ? { targetKey: over.targetKey } : {}),
   };
@@ -178,10 +178,10 @@ describe("the evict machine fails closed (amendment K)", () => {
     expect(await machineFor(room, b).onRequest(req, a.id)).toBe("roster-mismatch");
   });
 
-  it("refuses a request at another epoch, under another policy, or with a bad signature", async () => {
+  it("refuses a request naming another root, under another policy, or with a bad signature", async () => {
     const room = await makeRoom(3);
     const [a, b, t] = room.people;
-    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { epoch: 1 }), a.id)).toBe("wrong-epoch");
+    expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { root: 1 }), a.id)).toBe("wrong-root");
     expect(await machineFor(room, b).onRequest(await requestBy(room, a, t, { policy: "MAJORITY" }), a.id)).toBe("policy-not-permitted");
     // Signed by t, delivered as if from a: a's key does not verify it.
     const signedByT = await requestBy(room, t, t);
@@ -231,13 +231,13 @@ describe("the evict machine fails closed (amendment K)", () => {
     expect(m2.tick(room.clock.now)).toEqual({ state: "FAILED", reason: "no-commit" });
   });
 
-  it("fails when the room's epoch moves during the vote", async () => {
+  it("fails when the room's root moves during the vote", async () => {
     const room = await makeRoom(3);
     const [a, b, t] = room.people;
     const m = machineFor(room, b);
     await m.onRequest(await requestBy(room, a, t), a.id);
-    room.epoch.value = 1;
-    expect(m.tick(room.clock.now)).toEqual({ state: "FAILED", reason: "epoch-moved" });
+    room.root.value = 1;
+    expect(m.tick(room.clock.now)).toEqual({ state: "FAILED", reason: "root-moved" });
   });
 
   it("fails closed when the proposer or a needed voter leaves", async () => {
@@ -294,7 +294,7 @@ describe("the evict machine fails closed (amendment K)", () => {
     // A proposer cannot name a connection that holds its own key.
     const selfGhost: RosterEntry = { peerId: new Uint8Array(16).fill(0xcc), pubkey: a.identity.publicKeyRaw, joinedAtSeq: 10 };
     room.roster = [...room.roster, selfGhost];
-    const base = { id: new Uint8Array(16).fill(0x78), epoch: 0, target: selfGhost.peerId, targetKey: a.identity.publicKeyRaw, verifier: VERIFIER };
+    const base = { id: new Uint8Array(16).fill(0x78), root: 0, target: selfGhost.peerId, targetKey: a.identity.publicKeyRaw, verifier: VERIFIER };
     const named: EvictRequest = {
       ...base,
       roster: await rosterDigest(room.roster),
@@ -453,7 +453,7 @@ describe("requests that cannot be read", () => {
       myKey: () => b.identity.publicKeyRaw,
       members: () => room.roster,
       now: () => room.clock.now,
-      epoch: () => room.epoch.value,
+      root: () => room.root.value,
       statement: () => {
         throw new Error("cannot build");
       },
@@ -513,8 +513,8 @@ describe("checking a commit against the policy", () => {
     // A digest that is not the key its roster shows for the named target.
     const otherKey = { ...st, targetKeyDigest: await keyDigest(c.identity.publicKeyRaw) };
     const signedOther = [
-      { voter: a.id, sig: await signPayload(a.identity, voteStatement(ROOM, req.id, req.epoch, req.target, otherKey.targetKeyDigest, a.id, req.verifier)) },
-      { voter: b.id, sig: await signPayload(b.identity, voteStatement(ROOM, req.id, req.epoch, req.target, otherKey.targetKeyDigest, b.id, req.verifier)) },
+      { voter: a.id, sig: await signPayload(a.identity, voteStatement(ROOM, req.id, req.root, req.target, otherKey.targetKeyDigest, a.id, req.verifier)) },
+      { voter: b.id, sig: await signPayload(b.identity, voteStatement(ROOM, req.id, req.root, req.target, otherKey.targetKeyDigest, b.id, req.verifier)) },
     ];
     expect(await m.commitSatisfies({ ...otherKey, votes: signedOther })).toBe(false);
   });
@@ -636,7 +636,7 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
     expect(await m.commitSatisfies({ ...(await requestStatement(theirs)), votes: votes.slice(0, 1) })).toBe(false);
   });
 
-  it("never opens the same request id twice in one epoch, and forgets the ids when the epoch moves", async () => {
+  it("never opens the same request id twice under one root, and forgets the ids when the root moves", async () => {
     const room = await makeRoom(3);
     const [a, b, t] = room.people;
     const m = machineFor(room, b);
@@ -645,8 +645,8 @@ describe("a commit for a request this member saw (fix wave 1, A2)", () => {
     m.rejectOwn();
     expect(await m.onRequest(r1, a.id)).toBe("busy");
     expect(m.state).toBe("REJECTED");
-    room.epoch.value = 1;
-    expect(await m.onRequest(await requestBy(room, a, t, { epoch: 1 }), a.id)).toBeNull();
+    room.root.value = 1;
+    expect(await m.onRequest(await requestBy(room, a, t, { root: 1 }), a.id)).toBeNull();
   });
 });
 

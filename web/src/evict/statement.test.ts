@@ -19,7 +19,7 @@ const P256_PUB = "041f140146bfb1b251f84f4ddbe0d4cdcfd77afd984a9520e35794021f8312
 const P256_PUB_DIGEST = "f6140efc538823718229c03b61bdac222543e69b5d0cba12d9dcf917284fa5a6";
 
 describe("the vote statement", () => {
-  it("is the fixed layout amendment K gives", () => {
+  it("is the fixed layout amendment K gives, its u32 the room's root epoch", () => {
     const s = voteStatement(
       seq(0xb0, 16), seq(0x60, 16), 7, new Uint8Array(16).fill(0x33), h(TARGET_KEY_DIGEST), new Uint8Array(16).fill(0x11), seq(0x80, 32),
     );

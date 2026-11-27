@@ -1,7 +1,7 @@
 import * as cbor2 from "cbor2";
 import { describe, expect, it } from "vitest";
 import { decryptWithExplicitNonce, encryptWithExplicitNonce } from "../crypto/aead";
-import { deriveChainKey } from "../crypto/epoch";
+import { deriveChainKey, stepKeys } from "../crypto/epoch";
 import { generateIdentity, signPayload, type Identity } from "../crypto/identity";
 import { generateKx, sealWrap, wrapKey, type KxPair } from "../crypto/kx";
 import type { MemberView } from "../epoch/coordinator";
@@ -12,6 +12,7 @@ import {
   COMMIT_ECHO_MS,
   EARLY_HOLD_MS,
   EvictCoordinator,
+  MAX_COMMIT_RESENDS,
   MAX_EARLY_IDS,
   type EvictPrompt,
   type ReRooted,
@@ -65,11 +66,38 @@ class Hub {
     return true;
   }
 
+  /// How many commits a key step overtakes at the server: the step is taken
+  /// first, so the commit names an epoch the room has left and is dropped.
+  raceSteps = 0;
+
   commit(from: Peer, h: Uint8Array, body: Uint8Array): boolean {
     this.captured.push({ from, h, body });
+    if (this.raceSteps > 0) {
+      this.raceSteps -= 1;
+      this.step();
+    }
     if (this.dropCommits) return true;
     this.deliver(from, h, body);
     return true;
+  }
+
+  /// A key step the server takes and relays to every peer, as amendment J's
+  /// steps are: each applies it on its own queue, then is told, as the
+  /// session tells its evict coordinator.
+  step(): void {
+    const to = this.epoch + 1;
+    this.epoch = to;
+    const secret = crypto.getRandomValues(new Uint8Array(32));
+    for (const p of this.peers) {
+      this.pending.push(
+        p
+          .exclusive(async () => {
+            const next = await stepKeys(p.keyring.current, secret);
+            if (!(await p.keyring.applyStep(to, secret, next.confirm))) throw new Error("step refused");
+          })
+          .then(() => (p.ev as unknown as { stepped?: () => Promise<void> }).stepped?.()),
+      );
+    }
   }
 
   deliver(from: Peer, h: Uint8Array, body: Uint8Array): void {
@@ -694,7 +722,7 @@ describe("EvictCoordinator (amendment K)", () => {
     // The request as signed, with only its policy changed, built in the
     // frame's own layout since encodeRequest refuses to write it.
     const majority = cbor2.encode({
-      type: "EVICT_REQUEST", id: req.id, epoch: req.epoch, target: req.target, targetKey: req.targetKey,
+      type: "EVICT_REQUEST", id: req.id, epoch: req.root, target: req.target, targetKey: req.targetKey,
       verifier: req.verifier, roster: req.roster, policy: "MAJORITY", deadline: req.deadline, sig: req.sig,
     });
     await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, majority);
@@ -1198,10 +1226,10 @@ describe("checks that a test pins (fix wave 1, B9)", () => {
 async function forgeCommit(from: Peer, req: EvictRequest, way: WayIn, votes: { voter: Uint8Array; sig: Uint8Array }[], wrapFor: Peer[]) {
   const keys = await deriveReRoot(keep(way));
   const config = await encryptRoomConfig(keys.contentKey, from.config.ttl, from.config.ceilingOptout, from.config.level);
-  const h = header(FT.EVICT_COMMIT, req.epoch);
+  const h = header(FT.EVICT_COMMIT, req.root);
   const wraps = [];
   for (const p of wrapFor) {
-    const key = await wrapKey(from.kx, p.kx.publicKeyRaw, ROOM, req.epoch + 1, from.id, p.id);
+    const key = await wrapKey(from.kx, p.kx.publicKeyRaw, ROOM, req.root + 1, from.id, p.id);
     wraps.push({ p: p.id, ...(await sealWrap(key, h, encodeWayIn(way))) });
   }
   const body = await encodeCommit(
@@ -1215,7 +1243,7 @@ async function forgeCommit(from: Peer, req: EvictRequest, way: WayIn, votes: { v
       config,
       votes,
     },
-    { root: req.epoch + 1, sender: from.id, confirm: keys.confirm, wraps },
+    { root: req.root + 1, sender: from.id, confirm: keys.confirm, wraps },
     from.identity,
   );
   return { h, body };
@@ -1225,7 +1253,7 @@ async function forgeCommit(from: Peer, req: EvictRequest, way: WayIn, votes: { v
 const junkRequest = (): Uint8Array =>
   encodeRequest({
     id: crypto.getRandomValues(new Uint8Array(16)),
-    epoch: 0,
+    root: 0,
     target: null,
     targetKey: null,
     verifier: crypto.getRandomValues(new Uint8Array(32)),
@@ -1488,7 +1516,7 @@ describe("a member only follows a re-root from a roster that lists itself under 
       ({ a, b, c, t }) => [a.view(), { ...b.view(), pubkey: forger.publicKeyRaw }, c.view(), t.view()],
       async ({ a, b, c, req, cSig }) => {
         const digest = await keyDigest(req.targetKey!);
-        const forged = await signPayload(forger, voteStatement(ROOM, req.id, req.epoch, req.target, digest, b.id, req.verifier));
+        const forged = await signPayload(forger, voteStatement(ROOM, req.id, req.root, req.target, digest, b.id, req.verifier));
         return [
           { voter: a.id, sig: req.sig },
           { voter: b.id, sig: forged },
@@ -1535,5 +1563,200 @@ describe("a member only follows a re-root from a roster that lists itself under 
     expect(b.leftOut).toBe(1);
     expect(b.keyring.rootEpoch).toBe(0);
     expect(b.keyring.current.epoch).toBe(0);
+  });
+});
+
+describe("a key step during a vote does not end it (amendment K, votes bind the root)", () => {
+  it("completes a vote with a step applied in the middle of it, and everyone follows the commit", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, c] = peers;
+    expect(await a.ev.propose(c.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    hub.step();
+    await hub.flush();
+    for (const p of [a, b]) {
+      expect(p.keyring.current.epoch).toBe(1);
+      expect(p.ev.isOpen()).toBe(true);
+      expect(p.states).not.toContain("FAILED");
+    }
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    // The commit went under the epoch the step reached, and names the root above it.
+    expect(new DataView(hub.captured[0].h.buffer, hub.captured[0].h.byteOffset).getUint32(20, false)).toBe(1);
+    expect(decodeCommit(hub.captured[0].body)!.tail.root).toBe(2);
+    expect(hub.epoch).toBe(2);
+    expect(c.removed).toBe(true);
+    for (const p of [a, b]) {
+      expect(p.keyring.rootEpoch).toBe(2);
+      expect(p.applied).toHaveLength(1);
+      expect(p.states.at(-1)).toBe("DONE");
+      expect(p.refusals).toEqual([]);
+    }
+    expect(await sameKey(a.keyring.keyFor(2)!, b.keyring.keyFor(2)!)).toBe(true);
+  });
+
+  it("does not ask a member that approved before the step to vote again", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    hub.step();
+    await hub.flush();
+    // b's approval still counts, and b is not asked again.
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.sent.filter((x) => x.from === b && x.ft === FT.EVICT_VOTE)).toHaveLength(1);
+    expect(b.prompts).toHaveLength(1);
+    expect(hub.epoch).toBe(1);
+    await c.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.epoch).toBe(2);
+    for (const p of [a, b, c]) {
+      expect(p.keyring.rootEpoch).toBe(2);
+      expect(p.states.at(-1)).toBe("DONE");
+    }
+  });
+
+  it("builds its commit again for the new epoch when a step overtakes it, and everyone applies it", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    hub.raceSteps = 1;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await c.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.captured).toHaveLength(2);
+    const [first, again] = hub.captured.map((x) => ({ h: x.h, dec: decodeCommit(x.body)! }));
+    const epochOf = (h: Uint8Array) => new DataView(h.buffer, h.byteOffset).getUint32(20, false);
+    expect(epochOf(first.h)).toBe(0);
+    expect(first.dec.tail.root).toBe(1);
+    expect(epochOf(again.h)).toBe(1);
+    expect(again.dec.tail.root).toBe(2);
+    // The same votes, which name the root; new wraps, sealed for the new header.
+    expect(again.dec.clear.votes).toEqual(first.dec.clear.votes);
+    expect(again.dec.tail.wraps.map((w) => hexOf(w.ct))).not.toEqual(first.dec.tail.wraps.map((w) => hexOf(w.ct)));
+    expect(hub.epoch).toBe(2);
+    expect(t.removed).toBe(true);
+    for (const p of [a, b, c]) {
+      expect(p.keyring.rootEpoch).toBe(2);
+      expect(p.applied).toHaveLength(1);
+      expect(p.states.at(-1)).toBe("DONE");
+      expect(p.refusals).toEqual([]);
+    }
+    expect(await sameKey(a.keyring.keyFor(2)!, c.keyring.keyFor(2)!)).toBe(true);
+  });
+
+  it(`sends it again at most ${MAX_COMMIT_RESENDS} times, then gives up 10 seconds after the first send`, async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    const way = newLinkWayIn();
+    hub.raceSteps = MAX_COMMIT_RESENDS + 1;
+    expect(await a.ev.propose(t.view(), way)).toBeNull();
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.captured).toHaveLength(MAX_COMMIT_RESENDS + 1);
+    expect(hub.epoch).toBe(MAX_COMMIT_RESENDS + 1);
+    // A further tick sends nothing more.
+    await a.ev.tick();
+    expect(hub.captured).toHaveLength(MAX_COMMIT_RESENDS + 1);
+    hub.now += COMMIT_ECHO_MS - 1;
+    await a.ev.tick();
+    expect(a.states.at(-1)).toBe("APPROVED");
+    hub.now += 1;
+    await a.ev.tick();
+    expect(a.states.at(-1)).toBe("FAILED");
+    for (const p of [a, b, t]) expect(p.keyring.rootEpoch).toBe(0);
+    hub.now += COMMIT_WAIT_MS;
+    await a.ev.tick();
+    expect(way.secret.every((x) => x === 0)).toBe(true);
+  });
+
+  it("measures the give-up from the first send, not from a commit built again", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    hub.dropCommits = true;
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    await hub.flush();
+    await b.ev.vote("APPROVE");
+    await hub.flush();
+    expect(hub.captured).toHaveLength(1);
+    hub.now += 6_000;
+    hub.step();
+    await hub.flush();
+    expect(hub.captured).toHaveLength(2);
+    hub.now += COMMIT_ECHO_MS - 6_000 - 1;
+    await a.ev.tick();
+    expect(a.states.at(-1)).toBe("APPROVED");
+    hub.now += 1;
+    await a.ev.tick();
+    expect(a.states.at(-1)).toBe("FAILED");
+  });
+
+  it("refuses votes naming the old root once the room has re-rooted", async () => {
+    const { hub, peers } = await room(4);
+    const [a, b, c, t] = peers;
+    const held = holdFrames(hub);
+    const way = newLinkWayIn();
+    const copy = keep(way);
+    expect(await a.ev.propose(t.view(), way)).toBeNull();
+    const req = decodeRequest(held[0].pt)!;
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    await b.ev.vote("APPROVE");
+    const bVote = decodeVote(held[1].pt)!;
+    // c's tab re-roots to 1 some other way, then a commit at its epoch comes
+    // carrying votes that name root 0.
+    const { content, chain } = await rootKeys();
+    expect(await c.keyring.reroot(1, content, chain)).not.toBeNull();
+    const keys = await deriveReRoot(keep(copy));
+    const config = await encryptRoomConfig(keys.contentKey, a.config.ttl, a.config.ceilingOptout, a.config.level);
+    const h = header(FT.EVICT_COMMIT, 1);
+    const wk = await wrapKey(a.kx, c.kx.publicKeyRaw, ROOM, 2, a.id, c.id);
+    const body = await encodeCommit(
+      h,
+      {
+        requestId: req.id,
+        target: req.target,
+        targetKeyDigest: await keyDigest(req.targetKey!),
+        verifier: req.verifier,
+        salt: copy.salt,
+        config,
+        votes: [
+          { voter: a.id, sig: req.sig },
+          { voter: b.id, sig: bVote.sig! },
+        ],
+      },
+      { root: 2, sender: a.id, confirm: keys.confirm, wraps: [{ p: c.id, ...(await sealWrap(wk, h, encodeWayIn(copy))) }] },
+      a.identity,
+    );
+    await c.ev.receiveCommit(h, 1, a.id, body);
+    expect(c.refusals).toEqual(["commit-policy"]);
+    expect(c.leftOut).toBe(0);
+    expect(c.applied).toHaveLength(0);
+    expect(c.keyring.rootEpoch).toBe(1);
+  });
+
+  it("takes a request naming its own root after a step, and refuses one naming another root", async () => {
+    const { hub, peers } = await room(3);
+    const [a, b, t] = peers;
+    hub.step();
+    await hub.flush();
+    const held = holdFrames(hub);
+    expect(await a.ev.propose(t.view(), newLinkWayIn())).toBeNull();
+    const req = decodeRequest(held[0].pt)!;
+    expect(req.root).toBe(0);
+    // The same request, signed by a, naming root 1, which nobody holds.
+    const digest = await keyDigest(req.targetKey!);
+    const other = { ...req, id: new Uint8Array(16).fill(0x5a), root: 1 };
+    other.sig = await signPayload(a.identity, voteStatement(ROOM, other.id, 1, other.target, digest, a.id, other.verifier));
+    await b.ev.receiveFrame(FT.EVICT_REQUEST, a.id, encodeRequest(other));
+    expect(b.refusals).toEqual(["wrong-root"]);
+    expect(b.prompts).toHaveLength(0);
+    await b.ev.receiveFrame(held[0].ft, a.id, held[0].pt);
+    expect(b.prompts).toHaveLength(1);
+    expect(b.refusals).toEqual(["wrong-root"]);
   });
 });

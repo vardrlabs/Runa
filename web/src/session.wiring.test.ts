@@ -288,6 +288,13 @@ describe("Session.create wiring: eviction frames and votes", () => {
     await waitFor(() => expect(socket.epochKeys).toHaveLength(1));
   });
 
+  it("has the evict coordinator look at a commit it sent again whenever a key step is adopted", async () => {
+    const { session } = await joined();
+    const stepped = vi.spyOn(session.evict, "stepped");
+    session.keysAdopted(1);
+    expect(stepped).toHaveBeenCalledTimes(1);
+  });
+
   it("says in a shared room that its passphrase changed when the tab was left out", async () => {
     const { seen, evictDeps } = await joined({ wayKind: "pass" });
     evictDeps.leftOut();
@@ -322,7 +329,7 @@ describe("Session.create wiring: a tab left out of a re-root (amendment K)", () 
 
   it("tells the page on a FAILED left-out alone, and not for any other failure", async () => {
     const { seen, evictDeps } = await joined();
-    evictDeps.state("FAILED", "epoch-moved");
+    evictDeps.state("FAILED", "root-moved");
     expect(seen.leftOut).toBe(0);
     evictDeps.state("FAILED", "left-out");
     expect(seen.leftOut).toBe(1);

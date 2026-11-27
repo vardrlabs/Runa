@@ -14,7 +14,7 @@ import {
 const FAIL_REASONS = [
   "proposer-left",
   "voter-left",
-  "epoch-moved",
+  "root-moved",
   "no-echo",
   "no-commit",
   "left-out",
@@ -83,7 +83,7 @@ const IGNORED_REASONS = [
   "malformed",
   "busy",
   "policy-not-permitted",
-  "wrong-epoch",
+  "wrong-root",
   "unknown-proposer",
   "proposer-is-target",
   "unknown-target",
@@ -132,6 +132,7 @@ describe("the words a person reads (fix wave 1)", () => {
       voteBody("TIN-HARBOUR", null, "pass"),
       voteBody("TIN-HARBOUR", "COPPER-LANTERN", "pass"),
       evictStateText("FAILED", "left-out", "pass"),
+      evictStateText("FAILED", "root-moved", "pass"),
       proposeErrorText("target-gone", "pass"),
       ...IGNORED_REASONS.map((r) => ignoredText(r, "pass")),
     ];

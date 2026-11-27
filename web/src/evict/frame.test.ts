@@ -28,7 +28,7 @@ const header = (epoch: number) =>
 function request(over: Partial<EvictRequest> = {}): EvictRequest {
   return {
     id: new Uint8Array(16).fill(1),
-    epoch: 3,
+    root: 3,
     target: new Uint8Array(16).fill(2),
     targetKey: new Uint8Array(32).fill(3),
     verifier: new Uint8Array(32).fill(4),
@@ -87,7 +87,7 @@ describe("EVICT_REQUEST", () => {
     for (const policy of ["INITIATOR", "MAJORITY", "THRESHOLD"]) {
       const r = request();
       const raw = cbor2.encode({
-        type: "EVICT_REQUEST", id: r.id, epoch: r.epoch, target: r.target, targetKey: r.targetKey,
+        type: "EVICT_REQUEST", id: r.id, epoch: r.root, target: r.target, targetKey: r.targetKey,
         verifier: r.verifier, roster: r.roster, policy, deadline: r.deadline, sig: r.sig,
       });
       expect(decodeRequest(raw)).toBeNull();
@@ -104,7 +104,7 @@ describe("EVICT_REQUEST", () => {
   it("refuses a map with its keys in another order", () => {
     const r = request();
     const reordered = cbor2.encode({
-      id: r.id, type: "EVICT_REQUEST", epoch: r.epoch, target: r.target, targetKey: r.targetKey,
+      id: r.id, type: "EVICT_REQUEST", epoch: r.root, target: r.target, targetKey: r.targetKey,
       verifier: r.verifier, roster: r.roster, policy: r.policy, deadline: r.deadline, sig: r.sig,
     });
     expect(decodeRequest(reordered)).toBeNull();

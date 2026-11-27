@@ -7,8 +7,9 @@ import { bytesEqual as eq, hexOf, keyDigest, rosterDigest, voteStatement } from 
 /// The vote to remove someone or change the link (PROTOCOL.md amendment K).
 /// UNANIMOUS among everyone in the roster frozen at the request, the target
 /// left out; any refusal ends it, and so do the deadline, a member it needs
-/// leaving, and the room's epoch moving. No timers and no I/O: the caller
-/// supplies the clock and calls `tick`.
+/// leaving, and the room's root moving. Every vote names the root, not the
+/// epoch, so an ordinary key step does not end it. No timers and no I/O: the
+/// caller supplies the clock and calls `tick`.
 
 export type EvictState = "IDLE" | "VOTING" | "APPROVED" | "REJECTED" | "EXPIRED" | "CANCELLED" | "FAILED" | "DONE";
 
@@ -16,7 +17,7 @@ export type Guard =
   | "busy"
   | "malformed"
   | "policy-not-permitted"
-  | "wrong-epoch"
+  | "wrong-root"
   | "unknown-proposer"
   | "proposer-is-target"
   | "unknown-target"
@@ -37,7 +38,7 @@ export type LeaveReason = "proposer-left" | "voter-left";
 /// How long members wait for the commit once every approval is in.
 export const COMMIT_WAIT_MS = 15_000;
 
-/// How many request ids one member remembers in one epoch. Past it one is let
+/// How many request ids one member remembers under one root. Past it one is let
 /// go: a refused id before a settled proposal, the oldest first, and never the
 /// proposal this member holds now. The record is best effort: a commit for an
 /// id it has let go of is checked as one this member never saw, and is never
@@ -50,7 +51,8 @@ export const MAX_SEEN_REQUESTS = 64;
 /// signing key, so the server knows every connection holding it.
 export interface Statement {
   id: Uint8Array;
-  epoch: number;
+  /// The room's root epoch the votes name.
+  root: number;
   target: Uint8Array | null;
   targetKeyDigest: Uint8Array | null;
   verifier: Uint8Array;
@@ -60,7 +62,7 @@ export interface Statement {
 /// a vote signs its digest.
 export async function requestStatement(req: EvictRequest): Promise<Statement> {
   const targetKeyDigest = req.target && req.targetKey ? await keyDigest(req.targetKey) : null;
-  return { id: req.id, epoch: req.epoch, target: req.target, targetKeyDigest, verifier: req.verifier };
+  return { id: req.id, root: req.root, target: req.target, targetKeyDigest, verifier: req.verifier };
 }
 
 export interface MachineDeps {
@@ -74,8 +76,9 @@ export interface MachineDeps {
   /// The roster, this member included.
   members(): RosterEntry[];
   now(): number;
-  /// The epoch this member's keyring is at.
-  epoch(): number;
+  /// The root epoch of this member's keyring: the epoch of its link or
+  /// passphrase, or of the last re-root.
+  root(): number;
   statement?(s: Statement, voter: Uint8Array): Uint8Array;
 }
 
@@ -104,23 +107,23 @@ export class EvictMachine {
   private p: Proposal | null = null;
   /// Approvals by voter (hex), with their signatures, for the commit.
   private approvals = new Map<string, Uint8Array>();
-  /// Request ids this member received or made in the current epoch, with the
-  /// proposal it froze, or null for one it refused. A commit for a proposal
-  /// here is judged against it, even after a newer request replaced it; a
-  /// commit for any other id is one this member cannot place, and it never
-  /// applies one of those. Bounded by `MAX_SEEN_REQUESTS` and emptied when the
-  /// epoch moves. It lives here, not in the coordinator, because
-  /// `commitSatisfies` is what decides which set a commit is held to, and
-  /// `open` is the one place a proposal is frozen.
-  private seenEpoch = -1;
+  /// Request ids this member received or made under the current root, with
+  /// the proposal it froze, or null for one it refused. A commit for a
+  /// proposal here is judged against it, even after a newer request replaced
+  /// it; a commit for any other id is one this member cannot place, and it
+  /// never applies one of those. Bounded by `MAX_SEEN_REQUESTS` and emptied
+  /// when the root moves; a key step leaves it as it is. It lives here, not in
+  /// the coordinator, because `commitSatisfies` is what decides which set a
+  /// commit is held to, and `open` is the one place a proposal is frozen.
+  private seenRoot = -1;
   private seenIds = new Map<string, Proposal | null>();
 
   constructor(private d: MachineDeps) {}
 
   private seenTable(): Map<string, Proposal | null> {
-    const epoch = this.d.epoch();
-    if (epoch !== this.seenEpoch) {
-      this.seenEpoch = epoch;
+    const root = this.d.root();
+    if (root !== this.seenRoot) {
+      this.seenRoot = root;
       this.seenIds.clear();
     }
     return this.seenIds;
@@ -149,14 +152,14 @@ export class EvictMachine {
     if (victim !== null) table.delete(victim);
   }
 
-  /// Whether this member still holds a record of a request with this id in
-  /// the current epoch, whatever became of it.
+  /// Whether this member still holds a record of a request with this id
+  /// under the current root, whatever became of it.
   wasSeen(id: Uint8Array): boolean {
     return this.seenTable().has(hexOf(id));
   }
 
-  /// The proposal this member froze for that id in the current epoch, if it
-  /// opened one and still holds it. Only a commit for one of these is ever
+  /// The proposal this member froze for that id under the current root, if
+  /// it opened one and still holds it. Only a commit for one of these is ever
   /// applied.
   requestFor(id: Uint8Array): Proposal | null {
     return this.seenTable().get(hexOf(id)) ?? null;
@@ -165,7 +168,7 @@ export class EvictMachine {
   private statementFor(s: Statement, voter: Uint8Array): Uint8Array {
     return this.d.statement
       ? this.d.statement(s, voter)
-      : voteStatement(this.d.roomId, s.id, s.epoch, s.target, s.targetKeyDigest, voter, s.verifier);
+      : voteStatement(this.d.roomId, s.id, s.root, s.target, s.targetKeyDigest, voter, s.verifier);
   }
 
   current(): Proposal | null {
@@ -245,7 +248,7 @@ export class EvictMachine {
 
   async onRequest(req: EvictRequest, sender: Uint8Array): Promise<Guard | null> {
     this.pastDeadline();
-    // An id already received in this epoch is never opened again: a relayed
+    // An id already received under this root is never opened again: a relayed
     // copy of a request this member refused would otherwise ask it again.
     if (this.seenTable().has(hexOf(req.id))) return "busy";
     if (SETTLED.includes(this.state)) this.reset();
@@ -254,7 +257,9 @@ export class EvictMachine {
     if (this.state !== "IDLE") return "busy";
     if (req.policy !== "UNANIMOUS") return "policy-not-permitted";
     if (req.deadline <= 0 || req.deadline > MAX_DEADLINE_MS) return "malformed";
-    if (req.epoch !== this.d.epoch()) return "wrong-epoch";
+    // The request names the root it was made at, and only this member's own
+    // root is taken: a step since then changes nothing, a re-root does.
+    if (req.root !== this.d.root()) return "wrong-root";
     const roster = this.d.members();
     const proposer = roster.find((r) => eq(r.peerId, sender));
     if (!proposer?.pubkey) return "unknown-proposer";
@@ -310,6 +315,12 @@ export class EvictMachine {
     return null;
   }
 
+  /// Whether the open vote already holds an approval from this peer id. A
+  /// member that approved does not vote again, a key step since included.
+  hasApproved(peerId: Uint8Array): boolean {
+    return this.p !== null && this.approvals.has(hexOf(peerId));
+  }
+
   /// This member's own approval, once it has signed.
   recordOwn(sig: Uint8Array): void {
     const me = this.d.me();
@@ -354,9 +365,9 @@ export class EvictMachine {
     const now = this.d.now();
     const p = this.p;
     if (!p || !this.isOpen()) return null;
-    if (this.d.epoch() !== p.request.epoch) {
+    if (this.d.root() !== p.request.root) {
       this.state = "FAILED";
-      return { state: this.state, reason: "epoch-moved" };
+      return { state: this.state, reason: "root-moved" };
     }
     if (this.state === "VOTING" && now >= p.deadlineAt) {
       this.state = "EXPIRED";
@@ -381,7 +392,7 @@ export class EvictMachine {
   /// member of the roster the request froze, without the target, each with a
   /// valid signature, and nobody else; and whether it names the target's key
   /// as the request did (SHA-256 of `request.targetKey`). That holds for any
-  /// request this member opened in the current epoch, not only the one open
+  /// request this member opened under the current root, not only the one open
   /// now. For an id it cannot place (never received, refused, or let go of)
   /// it makes the checks of a member that never saw the request: the digest
   /// is that of the key its roster shows for the named target, if it is still
@@ -397,7 +408,7 @@ export class EvictMachine {
       const sameTarget = p.request.target === null ? c.target === null : c.target !== null && eq(p.request.target, c.target);
       const sameKey =
         p.targetKeyDigest === null ? c.targetKeyDigest === null : c.targetKeyDigest !== null && eq(p.targetKeyDigest, c.targetKeyDigest);
-      if (!sameTarget || !sameKey || !eq(p.request.verifier, c.verifier) || p.request.epoch !== c.epoch) return false;
+      if (!sameTarget || !sameKey || !eq(p.request.verifier, c.verifier) || p.request.root !== c.root) return false;
       set = p.policySet;
     } else {
       const me = this.d.me();
