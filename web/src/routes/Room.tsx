@@ -31,7 +31,17 @@ import { exportPdf, type ExportDensity } from "../export/paged";
 import { exportMarkdown } from "../export/markdown";
 import { TOOLBAR_ACTIONS, applyTool } from "../ui/toolbar";
 import { useLineSync } from "../ui/linesync";
-import { applyNamedSecurityLevel, applySecurityLevel, shareLink } from "../keyhandoff";
+import { applyNamedSecurityLevel, applySecurityLevel, replaceRoomKey, shareLink } from "../keyhandoff";
+import {
+  EvictModal,
+  EvictVotePrompt,
+  ReRootNotice,
+  evictInFlight,
+  type EvictCandidate,
+  type ReRootView,
+} from "../ui/EvictModal";
+import { EVICT_COPY, evictStateText, ignoredText } from "../evict/copy";
+import type { SecurityLevel } from "../security-level";
 import { plainWebSocketAllowed } from "../transport/origin";
 
 const api = new Api("");
@@ -52,6 +62,11 @@ type Phase =
   | { kind: "live"; session: Session; peerCount: number }
   | { kind: "purged" }
   | { kind: "unavailable" };
+
+/// Why a live tab can no longer take part in its room (amendment K): the room
+/// removed it, or changed its key without giving this tab the new one. Either
+/// way what the tab holds stays on screen, read-only, to read, copy or export.
+type Stranded = "removed" | "left-out";
 
 let extNoticeShown = false;
 let highestNoticeShown = false;
@@ -95,6 +110,30 @@ function JoinableRoom(props: RoomProps) {
   const [restartHandover, setRestartHandover] = useState(false);
   const [clock, setClock] = useState(() => performance.now());
   const [connRefused, setConnRefused] = useState<string | null>(null);
+  const [evictOpen, setEvictOpen] = useState<null | { relink: boolean }>(null);
+  const [evictCandidates, setEvictCandidates] = useState<EvictCandidate[]>([]);
+  const [evictState, setEvictState] = useState<{ state: string; reason?: string }>({ state: "IDLE" });
+  const [evictPrompt, setEvictPrompt] = useState<{ by: string; who: string | null } | null>(null);
+  // The new way in, held only while its notice is open: Done sets this back
+  // to null, which drops the page's last reference to the string.
+  const [reRoot, setReRoot] = useState<ReRootView | null>(null);
+  const [stranded, setStranded] = useState<Stranded | null>(null);
+  // The session's events are bound once, when it is created, so what they
+  // need to know about the page is read from refs.
+  const strandedRef = useRef<Stranded | null>(null);
+  const evictOpenRef = useRef(false);
+  // Whether this tab asked or was asked in the vote that is open, so its
+  // ending can be said when the dialog is not on screen.
+  const evictInvolvedRef = useRef(false);
+  // Whether the open vote is this tab's own request, the only one its
+  // Cancel withdraws.
+  const evictMineRef = useRef(false);
+  // The last evict state reported, as the session's events see it.
+  const evictStateRef = useRef("IDLE");
+  // The room's key as it stands: the link it was opened with, until a
+  // re-root replaces it (amendment K).
+  const fragmentRef = useRef(props.fragment);
+  const levelRef = useRef<SecurityLevel>("highest");
   const restartAnnouncedRef = useRef(false);
   const [showExtNotice, setShowExtNotice] = useState(() => !extNoticeShown);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
@@ -200,6 +239,23 @@ function JoinableRoom(props: RoomProps) {
     };
   }, []);
 
+  /// The room removed this tab, or moved on without it. The editor turns
+  /// read-only rather than going away, so its text can still be selected,
+  /// copied and exported; every dialog that would act on the room closes.
+  const strand = useCallback((why: Stranded) => {
+    if (strandedRef.current === "removed") return;
+    strandedRef.current = why;
+    setStranded(why);
+    editorRef.current?.updateOptions({ readOnly: true });
+    evictOpenRef.current = false;
+    setEvictOpen(null);
+    setEvictPrompt(null);
+    setShredOpen(false);
+    setShredPrompt(null);
+    setMenuOpen(false);
+    if (why === "removed") setReRoot(null);
+  }, []);
+
   const startSession = useCallback(
     async (args: {
       roomIdHex: string;
@@ -271,8 +327,9 @@ function JoinableRoom(props: RoomProps) {
           },
           onTtlMismatch: () => setTtlMismatch(true),
           onSecurityLevel: (level) => {
+            levelRef.current = level;
             if (props.name) applyNamedSecurityLevel(props.name, level);
-            else if (props.roomIdHex && props.fragment) applySecurityLevel(props.roomIdHex, props.fragment, level);
+            else if (props.roomIdHex && fragmentRef.current) applySecurityLevel(props.roomIdHex, fragmentRef.current, level);
             else return;
             if (level === "highest" && !highestNoticeShown) setHighestNotice(true);
           },
@@ -292,7 +349,12 @@ function JoinableRoom(props: RoomProps) {
           onKeyStatus: (m, alarming) => setKeyStatus(m ? { text: m, alarming } : null),
           onDivergence: (d) => setDiverged(d),
           onPurge: () => setPhase({ kind: "purged" }),
-          onRoomUnavailable: () => setPhase({ kind: "unavailable" }),
+          // A tab that was removed or left out keeps its document on screen;
+          // the room ending under it changes nothing it can do.
+          onRoomUnavailable: () => {
+            if (strandedRef.current) return;
+            setPhase({ kind: "unavailable" });
+          },
           onServerRestart: (inSecs, handover) => {
             restartAnnouncedRef.current = true;
             setRestartHandover(handover);
@@ -304,6 +366,65 @@ function JoinableRoom(props: RoomProps) {
             announce("The server was updated, and this room carried over.");
           },
           onConnectionRefused: (message) => setConnRefused(message),
+          onEvictPrompt: (p) => {
+            // The prompt is raised after VOTING, once the handles are worked
+            // out, so the vote may already be over by the time it arrives.
+            if (strandedRef.current === "removed" || !evictInFlight(evictStateRef.current)) return;
+            evictInvolvedRef.current = true;
+            setEvictPrompt(p);
+          },
+          // Raised once per state reached, in whatever order the vote takes:
+          // a proposer that gave up on its commit can still be let in by a
+          // late echo, which arrives as onReRooted after FAILED.
+          onEvictState: (state, reason) => {
+            evictStateRef.current = state;
+            setEvictState({ state, reason });
+            if (evictInFlight(state)) return;
+            setEvictPrompt(null);
+            if (state === "FAILED" && reason === "left-out") {
+              evictInvolvedRef.current = false;
+              evictMineRef.current = false;
+              strand("left-out");
+              return;
+            }
+            if (evictInvolvedRef.current && !evictOpenRef.current) announce(evictStateText(state, reason));
+            evictInvolvedRef.current = false;
+            evictMineRef.current = false;
+          },
+          onEvictIgnored: (reason) => announce(ignoredText(reason)),
+          onReRooted: (r) => {
+            if (strandedRef.current === "removed") return;
+            if (r.fragment && props.roomIdHex) {
+              fragmentRef.current = r.fragment;
+              replaceRoomKey(props.roomIdHex, r.fragment, levelRef.current);
+            }
+            // A tab left out of one re-root and let into a later one can
+            // take part again.
+            if (strandedRef.current === "left-out") {
+              strandedRef.current = null;
+              setStranded(null);
+              // The editor's usual options do not name readOnly, so going
+              // back to them would leave it set.
+              editorRef.current?.updateOptions({ readOnly: false });
+            }
+            if (r.fingerprint) setFingerprint(r.fingerprint);
+            setShredOpen(false);
+            setShredPrompt(null);
+            evictOpenRef.current = false;
+            evictInvolvedRef.current = false;
+            evictMineRef.current = false;
+            setEvictOpen(null);
+            setEvictPrompt(null);
+            evictStateRef.current = "IDLE";
+            setEvictState({ state: "IDLE" });
+            setReRoot({
+              link: r.fragment && props.roomIdHex ? shareLink(props.roomIdHex, r.fragment) : null,
+              passphrase: r.passphrase,
+              fingerprint: r.fingerprint,
+              removed: r.removed,
+            });
+          },
+          onRemoved: () => strand("removed"),
         },
       );
       sessionRef.current = session;
@@ -482,8 +603,8 @@ function JoinableRoom(props: RoomProps) {
     // A shared room's address is its name, which a highest-security room keeps
     // out of the address bar; its passphrase is never part of the link.
     const link =
-      props.roomIdHex && props.fragment
-        ? shareLink(props.roomIdHex, props.fragment)
+      props.roomIdHex && fragmentRef.current
+        ? shareLink(props.roomIdHex, fragmentRef.current)
         : props.name
           ? `${window.location.origin}/${props.name}`
           : window.location.href;
@@ -493,7 +614,24 @@ function JoinableRoom(props: RoomProps) {
         ? "Copied the room's address. Send the passphrase separately, never alongside it."
         : "Copied. The part after the # is the key. Send the whole thing.",
     );
-  }, [props.roomIdHex, props.fragment, props.name]);
+  }, [props.roomIdHex, props.name]);
+
+  const openEvict = useCallback(async (relink: boolean) => {
+    setMenuOpen(false);
+    if (strandedRef.current) return;
+    const candidates = (await sessionRef.current?.evictCandidates()) ?? [];
+    if (strandedRef.current) return;
+    setEvictCandidates(candidates);
+    // What an earlier vote ended in is old news; one still open is not.
+    setEvictState((s) => (evictInFlight(s.state) ? s : { state: "IDLE" }));
+    evictOpenRef.current = true;
+    setEvictOpen({ relink });
+  }, []);
+
+  const closeEvict = useCallback(() => {
+    evictOpenRef.current = false;
+    setEvictOpen(null);
+  }, []);
 
   if (phase.kind === "missing-key") return <MissingKey />;
 
@@ -554,6 +692,21 @@ function JoinableRoom(props: RoomProps) {
     );
   }
 
+  if (stranded === "removed" && phase.kind !== "live") {
+    return (
+      <main className="landing">
+        <h1 className="mono">RÚNA</h1>
+        <p className="micro-label tag">{EVICT_COPY.removedTitle}</p>
+        <div className="panel">
+          <p>{EVICT_COPY.removedBody}</p>
+          <p style={{ marginBottom: 0 }}>
+            <a href="/">← New room</a>
+          </p>
+        </div>
+      </main>
+    );
+  }
+
   if (phase.kind === "unavailable") {
     return (
       <main className="landing">
@@ -562,10 +715,10 @@ function JoinableRoom(props: RoomProps) {
         <div className="panel">
           <p>
             {restartAnnouncedRef.current && restartHandover
-              ? "The server restarted for an update, and this room could not be brought back to the new version. Rooms live only in memory — there is no copy to recover, which is the point."
+              ? "The server restarted for an update, and this room could not be brought back to the new version. Rooms live only in memory, so there is no copy to recover, which is the point."
               : restartAnnouncedRef.current
-              ? "The server restarted for an update, and this room ended with it. Rooms live only in memory — there is no copy to recover, which is the point."
-              : "It was shredded, it expired, or the server restarted. Rooms live only in memory — there is no copy to recover, which is the point."}
+              ? "The server restarted for an update, and this room ended with it. Rooms live only in memory, so there is no copy to recover, which is the point."
+              : EVICT_COPY.gone}
           </p>
           <p style={{ marginBottom: 0 }}>
             <a href="/">← New room</a>
@@ -597,7 +750,7 @@ function JoinableRoom(props: RoomProps) {
       <main className="landing">
         <h1 className="mono">RÚNA</h1>
         <div className="panel">
-          <p>Wrong passphrase, or this room no longer exists.</p>
+          <p>{EVICT_COPY.authFailed}</p>
           <a href="/">← Back</a>
         </div>
       </main>
@@ -627,7 +780,22 @@ function JoinableRoom(props: RoomProps) {
 
   return (
     <div className="room-shell">
-      {showLadderBanner && (
+      {stranded && (
+        <div className="banner" role="alert">
+          <span>
+            {stranded === "removed" && (
+              <>
+                <span className="micro-label">{EVICT_COPY.removedTitle}</span>{" "}
+                {EVICT_COPY.removedBody}{" "}
+              </>
+            )}
+            {stranded === "left-out" && <>{evictStateText("FAILED", "left-out")} </>}
+            {STRANDED_KEEP}
+          </span>
+          <button onClick={() => setExportOpen(true)}>Export</button>
+        </div>
+      )}
+      {showLadderBanner && !stranded && (
         <div className="banner" role="status">
           <span className="mono">
             {ladder.kind === "burn"
@@ -685,7 +853,7 @@ function JoinableRoom(props: RoomProps) {
           <button onClick={() => setHistoryPressure(null)}>Dismiss</button>
         </div>
       )}
-      {keyStatus && (
+      {keyStatus && !stranded && (
         <div className="banner" role={keyStatus.alarming ? "alert" : "status"}>
           <span className={keyStatus.alarming ? "error-text" : undefined}>{keyStatus.text}</span>
         </div>
@@ -753,7 +921,7 @@ function JoinableRoom(props: RoomProps) {
             happens to fill, which put Shred alone on a fourth row. */}
         <div className="statusbar-actions">
         <QuorumDial peers={[]} />
-        <button onClick={copyLink}>Copy link</button>
+        {!stranded && <button onClick={copyLink}>Copy link</button>}
         {/* Layout, Steady and Export fold behind ⋯ on a narrow screen. Copy
             link and Shred stay out because they are the two anyone reaches for
             under pressure, and burying Shred behind a menu would be the wrong
@@ -791,6 +959,7 @@ function JoinableRoom(props: RoomProps) {
                 </button>
               ))}
             </div>
+            {!stranded && (
             <button
               aria-pressed={steady}
               title="Constant-rate transmission: closes the typing-cadence channel at a bandwidth cost"
@@ -803,6 +972,7 @@ function JoinableRoom(props: RoomProps) {
               Steady
               {steady && <span className="toggle-dot" aria-hidden="true" />}
             </button>
+            )}
             <button
               onClick={() => {
                 setMenuOpen(false);
@@ -811,11 +981,19 @@ function JoinableRoom(props: RoomProps) {
             >
               Export
             </button>
+            {!stranded && (
+              <>
+                <button onClick={() => void openEvict(false)}>{EVICT_COPY.removeButton}</button>
+                <button onClick={() => void openEvict(true)}>{EVICT_COPY.relinkButton}</button>
+              </>
+            )}
           </div>
         </div>
-        <button className="danger" onClick={startShred}>
-          Shred
-        </button>
+        {!stranded && (
+          <button className="danger" onClick={startShred}>
+            Shred
+          </button>
+        )}
         </div>
       </div>
 
@@ -841,6 +1019,7 @@ function JoinableRoom(props: RoomProps) {
                 title={a.title}
                 className="mono"
                 style={{ padding: "2px 8px", fontSize: 12 }}
+                disabled={!!stranded}
                 onClick={() => editorRef.current && applyTool(editorRef.current, a)}
               >
                 {a.label}
@@ -860,7 +1039,7 @@ function JoinableRoom(props: RoomProps) {
           >
             <Editor
               defaultLanguage="markdown"
-              options={MONACO_OPTIONS}
+              options={stranded ? MONACO_READ_ONLY_OPTIONS : MONACO_OPTIONS}
               onMount={(editor) => void onEditorMount(editor)}
               theme="vs-dark"
             />
@@ -913,6 +1092,57 @@ function JoinableRoom(props: RoomProps) {
         }}
         onConfirm={confirmShred}
       />
+      {evictOpen && (
+        <EvictModal
+          candidates={evictCandidates}
+          relink={evictOpen.relink}
+          wayKind={props.name ? "pass" : "link"}
+          state={evictState.state}
+          stateReason={evictState.reason}
+          onPropose={async (target, passphrase) => {
+            const session = sessionRef.current;
+            if (!session) return "not-joined";
+            const code = await session.proposeEviction(target, passphrase);
+            // The coordinator reports VOTING before the call returns, and
+            // only one request is open at a time, so an open vote now is
+            // this one. In a room with nobody else to agree it can already
+            // be over, and then there is nothing to withdraw.
+            if (code === null && evictInFlight(evictStateRef.current)) {
+              evictInvolvedRef.current = true;
+              evictMineRef.current = true;
+            }
+            return code;
+          }}
+          onCancel={() => {
+            // Withdraws this tab's own request; a vote someone else opened
+            // carries on, and this dialog only closes.
+            if (evictMineRef.current && evictInFlight(evictState.state)) {
+              void sessionRef.current?.cancelEviction();
+            }
+            closeEvict();
+          }}
+        />
+      )}
+      {evictPrompt && (
+        <EvictVotePrompt
+          by={evictPrompt.by}
+          who={evictPrompt.who}
+          onDecide={(choice) => {
+            setEvictPrompt(null);
+            void sessionRef.current?.respondToEviction(choice);
+          }}
+        />
+      )}
+      {reRoot && (
+        <ReRootNotice
+          view={reRoot}
+          onCopy={(text) => {
+            void navigator.clipboard.writeText(text);
+            announce(reRoot.link ? EVICT_COPY.copied : EVICT_COPY.copiedPassphrase);
+          }}
+          onDone={() => setReRoot(null)}
+        />
+      )}
       {exportOpen && (
         <ExportDialog
           onClose={() => setExportOpen(false)}
@@ -1025,6 +1255,10 @@ function ShredVotePrompt({ onDecide }: { onDecide(choice: "APPROVE" | "REJECT"):
     </div>
   );
 }
+
+/// What a removed or left-out tab can still do with what it holds.
+const STRANDED_KEEP =
+  "This tab keeps what it already had, read-only, so you can still read it, copy it or export it.";
 
 const LIMIT_COPY =
   "This destroys the shared copy and the keys. It cannot reach copies other people already made.";
@@ -1183,6 +1417,10 @@ export const MONACO_OPTIONS = {
   accessibilitySupport: "auto",
   spellcheck: false,
 } as const;
+
+/// The same editor, for a tab the room has removed or moved on without: its
+/// text can still be selected and copied, but not changed.
+const MONACO_READ_ONLY_OPTIONS = { ...MONACO_OPTIONS, readOnly: true } as const;
 
 function b64ToBytes(s: string): Uint8Array {
   const bin = atob(s);

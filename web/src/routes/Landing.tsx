@@ -12,12 +12,12 @@ import {
 } from "../keys-session";
 import { openNamedRoom, openUnlistedRoom } from "../keyhandoff";
 import {
-  generateDicewarePassphrase,
   generateRoomName,
   randomHexSuffix,
 } from "../crypto/fingerprint";
 import { estimatePassphrase } from "../crypto/passphrase";
 import { Field } from "../ui/Field";
+import { PassphraseField } from "../ui/PassphraseField";
 import { nameProblem } from "./name-rules";
 import { readJoinTarget, type JoinTarget } from "./join";
 import { navigateTo } from "./navigate";
@@ -285,7 +285,6 @@ function NamedForm() {
   const [ttl, setTtl] = useState<TtlBody>(TTL_PRESETS[1].value);
   const [level, setLevel] = useState<SecurityLevel>("everyday");
 
-  const verdict = passphrase ? estimatePassphrase(passphrase) : null;
   const nameIssue = name ? nameProblem(suffixOn ? name : name.replace(/-[0-9a-f]{4}$/, "")) : null;
 
   const create = async () => {
@@ -389,33 +388,16 @@ function NamedForm() {
           read it without the passphrase.
         </span>
       </label>
-      <div className="field">
-        <label className="micro-label" htmlFor="passphrase">PASSPHRASE</label>
-        <div className="row">
-          <input
-            id="passphrase"
-            type="password"
-            // "new-password" invites the browser to save it, and a password
-            // manager with sync carries it off the device. A highest-security
-            // room asks it not to; browsers may still offer, which the hint
-            // below says.
-            autoComplete={level === "highest" ? "off" : "new-password"}
-            value={passphrase}
-            onChange={(e) => setPassphrase(e.target.value)}
-          />
-          <button type="button" onClick={() => setPassphrase(generateDicewarePassphrase(5))}>Generate</button>
-        </div>
-        {verdict && !verdict.ok && (
-          <p className="error-text">Too easy to guess. Press Generate, or add more words.</p>
-        )}
-        {verdict?.ok && (
-          <p className="hint">
-            {verdict.dicewareWords > 0
-              ? `${verdict.dicewareWords} random words — strong, and easy to read aloud.`
-              : "Strong enough."}
-          </p>
-        )}
-      </div>
+      {/* "new-password" invites the browser to save it, and a password
+          manager with sync carries it off the device. A highest-security
+          room asks it not to; browsers may still offer, which the hint
+          below says. */}
+      <PassphraseField
+        id="passphrase"
+        value={passphrase}
+        onChange={setPassphrase}
+        autoComplete={level === "highest" ? "off" : "new-password"}
+      />
       <ExpiryPicker onChange={setTtl} />
       <SecurityPicker value={level} onChange={setLevel} kind="shared" />
       <button className="primary" onClick={create} disabled={busy}>
