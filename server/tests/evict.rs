@@ -789,14 +789,18 @@ async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
     });
     let hex = k.hex.clone();
     let mut tws = t.ws;
+    // Paced, not as fast as the socket takes it: a flood that outruns b's
+    // reader fills b's outbound queue, the server drops b, and the commit is
+    // then refused because a voter has gone. That is a different rule from
+    // the one this test is about, and on a slow machine it happened.
     let writer = tokio::spawn(async move {
-        for _ in 0..200_000 {
+        for _ in 0..20_000 {
             for ft in [0x03u8, 0x06, 0x24] {
                 if tws.send(frame(&hex, ft, 0, b"late")).await.is_err() {
                     return;
                 }
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     });
     tokio::time::timeout(Duration::from_secs(5), flowing_rx)
@@ -806,7 +810,10 @@ async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
     a.ws.send(frame(&k.hex, 0x23, 0, &body)).await.unwrap();
     let seen = collector.await.unwrap();
     writer.abort();
-    let commit_at = seen.iter().position(|f| f[3] == 0x23).expect("b never got the commit");
+    let commit_at = seen.iter().position(|f| f[3] == 0x23).unwrap_or_else(|| {
+        let kinds: Vec<u8> = seen.iter().map(|f| f[3]).filter(|t| ![0x03, 0x06, 0x24].contains(t)).collect();
+        panic!("b never got the commit; besides the flood it saw frame types {kinds:?} in {} frames", seen.len())
+    });
     let leave_at = seen
         .iter()
         .position(|f| f[3] == 0x08 && json_body(f)["peer_id"] == B64.encode(t_id))
