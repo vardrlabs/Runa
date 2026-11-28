@@ -18,6 +18,9 @@ pub enum WireCode {
     Expired = 4011,
     NameTaken = 4012,
     NameInvalid = 4013,
+    /// The room removed this peer (amendment K). Sent as an ERROR, then as
+    /// the close code of its connection.
+    Evicted = 4014,
     /// The process is stopping to be replaced, and has handed each room a
     /// ticket to come back with (amendment I). The standard WebSocket code for
     /// it, so a client that knows nothing of tickets still reads a restart.

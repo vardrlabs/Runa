@@ -21,6 +21,10 @@ pub const FT_RESTART_TICKET: u8 = 0x16;
 pub const FT_PING: u8 = 0x17;
 pub const FT_PONG: u8 = 0x18;
 pub const FT_EPOCH_KEY: u8 = 0x20;
+pub const FT_EVICT_COMMIT: u8 = 0x23;
+pub const FT_EVICT_REQUEST: u8 = 0x24;
+pub const FT_EVICT_VOTE: u8 = 0x25;
+pub const FT_EVICT_CANCEL: u8 = 0x26;
 pub const FT_TTL_EXTEND: u8 = 0x22;
 pub const FT_SNAPSHOT: u8 = 0x21;
 pub const FT_ERROR: u8 = 0x30;
@@ -131,7 +135,7 @@ mod tests {
     }
 
     /// The invariant `server/fuzz/fuzz_targets/frame_header.rs` asserts. It
-    /// only ran in a weekly cron — one that had never once succeeded — so it
+    /// only ran in a weekly cron, one that had never once succeeded, so it
     /// is checked here on every run as well.
     #[test]
     fn decode_encode_roundtrips_for_any_accepted_input() {

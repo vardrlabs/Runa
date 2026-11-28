@@ -2,7 +2,7 @@
 
 Newest first. The release workflow reads the section matching the tag and
 publishes it as the release notes, and refuses to build a tag that has no
-section — so this file is not documentation of the release, it is part of it.
+section, so this file is not documentation of the release, it is part of it.
 
 ## Unreleased
 
@@ -21,8 +21,37 @@ section — so this file is not documentation of the release, it is part of it.
   `docs/THREAT_MODEL.md` and `docs/PROTOCOL.md` amendment J. A tab still
   running an earlier version can't be handed the new key, so once a room's key
   has changed the server turns it away. The older page doesn't say why; it keeps
-  trying to connect until it is reloaded. Removing someone and changing a
-  room's link come in a later release.
+  trying to connect until it is reloaded.
+- **People can be removed from a room, and a room's link can be changed.**
+  Everyone else in the room has to agree, and any one of them can refuse; the
+  server checks that everyone agreed too. The person being removed isn't asked.
+  They can't block it by changing the room's key, because while a request is
+  open the server holds key changes back for up to two and a half minutes, and
+  they can't block it by keeping a request of their own open, from one tab or
+  several, because several requests can be open at once and all of theirs
+  together take one place. Someone who has asked can close the dialog and still
+  answer everyone else's requests while their own is open. A member who is
+  determined to stay can still block their own removal, though, and the threat
+  model says how. A tab still
+  running an earlier version can't vote, so
+  nothing can be removed or changed while one is open until it's reloaded. The
+  person who asks makes the new link first, or for a shared room types or
+  generates a new passphrase, held to the same strength check as a new room's.
+  Once everyone has agreed, each member receives it sealed to them alone, the
+  server stops accepting the old one, and the room's key starts again from the
+  new one. The removed person's page says they were removed, and their old link
+  or passphrase no longer opens the room. Their tab keeps what it already had on
+  screen, read-only, so they can still read, copy or export it, but nothing
+  written afterwards reaches it. Changing the link with nobody removed is what
+  an everyday room can do about someone who once had the link, and a shared room
+  changes its passphrase the same way. A member's tab applies a change only for
+  a request it saw itself; a tab that was left out of a change says so, stops
+  connecting, and keeps what it had, read-only. Anyone who was away at that
+  moment comes back to the same "this room is gone" page as for an expired room,
+  and needs the new link or passphrase from someone who was there. The room's
+  fingerprint changes, so it's worth comparing again. The limits, including what
+  a dishonest server can still do, are in `docs/THREAT_MODEL.md`, and the design
+  is in `docs/PROTOCOL.md` amendment K.
 
 ### Fixed
 
@@ -176,7 +205,7 @@ section — so this file is not documentation of the release, it is part of it.
 - **A room's key no longer sits in the address bar, or in browser history.**
   The key is the part of the link after `#`. It never reached the server, but
   it stayed in the address bar for as long as the room was open, and browsers
-  write the full address into their history — which, with sync on, leaves the
+  write the full address into their history, which, with sync on, leaves the
   device. A room created on the front page, or joined by pasting its link
   into Join, now gets the key in memory and never shows it in the address. A
   room opened from a clicked link has it removed as the page starts; the
@@ -186,11 +215,11 @@ section — so this file is not documentation of the release, it is part of it.
 - **The server remembered every visitor's address until it restarted.**
   Nothing was logged or written to disk, but the rate-limit tables held each
   client's IP address in plain text and dropped entries only once a table
-  reached 100,000 — which a server this size never does. So its memory held a
+  reached 100,000, which a server this size never does. So its memory held a
   list of everyone who had used it since boot. The tables now hold a keyed
   pseudonym instead (HMAC under a key drawn at startup and never written), and
   every minute they drop each entry that no longer limits anything, so a visit
-  is remembered for about one limiter window — at most an hour — after it
+  is remembered for about one limiter window, at most an hour, after it
   ends. Whoever captures the running process still holds the key and could
   test a suspected address; that is the floor for any server that rate-limits,
   and the reason to reach RÚNA over Tor if it matters.
@@ -209,7 +238,7 @@ section — so this file is not documentation of the release, it is part of it.
 - **One caller could lock everyone out of a room.** Join attempts were limited
   per room, in one window shared by everybody, and every attempt counted, not
   only failures. Anyone who knew a named room's name could spend it and keep
-  every real join failing — which looks exactly like a wrong passphrase. The
+  every real join failing, which looks exactly like a wrong passphrase. The
   limit is now per caller, and a successful join no longer spends two
   attempts.
 - **A room's key-derivation settings could reveal that it existed.** The
@@ -219,9 +248,9 @@ section — so this file is not documentation of the release, it is part of it.
   made through the interface was affected.
 - **Dependencies with published advisories are upgraded**: vitest 4, vite
   6.4.4, KaTeX 0.18. Every alert but one was in build and test tooling. The
-  one in shipped code, KaTeX, was not exploitable here — RÚNA sets
-  `trust: false` itself and sanitises KaTeX's output afterwards — and math
-  renders byte-for-byte as before.
+  one in shipped code, KaTeX, was not exploitable here: RÚNA sets
+  `trust: false` itself and sanitises KaTeX's output afterwards. Math renders
+  byte-for-byte as before.
 
 ### Added
 
@@ -257,7 +286,7 @@ section — so this file is not documentation of the release, it is part of it.
   server still writes nothing down. With `RUNA_RESTART_KEY` set, the countdown
   before a restart now ends by handing every member a signed ticket for their
   room. When the new process comes up, their pages present it, the room is
-  recreated under its old link, and each page sends its copy back — so a
+  recreated under its old link, and each page sends its copy back, so a
   redeploy costs nobody their document, and someone who joins afterwards sees
   everything written before it. The countdown says which of the two is about
   to happen. Both deploy scripts generate the key once into a root-only file.
@@ -265,8 +294,8 @@ section — so this file is not documentation of the release, it is part of it.
   died quietly used to show the room as connected, while everyone else's edits
   went nowhere, until the next keystroke. Each answer also carries who is in
   the room, so a list that missed a join or a leave is corrected.
-- **A restart warns every open room first.** On SIGTERM — what
-  `systemctl restart`, `docker stop` and both deploy scripts send — every open
+- **A restart warns every open room first.** On SIGTERM, which is what
+  `systemctl restart`, `docker stop` and both deploy scripts send, every open
   room sees a countdown with an Export button, and the server waits it out
   (`RUNA_SHUTDOWN_GRACE_SECS`, 60 s by default). With nobody connected it stops
   at once. Room creation during the countdown is refused with a reason.
@@ -307,7 +336,7 @@ section — so this file is not documentation of the release, it is part of it.
   seconds is replaced, and a resend too big for one message is split.
 
 - **A shredded room could stay open.** The server destroys its copy once every
-  connected person has agreed — and that included anyone who opened the room
+  connected person has agreed, and that included anyone who opened the room
   during the vote, who never saw the request and so could never agree. Every
   voter's page wiped itself and showed the room as gone, while it stayed open
   to anyone with the link. Someone who arrives mid-vote no longer counts, just
@@ -323,7 +352,7 @@ section — so this file is not documentation of the release, it is part of it.
 - **The second Paste button in Firefox and Safari.** It was never a second
   menu. Monaco's Paste item reads the clipboard from script, and those
   browsers answer every such read with a Paste button of their own that has to
-  be clicked as well — a permission prompt no page can turn off, so no Paste a
+  be clicked as well: a permission prompt no page can turn off, so no Paste a
   page draws itself can ever take one click there. Right-click in those two
   now opens the browser's own menu instead, over an invisible stand-in holding
   your selection: Cut, Copy, Paste and Select All, each one click, carried out
@@ -332,14 +361,14 @@ section — so this file is not documentation of the release, it is part of it.
 - **Long sessions stopped compacting their history, and could fill up.** A
   snapshot has to say how much of the room's log it covers, and a client could
   only count the edits it had written itself. The longer-present member, who
-  takes the snapshots, might mostly have been reading — and once its count fell
+  takes the snapshots, might mostly have been reading, and once its count fell
   below the last snapshot's, the server refused every snapshot after it. The
   log then grew until edits were refused. The server now tells each client the
   log position of every update, and snapshots cover exactly what the client
   holds.
 - **A live room could be reported as gone.** The server allows 30 join
   attempts a minute from one address, to slow anyone guessing at a room's
-  key — and it counted successful joins too. So the 31st connection in a minute
+  key, and it counted successful joins too. So the 31st connection in a minute
   from one office, school or mobile-carrier address, as happens when a whole
   team reconnects after a network blip or a restart, was refused with the same
   answer as a room that does not exist, and the page said the room was gone.
@@ -373,8 +402,8 @@ section — so this file is not documentation of the release, it is part of it.
 ### Added
 
 - **Bold and italic from the keyboard.** Ctrl/Cmd+B and Ctrl/Cmd+I. These were
-  never Monaco keybindings — they are commands VS Code supplies for markdown,
-  not part of the standalone editor — so in a markdown editor the two shortcuts
+  never Monaco keybindings. They are commands VS Code supplies for markdown,
+  not part of the standalone editor, so in a markdown editor the two shortcuts
   everybody already has in their fingers did nothing at all. They run the same
   actions as the toolbar buttons, so the two cannot disagree about what bold
   means.
@@ -384,16 +413,17 @@ section — so this file is not documentation of the release, it is part of it.
 - **Sticky scroll is off.** Monaco enables it by default: it pins the header of
   the enclosing foldable block to the top of the editor, which is useful in
   code, where a block is a function. Markdown has no folding rules in the
-  standalone editor, so Monaco folds by indentation instead — and in prose,
+  standalone editor, so Monaco folds by indentation instead, and in prose,
   indentation means a list, a fenced code block, or pasted terminal output,
   none of which contain what follows them. It pinned rows of dashes and
   ordinary sentences, and cost up to 90px of editor height. The README explains
   how to turn it back on, and how to keep it while bounding the cost.
 - **The tombstone says "Gone. Reduced to atoms."** It previously read
-  "ROOM —— · SHREDDED —— UTC", where the dashes stood in for values no script
-  ever supplied — the element was referenced nowhere — so every reader saw the
-  placeholders themselves. They could not be filled either: the page is served
-  with Clear-Site-Data and knows nothing about the room by design, and naming
+  "ROOM", two long dashes, "· SHREDDED", two more long dashes and "UTC",
+  where the dashes stood in for values no script ever supplied. The element
+  was referenced nowhere, so every reader saw the placeholders themselves.
+  They could not be filled either: the page is served with Clear-Site-Data
+  and knows nothing about the room by design, and naming
   it on its own tombstone would write that address into a history just wiped
   for exactly that reason. It now says what is true, including the part the
   shred dialog says before you confirm: copies other people already made are
@@ -403,7 +433,7 @@ section — so this file is not documentation of the release, it is part of it.
 
 - **The room is exactly as tall as the window.** The editor pane was a plain
   block holding the markdown ribbon and, beneath it, an editor sized at 100% of
-  that same block — so the two came to a ribbon's height more than the window.
+  that same block, so the two came to a ribbon's height more than the window.
   The whole document scrolled: a second scrollbar beside the editor's own, and
   the status bar and ribbon sliding off the top as you scrolled. Reported as
   line numbers pinning themselves under the toolbar.
@@ -440,7 +470,7 @@ section — so this file is not documentation of the release, it is part of it.
   less than it appears to. Compact fits roughly twice as much per page as
   Large.
 - **A divergent copy now repairs itself.** When copies disagree, the client
-  asks the relay for the whole document — snapshot and full tail — instead of
+  asks the relay for the whole document, snapshot and full tail, instead of
   only reporting the problem. The warning appears when that did not work, and
   says so; it clears itself when the copies agree, and offers another attempt.
   Previously the only cure was reloading the page.
@@ -451,7 +481,7 @@ section — so this file is not documentation of the release, it is part of it.
   coming back left the previous connection's peer id in the roster for good,
   because the server's authoritative roster was merged into the client's
   rather than replacing it. Two reconnects meant four entries where two people
-  were, so the vote asked three of four to approve — and because the roster's
+  were, so the vote asked three of four to approve, and because the roster's
   hash travels inside a signed shred request and every receiver re-derives it,
   an inflated roster hashed differently from everyone else's and every peer
   silently refused the request. A refusal to take part in a shred vote is also
@@ -463,7 +493,7 @@ section — so this file is not documentation of the release, it is part of it.
 - **A 24-hour room no longer accuses its own server of tampering.** The server
   reports the time remaining for an absolute expiry, which is necessarily less
   than the duration the room was created with, and the client compared the two
-  directly — so every such room raised the tamper banner within a minute. A
+  directly, so every such room raised the tamper banner within a minute. A
   warning that is always on is worse than none. `JOIN_ACK` now carries how
   long the room has been alive so the two can be compared like with like, and
   a room that was legitimately extended is not flagged.
@@ -475,13 +505,13 @@ section — so this file is not documentation of the release, it is part of it.
 - **Line endings silently corrupted other peers' copies.** Monaco keeps one
   end-of-line sequence per document and rewrites inserted text to match it,
   while the shared document stores exactly what it is given. A client whose
-  editor used CRLF — in practice, Windows — drifted one character per newline
+  editor used CRLF, in practice Windows, drifted one character per newline
   from everyone else, so text landed in the wrong place on other machines, a
   deletion removed the wrong range, and lines appeared merged on one client
   and separate on the rest. This is the reason to prefer 0.2.1 over 0.2.0.
 - **The "your copy differs" warning fired on identical documents.** It
   compared the local document against hashes peers had broadcast up to a
-  heartbeat earlier, on every update, and never cleared once raised — so two
+  heartbeat earlier, on every update, and never cleared once raised, so two
   byte-identical copies could both display it for the rest of a session.
 - **Equations rendered flat.** `$E = mc^2$` came out as "E=mc2" because
   KaTeX's HTML output positions superscripts with inline styles that the

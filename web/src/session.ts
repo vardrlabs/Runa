@@ -18,13 +18,20 @@ import {
 import type { RosterEntry } from "./shred/roster";
 import { executeWipe } from "./shred/wipe";
 import { parseSecurityLevel, securityLevelOf, type SecurityLevel } from "./security-level";
+import { KdfUnavailableError } from "./crypto/kdf";
+import { fingerprintWords } from "./crypto/fingerprint";
+import { estimatePassphrase } from "./crypto/passphrase";
+import { EPOCH_OVERLAP_MS } from "./epoch/rotation";
+import { EvictCoordinator, type EvictPrompt, type ReRooted, type SealedConfig } from "./evict/coordinator";
+import { newLinkWayIn, newPassWayIn, wayFragment, wipeWayIn, type WayIn, type WayKind } from "./evict/reroot";
+import { bytesEqual } from "./evict/statement";
 
 /// A divergence warning is only meaningful once the document has stopped
 /// moving. Two peers mid-keystroke legitimately hold different states.
 const DIVERGENCE_QUIET_MS = 5_000;
 
 /// How long a repair is given to work before the disagreement is called real.
-/// Long enough for the server's replay to arrive and apply — the presence
+/// Long enough for the server's replay to arrive and apply: the presence
 /// heartbeat that re-evaluates this runs every ten seconds.
 const DIVERGENCE_REPAIR_SETTLE_MS = 15_000;
 
@@ -34,9 +41,9 @@ export type DivergenceAction = "none" | "repair" | "warn" | "clear";
 ///
 /// The warning used to be the whole response: it appeared and sat there, and
 /// the only thing that actually fixed a stale copy was reloading the page.
-/// But the relay can already repair this — `tail_from(0)` returns the snapshot
+/// But the relay can already repair this: `tail_from(0)` returns the snapshot
 /// and the entire tail, and applying it twice is harmless because Yjs is
-/// idempotent — so the first response to a disagreement should be to fix it,
+/// idempotent, so the first response to a disagreement should be to fix it,
 /// and the warning should be what happens when fixing it did not work.
 ///
 /// Pulled out of the heartbeat so the policy can be tested without a socket, a
@@ -62,7 +69,7 @@ export function divergenceAction(input: {
 /// Has the server shortened an absolute TTL behind the encrypted config?
 ///
 /// `reported.secs` is the time *remaining*, which for a 24-hour room is
-/// necessarily less than the 86 400 the config blob records — so comparing the
+/// necessarily less than the 86 400 the config blob records, so comparing the
 /// two directly reported every such room as tampered with, seconds after it
 /// was made. A warning that is always on is worse than none: it teaches people
 /// to dismiss the one banner that should stop them.
@@ -70,8 +77,8 @@ export function divergenceAction(input: {
 /// The total the server is claiming is `remaining + elapsed`, and elapsed
 /// comes from the server rather than the local clock so that a disagreement
 /// between the two cannot look like tampering. A room may legitimately be
-/// *extended* — effective_ttl_secs is the configured value plus any
-/// extensions — so only a claim shorter than the configured duration is a
+/// *extended*: effective_ttl_secs is the configured value plus any
+/// extensions, so only a claim shorter than the configured duration is a
 /// contradiction.
 ///
 /// Without `elapsedSecs` the shortening cannot be checked at all, and this
@@ -97,8 +104,8 @@ export function absoluteTtlShortened(
 /// connection, so every reconnect left the previous connection's id behind for
 /// good: switching tabs twice left four entries where two people were.
 ///
-/// The roster is not decoration. It is the consensus denominator — a shred
-/// then asked three of four to approve with two people present — and its hash
+/// The roster is not decoration. It is the consensus denominator: a shred
+/// then asked three of four to approve with two people present, and its hash
 /// travels inside a shred request, so an inflated roster hashed differently
 /// from everybody else's and every receiver rejected the request as
 /// `roster-mismatch` and never showed the prompt. Reloading the page appeared
@@ -141,7 +148,19 @@ export const KEY_STATUS_TEXT: Record<KeyStatus, string | null> = {
     "The latest key change was made with a different list of people than this tab sees. Someone may be hidden from this room.",
   "server-behind":
     "The server has lost track of this room's key changes, so this tab has stopped sending. Copy your work out and reload.",
+  "left-out":
+    "This room's link changed, and this tab was not given the new one. Ask someone in the room for the new link or passphrase.",
 };
+
+/// `KEY_STATUS_TEXT` for a room opened the way `way` says: a shared room is
+/// told that its passphrase changed, never its link.
+export function keyStatusText(way: WayKind): Record<KeyStatus, string | null> {
+  const word = way === "pass" ? "passphrase" : "link";
+  return {
+    ...KEY_STATUS_TEXT,
+    "left-out": `This room's ${word} changed, and this tab was not given the new one. Ask someone in the room for the new ${word}.`,
+  };
+}
 
 /// Passes a key status on only when it changes. The coordinator repeats
 /// "waiting" every second, and each report re-renders the room page.
@@ -150,15 +169,23 @@ export type KeyStatusReporter = ((s: KeyStatus) => void) & {
   alarming(): boolean;
 };
 
-const isAlarming = (s: KeyStatus | null): boolean => s === "refused" || s === "roster-mismatch" || s === "server-behind";
+/// The states that may mean tampering. The alarm they raise sticks over a
+/// later SECURE. "left-out" is not one of them: a member left out of a
+/// re-root, or one that joined after the request, was not tampered with, and
+/// its text says what happened and what to do.
+const isAlarming = (s: KeyStatus | null): boolean =>
+  s === "refused" || s === "roster-mismatch" || s === "server-behind";
 
-export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "onTemper">): KeyStatusReporter {
+export function keyStatusReporter(
+  events: Pick<SessionEvents, "onKeyStatus" | "onTemper">,
+  text: Record<KeyStatus, string | null> = KEY_STATUS_TEXT,
+): KeyStatusReporter {
   let last: KeyStatus | null = null;
   const report = ((s: KeyStatus) => {
     if (s === last) return;
     last = s;
     const alarming = isAlarming(s);
-    events.onKeyStatus?.(KEY_STATUS_TEXT[s], alarming);
+    events.onKeyStatus?.(text[s], alarming);
     if (alarming) events.onTemper("WATCH");
   }) as KeyStatusReporter;
   report.alarming = () => isAlarming(last);
@@ -170,7 +197,7 @@ export function keyStatusReporter(events: Pick<SessionEvents, "onKeyStatus" | "o
 ///
 /// Against a server that sends indexes this is exactly what the copy holds.
 /// Without them it can only be this client's own stored updates on top of its
-/// last snapshot — an undercount that falls further behind the more other
+/// last snapshot, an undercount that falls further behind the more other
 /// people type, and that the server refuses outright once it is below a
 /// snapshot someone else made, since a snapshot may never move backwards. A
 /// room whose oldest member mostly read therefore never compacted, and a long
@@ -255,6 +282,38 @@ export interface SessionEvents {
   /// to show, or null when there is nothing to say. `alarming` marks the
   /// states that may mean tampering.
   onKeyStatus?(message: string | null, alarming: boolean): void;
+  /// Someone asks this member to agree to removing someone, or to changing
+  /// the link (amendment K). `who` is null for a link change, and `id` names
+  /// the request, which the answer names in turn: several votes can be open
+  /// at once.
+  ///
+  /// Raised after the names are worked out, which awaits. The session does
+  /// not raise it for a vote that is no longer open by then. A page that has
+  /// already shown a terminal state (REJECTED, EXPIRED, CANCELLED, FAILED,
+  /// DONE) for that request ignores a prompt for it that comes after. Answering
+  /// one anyway is harmless, since the coordinator refuses a vote for a closed
+  /// request.
+  onEvictPrompt?(p: { id: string; by: string; who: string | null }): void;
+  /// Where a vote to remove someone or change the link stands. `vote` names
+  /// the request and says whether it is this tab's own; it is left out only
+  /// for a tab left out of a re-root with no vote open.
+  onEvictState?(state: string, reason?: string, vote?: { id: string; mine: boolean }): void;
+  /// A request this member ignored, and why.
+  onEvictIgnored?(reason: string): void;
+  /// The room has a new link or passphrase, to show once.
+  onReRooted?(r: { fragment: string | null; passphrase: string | null; fingerprint: string; removed: string | null }): void;
+  /// The room removed this member. Said once, whether ERROR 4014, a close
+  /// with 4014 or a commit naming this tab's key came first.
+  onRemoved?(): void;
+  /// The room's way in changed and this tab was not given the new one: it can
+  /// no longer take part, and what it holds is all it has. The socket stops
+  /// and does not reconnect, as for a removed tab, and the document stays.
+  /// Said once, whichever way the evict coordinator found out: a commit this
+  /// tab could place but held no usable wrap in, or could not place at all
+  /// (raised after `onEvictState("FAILED", "left-out")`), or a member's
+  /// commit for an epoch this tab has not reached (with that state only if a
+  /// vote was open here).
+  onLeftOut?(): void;
 }
 
 /// What the server said to a restart ticket: the room is back (whoever
@@ -267,6 +326,9 @@ export interface SessionConfig {
   authKey: Uint8Array;
   contentKey: CryptoKey;
   chainKey: CryptoKey;
+  /// How this room is opened: a link (private rooms) or a passphrase
+  /// (shared-name rooms). A re-root makes a new one of the same kind.
+  wayKind: WayKind;
   insecureAllowed?: boolean;
   /// Present a restart ticket to the new process. Without it, a room ends at
   /// a restart as it always did.
@@ -274,7 +336,7 @@ export interface SessionConfig {
 }
 
 /// How long to keep presenting a ticket the server has not yet been able to
-/// take — a new process still starting, say. The server stops honouring one
+/// take, a new process still starting, say. The server stops honouring one
 /// after ten minutes anyway.
 const TICKET_PATIENCE_MS = 9 * 60_000;
 
@@ -307,6 +369,29 @@ export class Session {
   readonly identity: Identity;
   awareness: AwarenessHub | null = null;
   coordinator!: EpochCoordinator;
+  evict!: EvictCoordinator;
+  private keyring!: Keyring;
+  /// The room's sealed config as this tab last opened it, for a commit to
+  /// seal again under the new key.
+  private sealed: SealedConfig | null = null;
+  /// When the last re-root was applied, until the keys before it are dropped.
+  private rerootAt: number | null = null;
+  /// Whether a snapshot under the latest root has been made or received.
+  private rerootSnapshotSeen = false;
+  /// Counts re-roots, so a snapshot started before one is not taken for a
+  /// snapshot under the new root.
+  private rerootGen = 0;
+  /// The room removed this tab (amendment K).
+  private removedSaid = false;
+  /// This tab was left out of a re-root (amendment K): it has stopped, like a
+  /// removed tab, and nothing brings it back.
+  private leftOutSaid = false;
+  /// A forgetting of the old root's keys is queued on the epoch queue.
+  private forgetting = false;
+  /// The reason this tab's own commit just failed with, while the evict
+  /// coordinator's task that failed it is still running: the refusal it
+  /// reports next is of this tab's own commit.
+  private ownCommitFailed: string | null = null;
   securityLevel: SecurityLevel = "highest";
   private epochTimer: ReturnType<typeof setInterval> | null = null;
   /// A JOIN_ACK arrived while this tab held no key for the room's epoch, so
@@ -354,7 +439,7 @@ export class Session {
     this.socket = socket;
     this.machine = machine;
     this.internals = internals;
-    this.keyStatus = keyStatusReporter(events);
+    this.keyStatus = keyStatusReporter(events, keyStatusText(cfg.wayKind));
   }
 
   static async create(cfg: SessionConfig, events: SessionEvents): Promise<Session> {
@@ -368,10 +453,11 @@ export class Session {
     const internals: SocketInternals = { roster, away, myPeerId: "", myJoinedSeq: 0, joinPerfMs: 0 };
     let sessionRef: Session | null = null;
 
-    const peerJoined = (entry: RosterEntry): void => {
+    /// `announced` for a PEER_JOIN, not for a peer a roster refresh lists.
+    const peerJoined = (entry: RosterEntry, announced = false): void => {
       const id = toB64(entry.peerId);
       roster.set(id, entry);
-      sessionRef?.coordinator?.memberJoined(entry);
+      sessionRef?.coordinator?.memberJoined(entry, announced);
       sessionRef?.noteRosterSeen(id);
       // Names come from the key the roster binds to this peer, never from
       // what the peer says its name is.
@@ -384,18 +470,21 @@ export class Session {
       away.delete(id);
       // Say hello immediately. Presence is broadcast on the ten-second
       // heartbeat and on cursor movement, so without this a newcomer who
-      // joins and sits still is invisible to everyone — and everyone is
-      // invisible to them — for up to ten seconds. Measured at 10-12s
+      // joins and sits still is invisible to everyone, and everyone is
+      // invisible to them, for up to ten seconds. Measured at 10-12s
       // before this line existed.
       void sessionRef?.announcePresence();
       events.onPeersChanged(roster.size);
     };
 
-    const peerLeft = (peerId: Uint8Array): void => {
+    const peerLeft = (peerId: Uint8Array, reason?: number): void => {
       const id = toB64(peerId);
       const entry = roster.get(id);
       if (roster.delete(id)) {
-        if (entry) sessionRef?.coordinator?.memberLeft(entry);
+        if (entry) {
+          sessionRef?.coordinator?.memberLeft(entry, reason);
+          void sessionRef?.evict?.memberLeft(entry);
+        }
         // Remember them briefly, by name. A locked phone is
         // indistinguishable on the wire from someone closing the tab, and
         // the difference matters when a shred is about to be proposed.
@@ -432,6 +521,9 @@ export class Session {
         },
         onEpochKey: (header, epoch, sender, body) =>
           void sessionRef?.coordinator?.receive(header, epoch, sender, body),
+        onEvictFrame: (ft, sender, pt) => void sessionRef?.evict?.receiveFrame(ft, sender, pt),
+        onEvictCommit: (header, epoch, sender, body) =>
+          void sessionRef?.evict?.receiveCommit(header, epoch, sender, body),
         onEntriesTaken: (indexes) => {
           for (const i of indexes) sessionRef?.doc.cursor.note(i);
         },
@@ -456,15 +548,21 @@ export class Session {
           ),
         onDocUpdate: (sender, envelope) =>
           sessionRef?.handleRemoteUpdate(envelope) ?? void sender,
-        onSnapshot: (sender, covers, blob) => sessionRef?.handleSnapshot(sender, covers, blob),
+        onSnapshot: (sender, covers, blob, epoch) => sessionRef?.handleSnapshot(sender, covers, blob, epoch),
         onAwareness: (sender, pt) => sessionRef?.awareness?.receive(sender, pt),
         onShredFrame: (ft, sender, pt) => void sessionRef?.handleShredFrame(ft, sender, pt),
-        onPeerJoin: (entry) => peerJoined(entry),
-        onPeerLeave: (peerId) => peerLeft(peerId),
+        onPeerJoin: (entry) => peerJoined(entry, true),
+        onPeerLeave: (peerId, reason) => peerLeft(peerId, reason),
         onPurge: (reason) => events.onPurge(reason),
         onTtlExtended: (remaining, effective, addedBy) =>
           sessionRef?.handleTtlExtended(remaining, effective, addedBy),
         onError: (code) => {
+          // Removed from the room (amendment K): its old key opens nothing,
+          // so trying again would only ever be refused.
+          if (code === 4014) {
+            sessionRef?.removedFromRoom();
+            return;
+          }
           // 4001 after a successful join means the room is gone, not that the
           // key is wrong. Discarding the code left the UI on "connecting"
           // while the socket retried forever.
@@ -510,7 +608,7 @@ export class Session {
     const machine = new ShredMachine(identity, "", () => [...roster.values()], {
       // Record only. Wiping here would tear down the socket inside
       // castMyVote(), before respondToShred() has had a chance to transmit
-      // the very ballot that produced the approval — so the last peer to
+      // the very ballot that produced the approval, so the last peer to
       // approve would destroy its own copy while everyone else sat one vote
       // short. The session flushes this once the wire is clear.
       onApproved: (requestId) => sessionRef?.markPurgeApproved(requestId),
@@ -520,8 +618,8 @@ export class Session {
         events.onShredState(waiting.length ? "STALLED" : "VOTING", waiting[0]),
       // Refusing to take part in a shred vote was discarded entirely: an empty
       // function, no log, no message. When a drifted roster made every peer
-      // reject a request, the initiator sat in VOTING forever and nobody —
-      // initiator or receiver — was told anything at all. A guard that fires
+      // reject a request, the initiator sat in VOTING forever and nobody,
+      // initiator or receiver, was told anything at all. A guard that fires
       // in silence cannot be diagnosed from the outside, which is exactly what
       // happened.
       onVoteRejectedByGuard: (reason) => {
@@ -546,8 +644,40 @@ export class Session {
       rejoin: () => socket.reconnectNow(),
       status: (st) => session.reportKeyStatus(st),
       snapshotSoon: () => session.snapshotSoon(),
+      stepsHeld: () => session.evict?.isOpen() ?? false,
     });
-    session.epochTimer = setInterval(() => void session.coordinator.tick(), 1_000);
+    session.keyring = keyring;
+    session.evict = new EvictCoordinator({
+      roomId,
+      identity,
+      kx,
+      keyring,
+      now: () => Date.now(),
+      me: () => (internals.myPeerId ? fromB64(internals.myPeerId) : null),
+      members: () => [...roster.values()],
+      exclusive: <T>(fn: () => Promise<T>): Promise<T> => session.coordinator.exclusive(fn),
+      kxOf: (m) => session.coordinator.kxOf(m),
+      header: (ft, epoch) => socket.frameHeader(ft, epoch),
+      sendSealed: (ft, pt) => socket.sendEvictFrame(ft, pt),
+      sendSigned: (h, b) => socket.sendSigned(h, b),
+      sealedConfig: () => session.sealedConfig(),
+      applyReRoot: (r) => session.applyReRoot(r),
+      prompt: (p) => void session.raiseEvictPrompt(p),
+      state: (st, reason, vote) => session.evictStateChanged(st, reason, vote ? { id: toB64(vote.requestId), mine: vote.mine } : undefined),
+      refused: (reason) => session.evictRefused(reason),
+      leftOut: () => {
+        session.reportKeyStatus("left-out");
+        session.leftOutOfReRoot();
+      },
+      // This tab was the one removed, under an earlier connection or with no
+      // 4014 reaching it: the same ending as ERROR 4014.
+      removed: () => session.removedFromRoom(),
+    });
+    session.epochTimer = setInterval(() => {
+      void session.coordinator.tick();
+      void session.evict.tick();
+      void session.forgetOldRoot();
+    }, 1_000);
     void socket.connect().catch(() => {
       events.onTemper("COLD");
     });
@@ -572,7 +702,7 @@ export class Session {
   carryOver(): boolean {
     const held = this.socket.heldRestartTicket();
     const restore = this.cfg.restoreRoom;
-    if (!held || !restore || this.destroyed) return false;
+    if (!held || !restore || this.destroyed || this.removedSaid || this.leftOutSaid) return false;
     if (this.carryingOver) return true;
     this.carryingOver = true;
     void (async () => {
@@ -587,6 +717,8 @@ export class Session {
           }
           if (result === "restored") {
             this.socket.dropRestartTicket();
+            // Removed or left out meanwhile: such a tab stays stopped.
+            if (this.removedSaid || this.leftOutSaid) return;
             this.socket.resume();
             return;
           }
@@ -609,8 +741,8 @@ export class Session {
     this.events.onConnectionRefused(null);
     this.indexed = ack.indexed === true;
     // A new log under the same room id is a room brought back after a
-    // restart (amendment I). It holds nothing yet — the server never had
-    // anything it could read — so this copy is the room now, as much as
+    // restart (amendment I). It holds nothing yet (the server never had
+    // anything it could read), so this copy is the room now, as much as
     // anyone's is: send all of it. Yjs merges it with everyone else's and
     // drops what repeats. Before any await, so it replaces the backlog before
     // the socket starts sending it.
@@ -624,7 +756,11 @@ export class Session {
       this.socket.replaceBacklogWith(wrapWithLengthAndPad(Y.encodeStateAsUpdate(this.doc.ydoc)));
       this.events.onRoomCarriedOver?.();
     }
+    const previousPeerId = this.internals.myPeerId;
     this.internals.myPeerId = ack.peer_id;
+    // Joined again under a new peer id: a vote that named the previous one
+    // cannot finish (amendment K).
+    if (previousPeerId && previousPeerId !== ack.peer_id) void this.evict?.rejoined(fromB64(previousPeerId));
     this.internals.myJoinedSeq = ack.roster.find((r) => r.peer_id === ack.peer_id)?.joined_at_seq ?? 0;
     this.internals.joinPerfMs = performance.now();
     this.machine.setMyPeerId(ack.peer_id);
@@ -636,7 +772,7 @@ export class Session {
     // is present.
     //
     // Merging is what shipped, and every reconnect therefore left the previous
-    // session's peer ids behind for good — a peer id is minted per connection,
+    // session's peer ids behind for good: a peer id is minted per connection,
     // so switching tabs twice left four entries where two people were. That
     // was not merely a wrong occupant count. The roster is the consensus
     // denominator, so a shred asked three of four to approve when two people
@@ -683,10 +819,23 @@ export class Session {
     }
     this.events.onSecurityLevel?.(level);
     this.securityLevel = level;
+    // What a commit seals again under the new key. A commit cannot change
+    // the room's expiry or level, so a re-root that lands during the await
+    // above changes nothing read here.
+    // Both fallbacks run when the config is missing or will not open (`cfg`
+    // is null): the clear values are all there is then. The coordinator's
+    // check of a commit's config compares only the expiry and the level.
+    this.sealed = {
+      ttl: cfg?.ttl ?? { kind: ack.ttl.kind, secs: ack.ttl.secs },
+      ceilingOptout: cfg?.ceilingOptout ?? ack.ceiling_optout,
+      level,
+    };
     // Members who left while this tab was away count as departures, the same
-    // as a PEER_LEAVE it saw (amendment J).
+    // as a PEER_LEAVE it saw (amendment J), and an open vote they were part
+    // of fails as voter-left now rather than at its deadline (amendment K).
     for (const gone of departedMembers(rosterBefore, [...this.internals.roster.values()])) {
       this.coordinator.memberLeft(gone);
+      void this.evict?.memberLeft(gone);
     }
     // A JOIN_ACK without root_epoch comes from a server that predates
     // amendment J: it never advances a room, so no step is sent or followed.
@@ -732,6 +881,10 @@ export class Session {
   /// A step or handover has given this tab the keys for `epoch`.
   keysAdopted(epoch: number): void {
     this.socket.adoptEpoch(epoch);
+    // A step does not end a vote, but a commit this tab sent before it names
+    // an epoch the room has left, and is built again (amendment K). Called
+    // from inside the task that applied the step, so it is only queued.
+    void this.evict?.stepped();
     if (this.syncDeferred && !this.socket.isAwaitingKeys) {
       this.syncDeferred = false;
       this.socket.sendSyncRequest(this.indexed ? this.doc.cursor.watermark : this.doc.syncFrom());
@@ -740,6 +893,237 @@ export class Session {
 
   reportKeyStatus(s: KeyStatus): void {
     this.keyStatus(s);
+  }
+
+  sealedConfig(): SealedConfig {
+    return this.sealed ?? { ttl: { kind: "none", secs: 0 }, ceilingOptout: false, level: this.securityLevel };
+  }
+
+  /// Everyone else in the room, in the order they joined, with the handle
+  /// their signing key gives them. A connection holding this tab's own key
+  /// (an earlier connection not yet gone) is not someone else.
+  async evictCandidates(): Promise<{ peerId: Uint8Array; handle: string }[]> {
+    const me = this.internals.myPeerId;
+    const others = [...this.internals.roster.values()]
+      .filter((r) => r.pubkey && toB64(r.peerId) !== me && !bytesEqual(r.pubkey, this.identity.publicKeyRaw))
+      .sort((a, b) => a.joinedAtSeq - b.joinedAtSeq || cmpBytes(a.peerId, b.peerId));
+    return Promise.all(others.map(async (r) => ({ peerId: r.peerId.slice(), handle: await handleFromPubkey(r.pubkey!) })));
+  }
+
+  /// Ask the room to remove `target`, or nobody (a link change). A shared
+  /// room's new passphrase is held to the create form's strength check and
+  /// run through Argon2id here, before anyone is asked. Returns null once the
+  /// request is out, or a code for `proposeErrorText`. The new way in belongs
+  /// to the evict coordinator from the moment it is handed over: it wipes it
+  /// on every path that does not keep it.
+  async proposeEviction(target: Uint8Array | null, passphrase?: string): Promise<string | null> {
+    // A removed or left-out tab holds no way in the room still opens.
+    if (this.destroyed || this.removedSaid || this.leftOutSaid) return "failed";
+    const victim = target ? ([...this.internals.roster.values()].find((r) => bytesEqual(r.peerId, target)) ?? null) : null;
+    if (target && !victim) return "target-gone";
+    let way: WayIn;
+    if (this.cfg.wayKind === "pass") {
+      if (!passphrase || !estimatePassphrase(passphrase).ok) return "weak-passphrase";
+      try {
+        way = await newPassWayIn(passphrase);
+      } catch (e) {
+        return e instanceof KdfUnavailableError ? "kdf-unavailable" : "failed";
+      }
+    } else {
+      way = newLinkWayIn();
+    }
+    // Argon2id takes seconds: the tab may have been removed, left out or
+    // closed since.
+    if (this.destroyed || this.removedSaid || this.leftOutSaid) {
+      wipeWayIn(way);
+      return "failed";
+    }
+    // The coordinator checks the target against the roster again, on its
+    // queue, so a member who left during Argon2id is refused there.
+    return this.evict.propose(victim, way);
+  }
+
+  /// This member's answer to the request the prompt `id` showed.
+  respondToEviction(id: string, choice: "APPROVE" | "REJECT"): Promise<void> {
+    let requestId: Uint8Array;
+    try {
+      requestId = fromB64(id);
+    } catch {
+      return Promise.resolve();
+    }
+    return this.evict.vote(requestId, choice);
+  }
+
+  cancelEviction(): Promise<void> {
+    return this.evict.cancel();
+  }
+
+  /// A commit this tab applied (amendment K): JOIN with the new key from now
+  /// on, open the room's config with the new content key, send under the new
+  /// root, end any shred vote, snapshot under the new key as soon as the
+  /// snapshotter can, and show the new way in once.
+  ///
+  /// Called synchronously inside the queue task that re-rooted the keyring,
+  /// so it never awaits. The socket gets the key first, and every page
+  /// callback after it is fenced off. Switching the send cipher is not: if it
+  /// failed, the socket would go on sending under the old root, which a
+  /// removed member holds. Then the socket stops, the secrets here are wiped,
+  /// and the throw reaches the coordinator, which zeroes the auth key the
+  /// stopped socket no longer uses.
+  private applyReRoot(r: ReRooted): void {
+    this.socket.replaceAuthKey(r.keys.authKey);
+    // The socket owns this array and zeroes it at its final close. The
+    // session holds the same reference, as it did for the first key, and
+    // none to the old one, which the socket zeroed.
+    this.cfg.authKey = r.keys.authKey;
+    this.cfg.contentKey = r.keys.contentKey;
+    this.cfg.chainKey = r.keys.chainKey;
+    try {
+      this.socket.adoptEpoch(r.root);
+    } catch (e) {
+      quietly(() => this.socket.stopReconnecting());
+      r.keys.fingerprintSeed.fill(0);
+      wipeWayIn(r.way);
+      quietly(() => this.events.onTemper("COLD"));
+      throw e;
+    }
+    // Clears the departures the re-root cut out and reports "ok", which
+    // reaches the page.
+    quietly(() => this.coordinator.reRooted(r.targetKey));
+    quietly(() => this.machine.reset());
+    quietly(() => this.events.onShredState("IDLE"));
+    this.rerootGen += 1;
+    this.rerootAt = Date.now();
+    this.rerootSnapshotSeen = false;
+    quietly(() => this.snapshotSoon());
+    // What the page shows once. Strings cannot be zeroed: these two are the
+    // copies the person is shown, and nothing here keeps them.
+    let fragment: string | null = null;
+    let passphrase: string | null = null;
+    let fingerprint = "";
+    try {
+      fragment = wayFragment(r.way);
+      passphrase = r.way.kind === "pass" ? r.way.phrase : null;
+      fingerprint = fingerprintWords(r.keys.fingerprintSeed).join("-").toUpperCase();
+    } catch {
+      // Shown without them; the room has moved either way.
+    } finally {
+      r.keys.fingerprintSeed.fill(0);
+      wipeWayIn(r.way);
+    }
+    const targetKey = r.targetKey ? r.targetKey.slice() : null;
+    // Outside the queue: naming the removed member awaits a digest.
+    void (async () => {
+      let removed: string | null = null;
+      try {
+        removed = targetKey ? await handleFromPubkey(targetKey) : null;
+      } catch {
+        removed = null;
+      }
+      quietly(() => this.events.onReRooted?.({ fragment, passphrase, fingerprint, removed }));
+    })();
+  }
+
+  /// The keys from before the last re-root are kept until a snapshot under
+  /// the new root has landed and the overlap has passed, so edits written
+  /// just before it can still be read. The keyring is changed on the epoch
+  /// queue, like every other change to it, and the conditions are read again
+  /// there.
+  ///
+  /// The timer asks every second: while a forgetting waits on the queue, it
+  /// is not queued again.
+  private forgetOldRoot(): Promise<void> {
+    if (this.forgetting || !this.oldRootDue()) return Promise.resolve();
+    this.forgetting = true;
+    let queued: Promise<void>;
+    try {
+      queued = this.coordinator.exclusive(async () => {
+        if (!this.oldRootDue()) return;
+        this.keyring.forgetBeforeRoot();
+        this.rerootAt = null;
+      });
+    } catch {
+      queued = Promise.resolve();
+    }
+    return queued
+      .catch(() => undefined)
+      .finally(() => {
+        this.forgetting = false;
+      });
+  }
+
+  private oldRootDue(): boolean {
+    if (this.rerootAt === null || !this.rerootSnapshotSeen) return false;
+    return Date.now() - this.rerootAt >= EPOCH_OVERLAP_MS;
+  }
+
+  /// The room removed this tab (amendment K), by ERROR or close 4014, or by
+  /// a commit naming its key. It stops reconnecting and says so once. What
+  /// it holds stays in the tab: the document, the editor and its contents
+  /// are left as they are, so they can still be read and copied. Only the
+  /// socket's send and receive queues go, which hold copies of edits already
+  /// in the document and pieces of frames that can no longer arrive whole.
+  private removedFromRoom(): void {
+    if (this.removedSaid) return;
+    this.removedSaid = true;
+    quietly(() => this.socket.stopReconnecting());
+    quietly(() => this.events.onRemoved?.());
+  }
+
+  private async raiseEvictPrompt(p: EvictPrompt): Promise<void> {
+    try {
+      const by = await handleFromPubkey(p.proposerKey);
+      const who = p.targetKey ? await handleFromPubkey(p.targetKey) : null;
+      // The vote may have ended during the awaits above.
+      if (this.evict && !this.evict.isVoting(p.requestId)) return;
+      this.events.onEvictPrompt?.({ id: toB64(p.requestId), by, who });
+    } catch {
+      // A page that cannot show the prompt leaves the vote to its deadline.
+    }
+  }
+
+  /// Where a vote stands, from the evict coordinator. When it fails this
+  /// tab's own commit, it reports FAILED with the commit's fault and then
+  /// refuses the commit with the same reason, in the same task: that refusal
+  /// is noted here as this tab's own.
+  private evictStateChanged(state: string, reason?: string, vote?: { id: string; mine: boolean }): void {
+    this.ownCommitFailed = state === "FAILED" && reason?.startsWith("commit-") ? reason : null;
+    if (this.ownCommitFailed !== null) {
+      queueMicrotask(() => {
+        this.ownCommitFailed = null;
+      });
+    }
+    this.events.onEvictState?.(state, reason, vote);
+    if (state === "FAILED" && reason === "left-out") this.leftOutOfReRoot();
+  }
+
+  /// This tab was left out of a re-root. It holds no key the room opens
+  /// now, so, like a removed tab, it stops its socket and never reconnects:
+  /// connected, it would sit in every later vote's list of people without
+  /// being able to answer, and block them all. Its document stays on screen.
+  /// Said once.
+  private leftOutOfReRoot(): void {
+    if (this.leftOutSaid) return;
+    this.leftOutSaid = true;
+    quietly(() => this.socket.stopReconnecting());
+    quietly(() => this.events.onLeftOut?.());
+  }
+
+  /// A commit that failed a check may mean tampering: it is a key change
+  /// refused, and raises the alarm. Two commit faults do not: `commit-stale`
+  /// (the keyring had already moved, a benign race with another commit) and
+  /// any fault in this tab's own commit, whose vote the page was already told
+  /// failed. Anything else is a request ignored.
+  private evictRefused(reason: string): void {
+    const own = this.ownCommitFailed !== null && reason === this.ownCommitFailed;
+    this.ownCommitFailed = null;
+    const commit = reason.startsWith("commit-") || reason === "malformed-commit";
+    if (!commit) {
+      this.events.onEvictIgnored?.(reason);
+      return;
+    }
+    if (own || reason === "commit-stale") return;
+    this.reportKeyStatus("refused");
   }
 
   /// After a rotation the elected member snapshots straight away, so the log
@@ -760,7 +1144,7 @@ export class Session {
 
   private async decryptConfigBlob(
     blobB64: string,
-  ): Promise<{ ttl: { kind: string; secs: number }; level: SecurityLevel } | null> {
+  ): Promise<{ ttl: { kind: string; secs: number }; level: SecurityLevel; ceilingOptout: boolean } | null> {
     try {
       const blob = fromB64(blobB64);
       const iv = blob.slice(0, 12);
@@ -773,8 +1157,9 @@ export class Session {
       const parsed = JSON.parse(new TextDecoder().decode(pt)) as {
         ttl: { kind: string; secs: number };
         level?: unknown;
+        ceilingOptout?: unknown;
       };
-      return { ttl: parsed.ttl, level: parseSecurityLevel(parsed.level) };
+      return { ttl: parsed.ttl, level: parseSecurityLevel(parsed.level), ceilingOptout: parsed.ceilingOptout === true };
     } catch {
       return null;
     }
@@ -785,7 +1170,7 @@ export class Session {
   private wiped = false;
 
   /// Absolute TTL anchors at join against the AEAD-protected config value
-  /// when present. Idle TTL is an activity-driven window — any local edit,
+  /// when present. Idle TTL is an activity-driven window: any local edit,
   /// remote update or peer change refreshes it, so a tab never
   /// self-destructs mid-session while the server still considers the room
   /// alive.
@@ -847,7 +1232,7 @@ export class Session {
 
   /// `remainingSecs` is what the server says is left, not what we asked for.
   /// The server clamps extensions at a ceiling, so adding our own request to
-  /// the local clock would drift past the real deadline — and the extender
+  /// the local clock would drift past the real deadline, and the extender
   /// used to count its own request twice, once locally and once from the
   /// broadcast it also receives.
   handleTtlExtended(remainingSecs: number, addSecs: number, addedBy: string): void {
@@ -890,7 +1275,8 @@ export class Session {
     void this.refreshOwnHash();
   }
 
-  private handleSnapshot(_sender: Uint8Array, covers: bigint, blobWithPrefix: Uint8Array): void {
+  /// `epoch` is the epoch the snapshot was sealed under, from its frame.
+  private handleSnapshot(_sender: Uint8Array, covers: bigint, blobWithPrefix: Uint8Array, epoch?: number): void {
     try {
       this.doc.applyRemote(blobWithPrefix);
     } catch {
@@ -898,6 +1284,12 @@ export class Session {
     }
     const c = Number(covers);
     this.doc.cursor.noteBelow(c);
+    // Only a snapshot sealed under the current root lets the keys before it
+    // go (amendment K). One sealed under the old root, sent just before the
+    // commit and delivered after it, may cover less than the old-root entries
+    // this tab still has to read. One that lands before any re-root is
+    // forgotten by the next, which starts the wait again.
+    if (epoch !== undefined && epoch >= this.keyring.rootEpoch) this.rerootSnapshotSeen = true;
     if (Number.isSafeInteger(c)) this.lastCovered = Math.max(this.lastCovered, c);
     void this.refreshOwnHash();
   }
@@ -936,8 +1328,11 @@ export class Session {
     // Taken now, so only a rotation that came before this snapshot counts as
     // answered by it.
     const asked = this.snapshotAsked;
+    const gen = this.rerootGen;
     void this.doc.createSnapshot(BigInt(covers)).then((made) => {
       if (!made) return;
+      // Sealed under the latest root only if no re-root came since it began.
+      if (gen === this.rerootGen && this.rerootAt !== null) this.rerootSnapshotSeen = true;
       this.lastCovered = Math.max(this.lastCovered, covers);
       this.snapshotPaid = Math.max(this.snapshotPaid, asked);
     });
@@ -952,7 +1347,7 @@ export class Session {
     this.steadyTimer = setInterval(() => {
       // Cover traffic goes out as AWARENESS, not DOC_UPDATE. The server
       // appends every DOC_UPDATE to the room log and cannot tell padded cover
-      // frames from padded real edits — that is the point of the padding — so
+      // frames from padded real edits (that is the point of the padding), so
       // sending it as an update quietly ate the room's log budget until real
       // edits started being refused. AWARENESS is relayed and never stored.
       void this.socket.sendAwareness(wrapWithLengthAndPad(new Uint8Array(0)));
@@ -961,7 +1356,7 @@ export class Session {
 
   /// When each roster entry was first seen by this client. Presence is
   /// broadcast on a heartbeat, so a peer who has just arrived and not yet
-  /// spoken is genuinely absent from the awareness map — measured at 10-12
+  /// spoken is genuinely absent from the awareness map: measured at 10-12
   /// seconds before a peer became visible by liveness alone. Counting them
   /// during that window is what stops a correct arrival looking like a
   /// disconnection.
@@ -999,7 +1394,7 @@ export class Session {
   /// The previous version compared the local hash *at this instant* against
   /// hashes peers had broadcast up to a heartbeat earlier, on every single
   /// remote update. Two people typing are never at the same state at the same
-  /// moment, so that fires constantly during ordinary editing — and because
+  /// moment, so that fires constantly during ordinary editing, and because
   /// the banner latched and never cleared, one transient mismatch left it up
   /// for the rest of the session. Measured: two clients whose documents were
   /// byte-identical both showed the warning.
@@ -1046,9 +1441,9 @@ export class Session {
   /// Ask the relay for everything again, on request.
   ///
   /// Returns nothing useful on purpose. The server allows one replay per
-  /// connection at a time and drops the rest without a reply — correct, since
-  /// otherwise a peer could make it clone the whole log at the frame rate —
-  /// so a request that arrives during another replay simply does not happen,
+  /// connection at a time and drops the rest without a reply. That is correct,
+  /// since otherwise a peer could make it clone the whole log at the frame
+  /// rate. So a request that arrives during another replay simply does not happen,
   /// and there is no way from here to tell which occurred. The caller must say
   /// it asked, not that it worked.
   resyncNow(): void {
@@ -1137,7 +1532,7 @@ export class Session {
 
     this.startSnapshotLoop();
     // Every cursor movement used to mean an AEAD encrypt plus a websocket
-    // frame — and typing moves the cursor on every keystroke, so the editor
+    // frame, and typing moves the cursor on every keystroke, so the editor
     // was doing crypto per character. Coalesce to at most one frame per
     // 120 ms; presence does not need to be sharper than that.
     let cursorTimer: ReturnType<typeof setTimeout> | null = null;
@@ -1174,6 +1569,7 @@ export class Session {
     cfg.chainKey = null;
     this.socket.dropKeys();
     this.coordinator?.wipe();
+    this.evict?.wipe();
     if (this.epochTimer) clearInterval(this.epochTimer);
     this.cancelSnapshotSoon();
     this.awareness?.dispose();
@@ -1185,7 +1581,7 @@ export class Session {
   }
 
   /// One presence broadcast, used on arrival and whenever somebody else
-  /// arrives. Cheap — it is the same frame the heartbeat sends — and it is
+  /// arrives. Cheap (it is the same frame the heartbeat sends), and it is
   /// what makes a liveness-derived count appear in about a second instead of
   /// on the next ten-second beat.
   async announcePresence(): Promise<void> {
@@ -1199,7 +1595,7 @@ export class Session {
   /// The roster size. This is the consensus denominator and must stay that
   /// way: a THRESHOLD request carries its bar inside the signed payload, and
   /// every receiver re-derives `supermajorityFor(ownRoster.length)` and
-  /// rejects anything lower — so a proposal computed from a smaller number
+  /// rejects anything lower, so a proposal computed from a smaller number
   /// would be refused by everyone it was sent to.
   get peerCount(): number {
     return this.internals.roster.size;
@@ -1209,7 +1605,7 @@ export class Session {
   ///
   /// The roster is a snapshot taken when this client joined, patched with the
   /// PEER_JOIN and PEER_LEAVE events it happened to receive afterwards. Miss
-  /// one — during a disconnect, say — and it over-counts for the rest of the
+  /// one, during a disconnect, say, and it over-counts for the rest of the
   /// session with nothing to correct it. Four devices in one room reported 5,
   /// 3, 3 and 3 people at the same moment, all from the same server.
   ///
@@ -1217,7 +1613,7 @@ export class Session {
   /// live presence is self-healing and every client converges on the same
   /// number because they are all watching the same traffic. A device that
   /// reconnects stops broadcasting under its old identity and drops out
-  /// without anything having to recognise that it is the same device — which
+  /// without anything having to recognise that it is the same device, which
   /// is how this avoids introducing a linkable cross-session identifier into a
   /// tool that deliberately stores nothing.
   ///
@@ -1312,6 +1708,7 @@ export class Session {
     if (this.epochTimer) clearInterval(this.epochTimer);
     this.cancelSnapshotSoon();
     this.coordinator?.wipe();
+    this.evict?.wipe();
     this.cursorTimerRef?.();
     this.binding?.dispose();
     this.doc.destroy();
@@ -1445,4 +1842,13 @@ function cmpBytes(a: Uint8Array, b: Uint8Array): number {
     if (a[i] !== b[i]) return a[i] - b[i];
   }
   return a.length - b.length;
+}
+
+/// Runs a callback whose failure must not stop the caller.
+function quietly(fn: () => void): void {
+  try {
+    fn();
+  } catch {
+    // Ignored on purpose.
+  }
 }

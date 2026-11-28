@@ -48,13 +48,13 @@ protocol design inside that bundle helps.
 What can be done, and what RÚNA does:
 
 - Zero third-party script origins. No CDN, no analytics, no hosted fonts.
-- Strict CSP with `script-src 'self' 'wasm-unsafe-eval'` — scripts only from
+- Strict CSP with `script-src 'self' 'wasm-unsafe-eval'`: scripts only from
   this origin, WebAssembly allowed to compile because Argon2id needs it, `eval`
-  still forbidden — and Subresource Integrity on every asset.
+  still forbidden, and Subresource Integrity on every asset.
 - Trusted Types enforced, with the policy allow-list naming only `default` and
   the nine policies monaco-editor creates. **Honest limit:** the `default`
   policy's `createHTML` is a pass-through compatibility shim for Monaco's own
-  DOM writes — it is not a sanitiser. The control that protects document
+  DOM writes. It is not a sanitiser. The control that protects document
   content is `rehype-sanitize` in `web/src/render/pipeline.ts`. What the
   `default` policy does enforce is `createScriptURL`, which is restricted to
   same-origin URLs.
@@ -83,7 +83,7 @@ room's lifetime. It is not, however, the 96 bits a random-nonce scheme would
 give, and it is worth knowing which number the guarantee rests on. Widening the
 session id is a wire-format change and is deferred to a protocol revision.
 
-The counter never restarts within a session — a client that rebuilt its cipher
+The counter never restarts within a session: a client that rebuilt its cipher
 mid-connection would replay nonces, which is why JOIN_ACK re-labels the sender
 in place and is accepted only once per connection.
 
@@ -100,7 +100,7 @@ What consensus shred is actually good for:
 - Making the server's copy provably unrecoverable, since it never had keys.
 - Giving a group a clear, agreed, observable moment of "this is over."
 
-The UI says this in plain words at the moment of first use, once — not in a
+The UI says this in plain words at the moment of first use, once, not in a
 terms page nobody reads.
 
 ### And consensus is a guarantee against your peers, not against the server
@@ -110,7 +110,7 @@ the conclusion was not.
 
 A shred vote is a signed object, and each receiver checks the signature against
 the public key its roster holds for the claimed signer. That roster comes from
-the server — `JOIN_ACK` on joining, `PEER_JOIN` afterwards. A3 already says a
+the server: `JOIN_ACK` on joining, `PEER_JOIN` afterwards. A3 already says a
 malicious operator can "forge peers"; this is what that costs. Substitute your
 own key for every peer, sign a request and a vote from each, and you have a
 unanimous decision nobody took, which destroys the shared copy and runs the
@@ -119,7 +119,7 @@ wipe in every connected browser.
 It grants a hostile operator no capability they lacked. They hold the log and
 can drop it; they can disconnect everyone; they can refuse to relay. Destroying
 a room is something they could already do more simply. And confidentiality is
-untouched either way — the server never holds a key, so forging a vote reveals
+untouched either way: the server never holds a key, so forging a vote reveals
 nothing.
 
 What it means is narrower and worth being precise about. "Everyone must agree"
@@ -155,7 +155,8 @@ What that buys is narrow, so here it is exactly:
 - **It does not stop them coming back.** They still hold the link or the
   passphrase, so they can rejoin, appear in the peer list like anyone else, and
   be handed the current key. Rotation turns silent reading into a visible
-  return.
+  return. Removing them, described below, is what takes the link or passphrase
+  away.
 - **It gives no backward secrecy.** A departed peer keeps everything they saw
   while they were there.
 - **Everyday rooms do not rotate when someone leaves.** An everyday room
@@ -167,6 +168,20 @@ What that buys is narrow, so here it is exactly:
   room's sealed configuration makes it behave as Highest, so it rotates; that
   costs availability, not confidentiality, and the server could delete the room
   anyway.
+- **A vote to remove someone holds key changes back.** While a request to
+  remove someone or change the link is open, the server applies no key change,
+  for up to 150 seconds. The server counts the limit on that per connection:
+  one connection's requests can hold the room for at most 300 seconds in any
+  900, but someone who reconnects starts with a fresh allowance, and each of
+  their connections has its own, so several connections can hold key changes
+  back without a gap for as long as they keep asking. A request is withdrawn
+  only when the person who asked cancels it, so a vote that is refused, runs
+  out or fails holds key changes for the whole 150 seconds. If someone leaves
+  during a hold, the key changes within about 15 seconds of the hold ending
+  and of the last open request ending, since the people in the room also hold
+  their own key changes while any request is open, so a member can let a
+  person who left read on for that long. Any member
+  could already pass them the new key itself.
 - **A tab opened before key rotation existed is kept out once the key has
   changed.** It cannot be handed a new key, so the server refuses it with a
   version error. The older page does not explain that error: it keeps trying to
@@ -205,6 +220,169 @@ keeps trying, and nothing tells anyone that the change is overdue. As
 everywhere in this document, nothing here helps against a server that serves
 bad JavaScript, and running the server yourself is the answer to both.
 
+### Removing someone, and changing the link
+
+Rotation on a departure leaves the person who left holding the link or the
+passphrase. Removing them takes it away. The person who asks has already made
+the replacement: a new link, or for a shared-name room a passphrase they typed
+or generated, held to the same strength check as a new room's. Everyone else in
+the room has to approve, any one of them can refuse, and a vote that nobody
+settles fails after a minute. The app always sets a minute and offers no choice;
+two minutes is the longest the protocol allows. The server checks this too: it
+applies the change only when everyone the request was put to has approved. Once
+everyone has approved, each member receives the new link or passphrase sealed to
+them alone, the server replaces what it checks a JOIN against, and the room's
+key starts again from the new link or passphrase. Changing the link is the same
+vote with nobody removed. It is what an everyday room can do about someone who
+once had its link, since an everyday room does not change its key when people
+leave. The design is in PROTOCOL amendment K.
+
+What that buys, exactly:
+
+- **The removed person cannot come back with what they had.** Their old link
+  or passphrase is refused like a wrong one, and their page says they were
+  removed. Every connection holding their signing key is left out of the vote
+  and of the new link, and closed, as well as the one that was named: every
+  vote names that key, so the server recognises those connections too. If
+  someone sends them the new one, they can come back, visibly.
+- **They cannot read what is written afterwards**, unless someone gives them
+  the new link or passphrase, or a dishonest server helps them (below).
+- **It gives no backward secrecy.** They keep everything they saw.
+- **Anyone not connected at that moment, or who arrived during the vote, is cut
+  off too.** Their link stops working, and they need the new one from someone
+  who was there. Each member is shown the new link or passphrase once, with a
+  reminder to send it to anyone who should still be here. A tab that was away
+  when the way in changed comes back with the old link or passphrase, is
+  refused, and shows the same "this room is gone" page as for an expired room.
+  The page cannot tell the two apart, so the person needs the new one from
+  someone who was there.
+- **A member follows a change only for a request it saw**, in a roster that
+  lists it under its own signing key. A member that did not see the request
+  checks what it can and is told it was left out. Its tab then stops
+  connecting, as a removed one does, and keeps what it already had on screen,
+  read-only.
+- **A hostile member can stall a removal.** Any member other than the person
+  being removed can refuse, which is the point of the rule. A member can also
+  make a vote fail, or make the others wait until a vote's deadline, by
+  sending requests that cannot pass or by asking and then never sending the
+  change once everyone has agreed. Nothing changes when that happens, and
+  nobody is removed either.
+- **A tab running an older version cannot vote.** A tab opened before this
+  release has no key-agreement key and does not understand the vote, so while
+  one is connected no removal or link change can pass; it has to be reloaded
+  first.
+- **Until the change lands, the person being removed is still a member.**
+  They can see that a vote has started, because the kind of each frame is
+  visible to everyone in the room. They read everything written until the
+  change, and they can vote on other things. Nobody asks for their approval,
+  and it would not count if they gave it. They cannot change the room's key
+  while the vote is open, because the server holds key changes while a request
+  to remove someone is open, within the limits below. What they can still do is change the key
+  just before a vote starts and leave someone out of the new key on purpose.
+  That person's tab joins again to be handed the key, and a vote asked for
+  before it has done so fails when its old connection leaves; the next request
+  can go ahead once it has. The hold lasts at most 150 seconds, and one
+  connection's requests get it for at most 300 seconds in any 900, so a vote
+  asked for from the same tab past that runs without it and can be stopped
+  that way. A server that does not hold key changes lets them do it during any
+  vote, and then they can make every vote fail; the remedy then is a new room.
+  A member can also send a key change just before a vote starts that hands one
+  of the people who will approve a copy of the new key they cannot open. If
+  that person approves and the change lands, their tab is told it was left
+  out and stops. That needs blind timing, because nobody sees a request
+  before the server has noted it.
+
+  Their own requests don't let them block it. A member holds several requests
+  open at once, at most one from each signing key and eight in all, so their
+  requests take one place however many tabs they open under their key, and
+  anyone else can still ask to remove them. Someone whose own request is open
+  can still answer everyone else's. If they keep a request of their own open,
+  or open and cancel requests in a loop, what they get is prompts that appear
+  and disappear for everyone else, and key changes held back for as long as
+  they keep a request open, because the people in the room hold their own key
+  changes while any request is open, whatever the server's limits. The room
+  can see it happening, because the same person keeps asking.
+
+  A member who is determined to stay can still block their own removal, and it
+  doesn't depend on timing. They can join under a second identity before anyone
+  asks. That second identity is a member, its approval is needed, and it can
+  refuse or leave. Neither identity can then be removed without the other's
+  approval, and eight identities can each keep a request open and fill every
+  place a member holds. A copy of another member's public key can refuse or
+  leave the same way, though it cannot open a request because it cannot sign
+  one, and it looks like that member's second tab. So removal by unanimous vote
+  works against someone who hasn't prepared a second identity, and it doesn't
+  work against a member who is determined to stay. What a removal guarantees
+  once it lands is unchanged: the removed person's old link or passphrase no
+  longer opens the room, and nothing written afterwards reaches them. Changing
+  the link while the unwanted person isn't connected isn't affected by any of
+  this, because someone who isn't connected has no vote.
+- **Someone being removed cannot dodge it by reconnecting: a new connection is
+  not given the new link.** The room changes its link whether or not they are
+  still connected, and only the people who approved receive the new one.
+- **Connections opened after a vote started are not asked.** The server checks
+  that everyone who was connected when the request passed through it, and is
+  still connected, approved, so nobody can hold the vote down by opening
+  connections once it has begun. Connections the person being removed holds
+  under their own signing key are never asked. Connections they opened under
+  other keys before anyone asked show in the room as extra people, have to be
+  asked too, and can refuse, as described above. Several connections that share
+  one signing key, other than the removed person's, are each asked separately.
+  The server cannot read a request, so it counts a commit against its sender's
+  latest one: a member who asked while alone in the room could, within 150
+  seconds, change the link with their own approval alone, and everyone who
+  arrived since would be left out. That is no more than a member can already do
+  to a room by breaking its key.
+- **A copy of someone's signing key counts as them.** A JOIN carries no proof
+  that the connection holds the private half of the signing key it presents,
+  so the server treats a connection that presents a copy of someone's public
+  key as that person. Removing either of them closes both.
+- **A removed person can delay the notice that they left.** A removed peer
+  that stops reading its own socket holds its connection slot until TCP gives
+  up, and the others are told it left only then. A removed peer whose outgoing
+  queue was already full at the commit is closed without the 4014 code, and
+  the notice that it left carries no reason; an error already queued for it
+  can be the one it receives.
+- **In a room of two, either person can remove the other.** Whichever change
+  reaches the server first wins.
+- **The room's fingerprint changes.** Anyone who compared it before should
+  compare the new one.
+
+Against the server:
+
+- **It checks the votes itself**, against the signing key each voter joined
+  with, and changes nothing unless everyone who was connected when the request
+  passed through it and is still connected, apart from every connection
+  holding the removed person's signing key, signed. Members hold the vote to
+  the same rule, and also end it if anyone whose approval it needs leaves. It
+  also holds key changes while a request is open, so the person being removed
+  cannot end the vote by changing the room's key, within the limits above. In
+  exchange the server learns which connections voted to remove which, and
+  when.
+- **It cannot check what it cannot read.** Someone who holds everyone's
+  approval can still send a change whose sealed copies or new settings the
+  others refuse. The server applies it, and the people who refused are left
+  out with what they already had, as if they had left to start a new room.
+- **It never sees the new link or passphrase.** Each member's copy is sealed
+  under a key agreed with the person who asked, as with rotation, and the same
+  limit applies: a server working with the removed person can put its own
+  key-agreement key in place of a member's in the peer list, open that member's
+  copy and pass the new link on. Comparing the new fingerprint does not catch
+  this, because the fingerprint comes from the link itself.
+- **A server that will not enforce a removal** can keep accepting the old link,
+  or keep the removed person's connection open. They still cannot read anything
+  written under the new key without the substitution above. Such a server can
+  also pass the removed person's edits under the old key to the others. Once
+  the overlap after the change has passed, members drop those relayed as live
+  edits, but a server that lies about its log can still present them as part
+  of a catch-up, until each member has forgotten the old key.
+- **Nothing stops a member who stays from passing the new link on.** Removal
+  protects the room from the person removed, not from the people who keep their
+  place.
+
+As everywhere in this document, none of this holds against a server that
+serves bad JavaScript.
+
 ## Metadata the server unavoidably learns
 
 | Leak | Why | Mitigation |
@@ -218,6 +396,7 @@ bad JavaScript, and running the server yourself is the answer to both.
 | Room TTL | The server enforces it, so it must know it | None. It is a scheduling parameter, not a secret |
 | A named room's name | It is the routing address | None, by construction. This is the entire trade; it is why named rooms are a separate class with a separate promise |
 | When a room's key changes, and how many times | It relays each rotation and enforces the room's current epoch | None. It already sees every departure that causes one |
+| Who asked to remove whom, who agreed, and when a room's link changed | It checks the votes and replaces what it checks a JOIN against | None. Votes name connections, which carry no names |
 
 ## Known limits stated plainly
 
@@ -232,8 +411,8 @@ to the server, but browsers write the full URL into their history, and a
 browser with sync on copies that history to its vendor. So the client keeps
 the key out of the address bar (`web/src/keyhandoff.ts`):
 
-- A room opened from inside RÚNA — created on the front page, or joined by
-  pasting its link into Join — gets the key handed over in memory. It is
+- A room opened from inside RÚNA (created on the front page, or joined by
+  pasting its link into Join) gets the key handed over in memory. It is
   never in the address, so no history entry can carry it.
 - A room opened from a clicked link has the fragment removed by
   `history.replaceState` as the page starts. The browser may already have
@@ -296,7 +475,7 @@ server writing anything down. What makes that safe is what a ticket cannot do:
 
 - **It cannot open a room.** It recreates one with the verifier it had, so
   joining still takes the key. A leaked ticket lets its holder recreate an
-  empty room nobody can enter without the key — and only for ten minutes.
+  empty room nobody can enter without the key, and only for ten minutes.
 - **It cannot undo a shred.** Tickets are issued when the process stops, only
   for rooms still alive at that moment, so a room shredded before then has
   none. One shredded after it was brought back is a tombstone in the new

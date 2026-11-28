@@ -10,7 +10,7 @@ import { PART_MARKER, RunaSocket, readPart, splitIntoParts, toB64, type SocketEv
 
 /// Stands in for the browser's WebSocket. `dead` models a connection that has
 /// died without the browser noticing: it stays OPEN, sends vanish, and nothing
-/// arrives — which is what a laptop waking or a phone changing networks does.
+/// arrives, which is what a laptop waking or a phone changing networks does.
 class FakeWebSocket {
   static readonly CONNECTING = 0;
   static readonly OPEN = 1;
@@ -464,7 +464,7 @@ describe("the log index of every entry", () => {
     await waitFor(() => applied.length === 1);
     expect([...taken].sort((a, b) => a - b)).toEqual(parts.map((_, i) => 10 + i));
 
-    // A part sent again after the update was whole — its first ack was lost —
+    // A part sent again after the update was whole (its first ack was lost)
     // is taken at once rather than starting an assembly that never ends.
     rws.deliver(relayIndexed(parts[0], 50));
     await waitFor(() => taken.includes(50));
@@ -793,5 +793,283 @@ describe("epochs (amendment J)", () => {
     await sleep(0);
     expect(onPeerJoin.mock.calls[0][0].kxPub).toEqual(kx);
     expect(onPeerJoin.mock.calls[0][0].kxSig).toEqual(sig);
+  });
+});
+
+describe("eviction and re-roots (amendment K)", () => {
+  it("treats what it derived as the root the room names, before anything has moved", async () => {
+    const { socket, key, keyring } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck({ epoch: 3, root_epoch: 3 }));
+    await sleep(0);
+    expect(socket.isAwaitingKeys).toBe(false);
+    expect(socket.currentEpoch).toBe(3);
+    expect(keyring.rootEpoch).toBe(3);
+    await socket.sendUpdate(text("on the new link"));
+    await waitFor(() => docFrames(ws).length === 1);
+    const frames = docFrames(ws);
+    expect(new DataView(frames[0].buffer, frames[0].byteOffset).getUint32(20, false)).toBe(3);
+    expect(await readAsPeer(frames[0], key)).toEqual(text("on the new link"));
+  });
+
+  it("does not relabel a keyring that has already moved", async () => {
+    const { socket, keyring } = await makeSocket();
+    await stepRing(keyring);
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck({ epoch: 5, root_epoch: 5 }));
+    await sleep(0);
+    expect(keyring.rootEpoch).toBe(0);
+    expect(socket.isAwaitingKeys).toBe(true);
+  });
+
+  it("opens EVICT frames and passes them on, and drops stale ones", async () => {
+    const onEvictFrame = vi.fn();
+    const onEpochStale = vi.fn();
+    const { socket, key, keyring } = await makeSocket({ events: { onEvictFrame, onEpochStale }, epochOverlapMs: 0 });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.deliver(await incoming(FT.EVICT_VOTE, 0, key, new Uint8Array([1, 2, 3])));
+    await waitFor(() => onEvictFrame.mock.calls.length === 1);
+    expect(onEvictFrame.mock.calls[0][0]).toBe(FT.EVICT_VOTE);
+    expect(onEvictFrame.mock.calls[0][1]).toEqual(OTHER);
+    expect(onEvictFrame.mock.calls[0][2]).toEqual(new Uint8Array([1, 2, 3]));
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    await sleep(5);
+    ws.deliver(await incoming(FT.EVICT_REQUEST, 0, key, new Uint8Array([4])));
+    await waitFor(() => onEpochStale.mock.calls.length > 0);
+    expect(onEvictFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it("passes EVICT_COMMIT through unopened", async () => {
+    const onEvictCommit = vi.fn();
+    await makeSocket({ events: { onEvictCommit } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.EVICT_COMMIT, roomId: ROOM, epoch: 0, nonceSess: new Uint8Array(4), flags: 0 });
+    const body = new Uint8Array([9, 8, 7]);
+    ws.deliver(concatBytes(header, OTHER, body));
+    await waitFor(() => onEvictCommit.mock.calls.length === 1);
+    const [h, e, sender, b] = onEvictCommit.mock.calls[0];
+    expect(h).toEqual(header);
+    expect(e).toBe(0);
+    expect(sender).toEqual(OTHER);
+    expect(b).toEqual(body);
+  });
+
+  it("sends EVICT frames sealed under the current key, and signed frames as they are", async () => {
+    const { socket, key } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    expect(await socket.sendEvictFrame(FT.EVICT_REQUEST, new Uint8Array([5, 5]))).toBe(true);
+    const sealed = ws.sent.find((f) => f[3] === FT.EVICT_REQUEST)!;
+    expect(await readAsPeer(sealed, key)).toEqual(new Uint8Array([5, 5]));
+    const h = socket.frameHeader(FT.EVICT_COMMIT, 0);
+    expect(h[3]).toBe(FT.EVICT_COMMIT);
+    expect(socket.sendSigned(h, new Uint8Array([1]))).toBe(true);
+    expect(ws.sent.at(-1)).toEqual(concatBytes(h, new Uint8Array([1])));
+  });
+
+  it("stops reconnecting when it is removed, and says so once", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(4014);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("treats a close with 4014 alone the same way", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.close(4014);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError).toHaveBeenCalledWith(4014);
+  });
+
+  it("passes on each snapshot with the epoch of the frame it came in, not the epoch it sends under", async () => {
+    const onSnapshot = vi.fn();
+    const { socket, key, keyring } = await makeSocket({ events: { onSnapshot }, epochOverlapMs: 60_000 });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    await stepRing(keyring);
+    socket.adoptEpoch(1);
+    const snapshot = async (epoch: number, k: CryptoKey, covers: bigint) => {
+      const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.SNAPSHOT, roomId: ROOM, epoch, nonceSess: new Uint8Array(4), flags: 0 });
+      const env = await new FrameCipher(k, OTHER).encrypt(header, text("state"), covers);
+      const body = new Uint8Array(8 + env.length);
+      new DataView(body.buffer).setBigUint64(0, covers, false);
+      body.set(env, 8);
+      return concatBytes(header, OTHER, body);
+    };
+    // Sealed under the epoch this socket has just left, then under its own.
+    ws.deliver(await snapshot(0, key, 3n));
+    await waitFor(() => onSnapshot.mock.calls.length === 1);
+    ws.deliver(await snapshot(1, keyring.current.contentKey, 4n));
+    await waitFor(() => onSnapshot.mock.calls.length === 2);
+    expect(onSnapshot.mock.calls[0][1]).toBe(3n);
+    expect(onSnapshot.mock.calls[0][3]).toBe(0);
+    expect(onSnapshot.mock.calls[1][1]).toBe(4n);
+    expect(onSnapshot.mock.calls[1][3]).toBe(1);
+  });
+
+  it("stays stopped after ERROR 4014 and then an abnormal close, and says so once", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(1006);
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("says it was removed once when ERROR 4014 comes twice", async () => {
+    const onError = vi.fn();
+    await makeSocket({ events: { onError } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const before = FakeWebSocket.all.length;
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+    expect(onError.mock.calls.filter((c) => c[0] === 4014)).toHaveLength(1);
+  });
+
+  it("does not come back on resume() after a close with 4014", async () => {
+    await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.close(4014);
+    const before = FakeWebSocket.all.length;
+    const socket = sockets[sockets.length - 1];
+    socket.resume();
+    await sleep(700);
+    expect(FakeWebSocket.all.length).toBe(before);
+  });
+
+  it("ignores reconnectNow() once removed, so the page is not told twice that it disconnected", async () => {
+    const onDisconnected = vi.fn();
+    const { socket } = await makeSocket({ events: { onDisconnected } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    ws.deliver(buildJsonFrame(FT.ERROR, ROOM, 0, { code: 4014 }));
+    ws.close(4014);
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    const before = FakeWebSocket.all.length;
+    socket.reconnectNow();
+    await sleep(700);
+    expect(onDisconnected).toHaveBeenCalledTimes(1);
+    expect(FakeWebSocket.all.length).toBe(before);
+  });
+
+  it("joins with the replacement key after a re-root", async () => {
+    const { socket } = await makeSocket();
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck());
+    await sleep(0);
+    const next = new Uint8Array(32).fill(2);
+    const before = FakeWebSocket.all.length;
+    socket.replaceAuthKey(next);
+    socket.reconnectNow();
+    await waitFor(() => FakeWebSocket.all.length > before);
+    const again = latest();
+    expect(again).not.toBe(ws);
+    again.open();
+    await waitFor(() => again.sent.length > 0);
+    const body = JSON.parse(new TextDecoder().decode(again.sent[0].slice(HEADER_LEN)));
+    expect(body.auth_key).toBe(toB64(new Uint8Array(32).fill(2)));
+  });
+});
+
+describe("updates under the root a re-root left (amendment K)", () => {
+  async function reRooted(overlapMs: number, onDocUpdate: (s: Uint8Array, pt: Uint8Array) => void, ack: Record<string, unknown> = {}) {
+    const { socket, key, keyring } = await makeSocket({ epochOverlapMs: overlapMs, events: { onDocUpdate } });
+    const ws = latest();
+    ws.open();
+    ws.deliver(joinAck(ack));
+    await sleep(0);
+    const content = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x51), { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
+    const chain = await crypto.subtle.importKey("raw", new Uint8Array(32).fill(0x52), "HKDF", false, ["deriveBits", "deriveKey"]);
+    expect(await keyring.reroot(1, content, chain)).not.toBeNull();
+    socket.adoptEpoch(1);
+    return { socket, ws, oldKey: key, newKey: content };
+  }
+
+  /// A frame as relayed to a connection that asked for indexes.
+  async function incomingIndexed(epoch: number, key: CryptoKey, plaintext: Uint8Array, index: number): Promise<Uint8Array> {
+    const header = encodeHeader({ version: PROTOCOL_VERSION, frameType: FT.DOC_UPDATE, roomId: ROOM, epoch, nonceSess: new Uint8Array(4), flags: 0 });
+    const env = await new FrameCipher(key, OTHER).encrypt(header, plaintext);
+    const i = new Uint8Array(8);
+    new DataView(i.buffer).setBigUint64(0, BigInt(index), false);
+    return concatBytes(header, OTHER, i, env);
+  }
+
+  it("still reads a live update under the old root inside the overlap", async () => {
+    const got: Uint8Array[] = [];
+    const { ws, oldKey } = await reRooted(60_000, (_s, pt) => got.push(pt));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 0, oldKey, text("written just before")));
+    await waitFor(() => got.length === 1);
+    expect(got[0]).toEqual(text("written just before"));
+  });
+
+  it("drops a live update under the old root once the overlap has passed, and still reads the new root", async () => {
+    const got: Uint8Array[] = [];
+    const { ws, oldKey, newKey } = await reRooted(0, (_s, pt) => got.push(pt));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 0, oldKey, text("from the removed person")));
+    ws.deliver(await incoming(FT.DOC_UPDATE, 1, newKey, text("under the new root")));
+    await waitFor(() => got.length === 1);
+    // Given time to arrive, the old-root update is still not read.
+    await sleep(30);
+    expect(got).toEqual([text("under the new root")]);
+  });
+
+  it("still reads old-root entries inside a sync response after the overlap, and only those", async () => {
+    const got: Uint8Array[] = [];
+    const { socket, ws, oldKey } = await reRooted(0, (_s, pt) => got.push(pt), { indexed: true, log_len: 3 });
+    socket.sendSyncRequest(0);
+    for (let i = 0; i < 3; i++) ws.deliver(await incomingIndexed(0, oldKey, text(`entry ${i}`), i));
+    await waitFor(() => got.length === 3);
+    expect(got).toEqual([text("entry 0"), text("entry 1"), text("entry 2")]);
+    // Past what the log held when this connection joined, or an index the
+    // response has already passed: not part of the sync response.
+    ws.deliver(await incomingIndexed(0, oldKey, text("live, index 3"), 3));
+    ws.deliver(await incomingIndexed(0, oldKey, text("again, index 1"), 1));
+    await sleep(30);
+    expect(got).toHaveLength(3);
   });
 });

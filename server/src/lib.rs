@@ -75,7 +75,7 @@ impl AppState {
     /// Drop every per-client entry that no longer affects a decision: full
     /// buckets, expired blocks, refilled per-room join budgets. Before this,
     /// nothing was removed until a table reached its cap, which a quiet server
-    /// never does — so it held a pseudonym for everyone since boot.
+    /// never does, so it held a pseudonym for everyone since boot.
     pub fn forget_idle_clients(&self) {
         for limiter in [
             &self.auth_per_ip,
@@ -147,7 +147,7 @@ impl AppState {
     ///
     /// Issued at the very end, not with the warning: a room shredded during
     /// the countdown must not leave its members holding a way to bring it
-    /// back. Sent with backpressure rather than dropped on a full queue — a
+    /// back. Sent with backpressure rather than dropped on a full queue: a
     /// member who misses theirs can still rejoin once another has restored
     /// the room, but a room nobody got a ticket for is gone.
     pub async fn hand_over(&self) -> usize {
@@ -160,13 +160,19 @@ impl AppState {
             if !matches!(room.current_state(), runar::room::RoomState::Active) {
                 continue;
             }
+            // Issued first: issuing stops the room's epoch and way in from
+            // moving (`Room::ticket_access`, under `epochs` alone), so no
+            // commit or step can land while the ticket is on its way and
+            // leave the members holding a ticket for a room that has moved
+            // on. The peers are read after that, under `peers` alone, and
+            // the guard is dropped before anything is awaited.
+            let Some(ticket) = runar::ticket::issue(key, &room, now) else {
+                continue;
+            };
             let peers: Vec<_> = room.peers.lock().unwrap().iter().map(|p| p.tx.clone()).collect();
             if peers.is_empty() {
                 continue;
             }
-            let Some(ticket) = runar::ticket::issue(key, &room, now) else {
-                continue;
-            };
             let frame = crate::bifrost::restart_ticket(room.id, &ticket);
             for tx in peers {
                 let _ = tokio::time::timeout(Duration::from_secs(2), tx.send_backpressured(frame.clone())).await;

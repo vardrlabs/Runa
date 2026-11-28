@@ -1,5 +1,5 @@
 /// Where an unlisted room's key lives between "I have the link" and "the room
-/// is open" — and, just as much, where it does not.
+/// is open", and, just as much, where it does not.
 ///
 /// The key is the URL fragment (`#k=…&s=…`). A fragment never reaches the
 /// server, which is why it was put there, but the browser does write the full
@@ -40,7 +40,7 @@ function keyState(): KeyState | null {
 
 /// The key for the room at `/r/<roomIdHex>`, from wherever it is: a handoff,
 /// the address (which this then clears), or the tab's saved state. Undefined
-/// if there is none — a highest-security room after a refresh, say.
+/// if there is none: a highest-security room after a refresh, say.
 export function takeRoomKey(roomIdHex: string): string | undefined {
   const hash = window.location.hash;
   if (hash.startsWith("#k=")) {
@@ -79,6 +79,15 @@ export function applySecurityLevel(
   } else if (keyState()) {
     history.replaceState(null, "", here);
   }
+}
+
+/// The room's link changed (amendment K): the old key opens nothing now.
+/// The new one replaces it in memory, and in an everyday room in the tab's
+/// saved state too, so a refresh comes back in with it. A highest-security
+/// room keeps it in memory only, and drops any key the tab had saved.
+export function replaceRoomKey(roomIdHex: string, fragment: string, level: SecurityLevel): void {
+  current = { roomIdHex, fragment };
+  applySecurityLevel(roomIdHex, fragment, level);
 }
 
 /// The full shareable link, built from the key in memory rather than read

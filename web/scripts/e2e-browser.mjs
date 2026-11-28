@@ -38,13 +38,13 @@ function waitForProcessExit(proc) {
   return new Promise((resolve) => proc.once("exit", resolve));
 }
 
-/// Open a page of the app — the front page or a room — recovering from a
+/// Open a page of the app, the front page or a room, recovering from a
 /// Playwright bug that strands Firefox navigations.
 ///
 /// On the Linux runner Firefox timed out opening a room page on four runs, at
 /// three different pages, and waiting only for commit instead of
 /// DOMContentLoaded changed nothing. When the stalled page could be asked, it
-/// had loaded perfectly — the room rendered, nothing in flight — while
+/// had loaded perfectly, the room rendered, nothing in flight, while
 /// Playwright still reported about:blank.
 ///
 /// That is microsoft/playwright#42183. In Firefox a small share of navigations
@@ -60,11 +60,11 @@ function waitForProcessExit(proc) {
 /// app takes the key out of the address bar as it starts (keyhandoff.ts): a
 /// room page that loaded correctly is at `/r/<id>`, never `/r/<id>#k=…`. Anything else keeps the original navigation
 /// and its verdict. Every recovery is written to the log, and the room still
-/// has to come up — each caller waits for the editor next.
+/// has to come up, each caller waits for the editor next.
 ///
 /// The front page goes through here too. Two Firefox runs on 2026-10-07 timed
 /// out on its very first load, waiting for DOMContentLoaded, with the server
-/// up — the same stranding, at a load that had no recovery.
+/// up, the same stranding, at a load that had no recovery.
 ///
 /// Request listeners were taken off these pages once the diagnosis was done:
 /// listeners attached before navigating are one of the conditions the upstream
@@ -299,7 +299,7 @@ async function main() {
         opened.push(ws);
         // Severed: refuse the connection. Closing while still CONNECTING means
         // onopen can never fire, so nothing reaches the server, and the client
-        // gets the close event after it has attached its handlers — the same
+        // gets the close event after it has attached its handlers, the same
         // thing it sees when the network is really gone.
         // Two more ways a network fails, for the tests that need them. A
         // connection that has died without the browser noticing stays OPEN:
@@ -348,14 +348,14 @@ async function main() {
   ///
   /// `context.setOffline` is not that. Running the suite on three engines was
   /// what showed how far apart they are: all three refuse new *HTTP* requests
-  /// while offline, but only Chromium tears down an established WebSocket —
+  /// while offline, but only Chromium tears down an established WebSocket,
   /// Gecko leaves it up, and WebKit will happily open a brand new one while
   /// `navigator.onLine` is false. The offline peer there reconnected inside
   /// the same tick, stayed in sync, and the split-brain test then failed its
   /// own precondition rather than passing on a setup that never happened.
   ///
   /// So do neither engine's version of offline. From inside the page, close
-  /// the socket that is up and refuse every new one until restored — the
+  /// the socket that is up and refuse every new one until restored, the
   /// patched constructor in makePage does the refusing. The client sees a
   /// close it did not ask for and retries on its backoff, which is what a lost
   /// network actually looks like.
@@ -363,7 +363,7 @@ async function main() {
   /// Not `page.routeWebSocket`, which was the first version of this. It relays
   /// every frame of every routed socket through the Playwright driver, so the
   /// sync tests were measuring traffic that took a detour through the test
-  /// harness rather than the connection they claim to test — and on the Linux
+  /// harness rather than the connection they claim to test, and on the Linux
   /// runner Firefox then hung loading the second peer while the first one's
   /// frames were being relayed. Cause not proven; the detour is wrong anyway.
   async function severNetwork(page) {
@@ -392,7 +392,7 @@ async function main() {
   // Scope, honestly: this catches fixed widths, wide tables and unbreakable
   // strings. It does NOT catch the bug that prompted it. On iOS Safari a
   // <select> grows to fit its longest <option> and drags the page sideways;
-  // Chromium clamps it — headless and under device emulation alike — so the
+  // Chromium clamps it, headless and under device emulation alike, so the
   // failure is unreproducible here. Measured: the same page that scrolled
   // 214px sideways on a real iPhone reports zero overflow in this engine.
   //
@@ -552,6 +552,621 @@ async function main() {
     for (const p of [a, b, c]) await p.close();
   }
 
+  // Removing someone and changing the way in (PROTOCOL amendment K), seen
+  // from every tab involved. These are the first runs of the whole feature in
+  // a real browser, so each step checks what the person in front of that tab
+  // would actually see, and the crypto is checked from outside the browser as
+  // well.
+  //
+  // Tabs that are part of these scenarios, kept so a failure can show what
+  // each of them looked like.
+  const evictPages = new Map();
+
+  /// A page whose clipboard writes are kept where the test can read them.
+  async function makeCopyingPage(label) {
+    const page = await makePage(label);
+    evictPages.set(label, page);
+    await page.addInitScript(() => {
+      window.__copied = [];
+      const write = (t) => {
+        window.__copied.push(t);
+        return Promise.resolve();
+      };
+      Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText: write } });
+    });
+    return page;
+  }
+
+  const previewOf = (page) =>
+    page.evaluate(() => document.querySelector(".pane-preview .preview-body")?.textContent ?? "");
+
+  async function typeAtEnd(page, text) {
+    await page.waitForSelector("textarea.inputarea", { state: "attached", timeout: 15_000 });
+    await page.click(".monaco-editor .view-lines");
+    await page.keyboard.press("End");
+    await page.keyboard.type(text);
+  }
+
+  async function copiedLink(page) {
+    await page.click('.statusbar-actions button:has-text("Copy link")');
+    return page.evaluate(() => window.__copied.at(-1));
+  }
+
+  function parseLink(link, label) {
+    const m = /\/r\/([0-9a-f]{32})#k=([^&]+)&s=(.+)$/.exec(link ?? "");
+    if (!m) throw new Error(`[${label}] not a whole room link: ${link}`);
+    return { rid: m[1], key: Buffer.from(m[2], "base64url"), salt: Buffer.from(m[3], "base64url") };
+  }
+
+  /// The epoch-0 content key a link gives, which is what a tab that opened
+  /// the room with it holds until the room's key first changes.
+  async function linkContentKey(key, salt) {
+    const raw = await hkdf(key, salt, INFO_CONTENT, 32);
+    return crypto.subtle.importKey("raw", raw, { name: "AES-GCM" }, false, ["decrypt"]);
+  }
+
+  /// The labels of the ask dialog's choices, in the order it lists them.
+  const targetLabels = (page) =>
+    page.$$eval('input[name="evict-target"]', (els) => els.map((el) => el.closest("label")?.textContent?.trim() ?? ""));
+
+  /// Open the ask dialog and wait until it lists exactly `want` choices. The
+  /// list is read when the dialog opens, so a departure that the page has not
+  /// heard of yet is waited out by opening it again.
+  async function openAsk(page, label, button, want) {
+    const until = Date.now() + 15_000;
+    for (;;) {
+      await page.click(`.statusbar-actions button:has-text("${button}")`);
+      await page.waitForSelector("#evict-title", { timeout: 5000 });
+      const labels = await targetLabels(page);
+      if (labels.length === want) return labels;
+      if (Date.now() > until) throw new Error(`[${label}] the ask dialog offers ${labels.length} choices, expected ${want}: ${labels.join(" | ")}`);
+      await page.click('[role="dialog"] button:has-text("Cancel")');
+      await page.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+      await page.waitForTimeout(500);
+    }
+  }
+
+  /// Open a room by its shared name and passphrase, on whichever page the
+  /// address shows first.
+  async function enterNamed(page, label, name, phrase) {
+    await gotoPage(page, label, `${BASE}/${name}`);
+    await page.waitForSelector("#pp", { timeout: 15_000 });
+    await page.fill("#pp", phrase);
+    await page.click('button:has-text("Enter room")');
+  }
+
+  /// What every member who stayed is shown once: the new link or passphrase,
+  /// the same for all of them, under the right title.
+  async function readReRootNotice(page, label, { kind, removed }) {
+    const hook = kind === "link" ? "[data-new-link]" : "[data-new-passphrase]";
+    await page.waitForSelector(hook, { timeout: 20_000 }).catch(async () => {
+      const shown = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 400));
+      throw new Error(`[${label}] never showed the new ${kind}: ${shown}`);
+    });
+    const notice = page.locator('[role="dialog"]:has(#reroot-title)');
+    const title = (await page.textContent("#reroot-title")).trim();
+    const want = kind === "link" ? "THIS ROOM HAS A NEW LINK" : "THIS ROOM HAS A NEW PASSPHRASE";
+    if (title !== want) throw new Error(`[${label}] the notice is titled "${title}", expected "${want}"`);
+    const text = (await notice.textContent()) ?? "";
+    if (removed && !text.includes(`${removed} was removed from this room.`)) {
+      throw new Error(`[${label}] the notice does not say who was removed: ${text}`);
+    }
+    if (!removed && /was removed from this room/.test(text)) {
+      throw new Error(`[${label}] the notice names someone removed when nobody was: ${text}`);
+    }
+    if (!text.includes("The room's fingerprint is now")) {
+      throw new Error(`[${label}] the notice does not give the new fingerprint: ${text}`);
+    }
+    if (await page.$("[data-new-link]") && await page.$("[data-new-passphrase]")) {
+      throw new Error(`[${label}] the notice shows a link and a passphrase at once`);
+    }
+    const value = ((await page.textContent(hook)) ?? "").trim();
+    // Only Done closes it: an Escape pressed by habit must not lose the one
+    // time it is shown.
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+    if (!(await page.$(hook))) throw new Error(`[${label}] Escape closed the notice that shows the new ${kind} only once`);
+    return { value, text };
+  }
+
+  async function closeReRootNotice(page) {
+    await page.click("#reroot-done");
+    await page.waitForSelector("#reroot-title", { state: "detached", timeout: 5000 });
+  }
+
+  /// A tab the room removed: a banner over the read-only document it already
+  /// had, Export still working, the room's actions gone, and no reconnecting.
+  async function checkStranded(page, label, { banner, keeps, way }) {
+    await page.waitForSelector(`.banner[role="alert"]:has-text("${banner}")`, { timeout: 20_000 }).catch(async () => {
+      const shown = await page.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 400));
+      throw new Error(`[${label}] never said "${banner}": ${shown}`);
+    });
+    const bannerText = (await page.textContent('.banner[role="alert"]')) ?? "";
+    if (!bannerText.includes("read-only")) throw new Error(`[${label}] the banner does not say the tab keeps a read-only copy: ${bannerText}`);
+    if (way === "pass" && /\blink\b/i.test(bannerText)) throw new Error(`[${label}] a shared room's banner speaks of a link: ${bannerText}`);
+    if (!(await page.$(".monaco-editor"))) throw new Error(`[${label}] the document was taken off the screen`);
+    if (!(await previewOf(page)).includes(keeps)) throw new Error(`[${label}] the document on screen lost "${keeps}"`);
+    const actions = await page.$$eval(".statusbar-actions button", (els) =>
+      els.filter((el) => el.getClientRects().length > 0).map((el) => el.textContent.trim()),
+    );
+    for (const gone of ["Copy link", "Shred", "Remove someone", "Change link", "Change passphrase", "Steady"]) {
+      if (actions.includes(gone)) throw new Error(`[${label}] a stranded tab still offers "${gone}": ${actions.join(", ")}`);
+    }
+    // Read-only: typing changes nothing.
+    await page.click(".monaco-editor .view-lines");
+    await page.keyboard.type("typed-after-stranding");
+    await page.waitForTimeout(1000);
+    if ((await previewOf(page)).includes("typed-after-stranding")) throw new Error(`[${label}] the stranded editor still takes typing`);
+    // Monaco answers typing into a read-only editor with a message of its
+    // own, and that message must not break the page's Trusted Types policy.
+    const ttFromHere = errors.filter((e) => e.startsWith(`[${label}]`) && /TrustedTypePolicy|Trusted Types|trustedTypes/i.test(e));
+    if (ttFromHere.length > 0) {
+      throw new Error(`[${label}] typing into the read-only editor broke the Trusted Types policy: ${ttFromHere[0].slice(0, 200)}`);
+    }
+    // No reconnecting: every socket the tab opened is closed, and no new one
+    // is opened while the client's backoff would have had several goes.
+    const sockets = () => page.evaluate(() => (window.__runaSockets ?? []).map((ws) => ws.readyState));
+    const before = await sockets();
+    await page.waitForTimeout(8000);
+    const after = await sockets();
+    if (after.length !== before.length || after.some((s) => s !== 3)) {
+      throw new Error(`[${label}] a stranded tab is still connecting: sockets ${JSON.stringify(before)} then ${JSON.stringify(after)}`);
+    }
+    // Export, from the banner, still gives the document.
+    page.on("dialog", (d) => void d.accept());
+    await page.click('.banner[role="alert"] button:has-text("Export")');
+    await page.waitForSelector('[role="dialog"] button:has-text("Markdown (.md)")', { timeout: 5000 });
+    const download = page.waitForEvent("download", { timeout: 15_000 });
+    await page.click('[role="dialog"] button:has-text("Markdown (.md)")');
+    const file = await download;
+    const saved = await file.path();
+    const contents = saved ? await (await import("node:fs/promises")).readFile(saved, "utf8") : "";
+    if (!contents.includes(keeps)) throw new Error(`[${label}] Export from a stranded tab lost the document: ${JSON.stringify(contents.slice(0, 120))}`);
+    await page.keyboard.press("Escape");
+  }
+
+  const goneText = "THIS ROOM IS GONE";
+
+  try {
+    // Scenarios 1 to 5 share one everyday private room with three people.
+    const a = await makeCopyingPage("evict-a");
+    await gotoPage(a, "evict-a", `${BASE}/`);
+    await a.waitForSelector("#security", { timeout: 10_000 });
+    await a.click('button:has-text("Create private room")');
+    await a.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    const oldLink = await copiedLink(a);
+    const old = parseLink(oldLink, "evict-a");
+    const rid = old.rid;
+    await typeAtEnd(a, "before-evict ");
+
+    const b = await makeCopyingPage("evict-b");
+    await gotoPage(b, "evict-b", oldLink);
+    await b.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(b, "before-evict", "evict-b");
+    const t = await makeCopyingPage("evict-t");
+    await gotoPage(t, "evict-t", oldLink);
+    await t.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(t, "before-evict", "evict-t");
+
+    // A refusal first. Bob has his own ask dialog open when Alice's request
+    // arrives: the vote prompt waits behind it and shows once Bob closes it,
+    // so there is only ever one dialog, and a prompt never stops Bob asking.
+    const relinkLabel = await a.$$eval(".statusbar-actions button", (els) => els.map((el) => el.textContent.trim()));
+    if (!relinkLabel.includes("Change link") || relinkLabel.includes("Change passphrase")) {
+      throw new Error(`[evict-a] a private room's bar should offer "Change link": ${relinkLabel.join(", ")}`);
+    }
+    await openAsk(b, "evict-b", "Remove someone", 3);
+    const labels = await openAsk(a, "evict-a", "Remove someone", 3);
+    const title = ((await a.textContent("#evict-title")) ?? "").trim();
+    if (title !== "REMOVE SOMEONE OR CHANGE THE LINK") throw new Error(`[evict-a] the ask dialog is titled "${title}"`);
+    if (labels[0] !== "Nobody, only the link changes") throw new Error(`[evict-a] the first choice is "${labels[0]}"`);
+    // Nobody first, then everyone else in the order they joined: the third
+    // tab is the last choice.
+    const tHandle = labels[2];
+    let options = await a.$$('input[name="evict-target"]');
+    await options[2].check();
+    await a.click("#evict-propose");
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    await b.waitForTimeout(2000);
+    if (!(await b.$("#evict-title"))) throw new Error("[evict-b] a vote prompt closed the ask dialog");
+    if (await b.$("#evict-reject")) throw new Error("[evict-b] a vote prompt showed over the ask dialog");
+    await b.click('[role="dialog"] button:has-text("Cancel")');
+    await b.waitForSelector("#evict-reject", { timeout: 15_000 });
+    if (await b.$("#evict-title")) throw new Error("[evict-b] the ask dialog stayed open under the vote prompt");
+    let modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
+    if (modals !== 1) throw new Error(`[evict-b] ${modals} modal dialogs at once`);
+    const voteTitle = ((await b.textContent("#evict-vote-title")) ?? "").trim();
+    if (voteTitle !== `REMOVE ${tHandle}?`) throw new Error(`[evict-b] the vote asks "${voteTitle}", expected to remove ${tHandle}`);
+    // The prompt offers the bar's ways of asking. Either opens the ask
+    // dialog and puts the prompt aside until it closes.
+    await b.click('[role="alertdialog"] [data-evict-ask] button:has-text("Remove someone")');
+    await b.waitForSelector("#evict-title", { timeout: 5000 });
+    if (await b.$("#evict-reject")) throw new Error("[evict-b] the vote prompt stayed on screen under the ask dialog");
+    modals = await b.$$eval('[aria-modal="true"]', (els) => els.length);
+    if (modals !== 1) throw new Error(`[evict-b] ${modals} modal dialogs at once with the ask dialog open`);
+    await b.click('[role="dialog"] button:has-text("Cancel")');
+    await b.waitForSelector("#evict-reject", { timeout: 5000 });
+    await b.keyboard.press("Escape");
+    await b.waitForTimeout(300);
+    if (!(await b.$("#evict-reject"))) throw new Error("[evict-b] Escape closed the vote prompt without an answer");
+    // The person named is not asked.
+    await t.waitForTimeout(500);
+    if (await t.$("#evict-approve")) throw new Error("[evict-t] the person being removed was asked to vote");
+    await b.click("#evict-reject");
+    await a.waitForSelector('[role="dialog"]:has-text("Someone refused, so nothing changed.")', { timeout: 15_000 });
+    await a.click('[role="dialog"] button:has-text("Cancel")');
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    // Nothing changed: no new link anywhere, the third tab still writes and
+    // is read, and the room's link is still the old one.
+    await t.waitForTimeout(1500);
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-t", t]]) {
+      if (await page.$("[data-new-link]")) throw new Error(`[${label}] a refused request still changed the link`);
+      if (await page.$('.banner[role="alert"]:has-text("removed")')) throw new Error(`[${label}] a refused request still removed someone`);
+    }
+    await typeAtEnd(t, "still-here ");
+    await waitForPreview(a, "still-here", "evict-a");
+    await waitForPreview(b, "still-here", "evict-b");
+    if ((await copiedLink(b)) !== oldLink) throw new Error("[evict-b] after a refusal Copy link no longer gives the room's link");
+
+    // The removal. The third tab asks for a link change first and leaves it
+    // open: that does not stop anyone asking to remove them. Alice is shown
+    // the third tab's request, asks to remove them from that prompt, and Bob
+    // answers both, in the order they arrived. Agreeing to the link change
+    // keeps it open, since Alice has not answered it.
+    await openAsk(t, "evict-t", "Change link", 3);
+    await t.click("#evict-propose");
+    await t.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    for (const [label, page] of [["evict-a", a], ["evict-b", b]]) {
+      await page.waitForSelector("#evict-approve", { timeout: 15_000 });
+      const asked = ((await page.textContent("#evict-vote-title")) ?? "").trim();
+      if (asked !== "CHANGE THE LINK?") throw new Error(`[${label}] the first prompt asks "${asked}", expected the third tab's link change`);
+    }
+    await a.click('[role="alertdialog"] [data-evict-ask] button:has-text("Remove someone")');
+    await a.waitForSelector("#evict-title", { timeout: 5000 });
+    const removeLabels = await targetLabels(a);
+    if (removeLabels.length !== 3 || removeLabels[2] !== tHandle) throw new Error(`[evict-a] the ask dialog from the prompt offers ${removeLabels.join(" | ")}`);
+    options = await a.$$('input[name="evict-target"]');
+    await options[2].check();
+    await a.click("#evict-propose");
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 15_000 });
+    if ((await a.$$eval('[aria-modal="true"]', (els) => els.length)) !== 1) throw new Error("[evict-a] two dialogs at once after asking");
+    await b.click("#evict-approve");
+    await b.waitForSelector(`#evict-vote-title:has-text("REMOVE ${tHandle}?")`, { timeout: 15_000 });
+    // Alice's own request is open, and she can still answer the third tab's.
+    // Close leaves her request open, the prompt she put aside comes back,
+    // and she refuses the link change.
+    if (!(await a.$("#evict-withdraw"))) throw new Error("[evict-a] the ask dialog offers no way to withdraw an open request");
+    const closeLabel = ((await a.textContent("#evict-close")) ?? "").trim();
+    if (closeLabel !== "Close") throw new Error(`[evict-a] the ask dialog's close control says "${closeLabel}"`);
+    await a.click("#evict-close");
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    await a.waitForSelector('#evict-vote-title:has-text("CHANGE THE LINK?")', { timeout: 5000 });
+    await a.click("#evict-reject");
+    await t.waitForSelector('[role="dialog"]:has-text("Someone refused, so nothing changed.")', { timeout: 15_000 });
+    // The bar opens the dialog again on where her request stands, and Escape
+    // closes it without withdrawing anything.
+    await a.waitForTimeout(500);
+    if (await a.$("#evict-approve")) throw new Error("[evict-a] a prompt is still shown after Alice answered it");
+    await a.click('.statusbar-actions button:has-text("Remove someone")');
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 5000 });
+    if (!(await a.$("#evict-withdraw"))) throw new Error("[evict-a] the reopened dialog offers no way to withdraw the open request");
+    await a.keyboard.press("Escape");
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    if (!(await b.$(`#evict-vote-title:has-text("REMOVE ${tHandle}?")`))) throw new Error("[evict-b] Alice's request ended when she closed her dialog");
+    // Someone opens the old link between the request and Bob's answer: they
+    // never saw the request, so nobody wraps the new link for them, and the
+    // commit leaves them out.
+    const n = await makeCopyingPage("evict-newcomer");
+    await gotoPage(n, "evict-newcomer", oldLink);
+    await n.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(n, "still-here", "evict-newcomer");
+    await b.click("#evict-approve");
+
+    const removedBanner = "You were removed from this room. The link you used no longer opens it.";
+    await t.waitForSelector(`.banner[role="alert"]:has-text("${removedBanner}")`, { timeout: 20_000 });
+    const noticeA = await readReRootNotice(a, "evict-a", { kind: "link", removed: tHandle });
+    const noticeB = await readReRootNotice(b, "evict-b", { kind: "link", removed: tHandle });
+    const newLink = noticeA.value;
+    if (newLink !== noticeB.value) throw new Error("[evict] the two who stayed were shown different links");
+    if (newLink === oldLink || !newLink.includes(`/r/${rid}#k=`)) throw new Error(`[evict] no new link: ${newLink}`);
+    const fresh = parseLink(newLink, "evict-a");
+    await closeReRootNotice(a);
+    await closeReRootNotice(b);
+    // The third tab's link change was refused, and nothing else waits.
+    await a.waitForTimeout(1000);
+    for (const [label, page] of [["evict-a", a], ["evict-b", b]]) {
+      if (await page.$("#evict-approve")) throw new Error(`[${label}] a prompt for a request that ended came back after the re-root`);
+    }
+
+    // The two who stayed keep writing, each sees the other, and Copy link now
+    // gives the new link.
+    await typeAtEnd(a, "after-evict ");
+    await waitForPreview(b, "after-evict", "evict-b");
+    await typeAtEnd(b, "from-b-after ");
+    await waitForPreview(a, "from-b-after", "evict-a");
+    if ((await copiedLink(a)) !== newLink) throw new Error("[evict-a] Copy link still gives an old link");
+
+    // The removed tab: read-only document, Export, no room actions, quiet.
+    await checkStranded(t, "evict-t", { banner: removedBanner, keeps: "still-here", way: "link" });
+    if ((await previewOf(t)).includes("after-evict")) throw new Error("[evict-t] the removed tab still receives what is written");
+    // The tab that joined during the vote is left out, with no alarm, and
+    // stops like the removed one: it does not reconnect and sit in the room's
+    // list of people, where it would block every later vote.
+    const leftOutBanner = "The room's link changed, and this tab was not given the new one.";
+    await checkStranded(n, "evict-newcomer", { banner: leftOutBanner, keeps: "still-here", way: "link" });
+    if ((await previewOf(n)).includes("after-evict")) throw new Error("[evict-newcomer] the left-out tab still receives what is written");
+    const nAlarms = await n.$$eval('.banner[role="alert"], [role="status"]', (els) => els.map((e) => e.textContent));
+    if (nAlarms.some((x) => /key change|interfering|list of people|lost track/.test(x))) {
+      throw new Error(`[evict-newcomer] a tab left out by an honest commit showed a key alarm: ${nAlarms.join(" | ")}`);
+    }
+
+    // The old link no longer opens the room: the server refuses it, and a
+    // page opening it says the room is gone.
+    const stale = await rawPeer(rid, old.key, old.salt);
+    const refusal = await stale.joined.then(
+      () => "joined",
+      (e) => String(e.message),
+    );
+    stale.close();
+    if (!refusal.includes("4001")) throw new Error(`[evict] the old link was not refused with 4001: ${refusal}`);
+    const late = await makePage("evict-old-link");
+    evictPages.set("evict-old-link", late);
+    await gotoPage(late, "evict-old-link", oldLink);
+    await late.waitForSelector(`text=${goneText}`, { timeout: 20_000 });
+    await late.close();
+    // Nor does the removed tab's own saved key: a refresh brings it to the
+    // same page, not back into the room.
+    await t.reload();
+    await t.waitForSelector(`text=${goneText}`, { timeout: 20_000 });
+    if (await t.$(".monaco-editor")) throw new Error("[evict-t] a refresh took the removed tab back into the room");
+
+    // Someone opening the new link reads everything. What was written before
+    // the removal arrives with the snapshot under the new key, which the
+    // longest-connected member writes once it has been in the room a minute.
+    const c = await makeCopyingPage("evict-c");
+    await gotoPage(c, "evict-c", newLink);
+    await c.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(c, "before-evict", "evict-c", 150_000);
+    await waitForPreview(c, "after-evict", "evict-c");
+    await waitForPreview(c, "from-b-after", "evict-c");
+
+    // From outside the browser: what was written after the removal cannot be
+    // opened with the key the removed tab held, which is the old link's
+    // epoch-0 key, while what was written before it could be.
+    const oldContent = await linkContentKey(old.key, old.salt);
+    const spy = await rawPeer(rid, fresh.key, fresh.salt);
+    await spy.joined;
+    const entries = await spy.syncAll();
+    spy.close();
+    const epochs = [...new Set(entries.map((e) => e.epoch))];
+    const later = entries.filter((e) => e.epoch >= 1);
+    if (later.length === 0) throw new Error(`[evict] no entry from after the removal; epochs seen: ${epochs}`);
+    for (const e of later) {
+      if (await e.openWith(oldContent)) throw new Error(`[evict] the removed tab's key opened an entry from epoch ${e.epoch}`);
+    }
+    const earlier = entries.filter((e) => e.epoch === 0);
+    if (earlier.length > 0 && !(await Promise.all(earlier.map((e) => e.openWith(oldContent)))).some(Boolean)) {
+      throw new Error("[evict] the old key opened nothing from before the removal either; the check above would prove nothing");
+    }
+    // The other half of the proof: the same entries do open with the key the
+    // new link gives, so the refusal above is the old key's, not a check that
+    // could open nothing at all.
+    const freshContent = await linkContentKey(fresh.key, fresh.salt);
+    const freshOpens = (await Promise.all(later.map((e) => e.openWith(freshContent)))).filter(Boolean).length;
+    if (freshOpens === 0) throw new Error("[evict] the new link's key opened nothing written after the removal; the check above would prove nothing");
+
+    // An everyday room keeps the new key for a refresh.
+    await b.reload();
+    await b.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(b, "after-evict", "evict-b", 60_000);
+    if ((await copiedLink(b)) !== newLink) throw new Error("[evict-b] after a refresh Copy link does not give the new link");
+    await typeAtEnd(b, "after-refresh ");
+    await waitForPreview(a, "after-refresh", "evict-a");
+
+    // Changing the link with nobody removed. A fourth tab is away while it
+    // happens, and comes back to find the room gone, as for an expired one.
+    const d = await makeCopyingPage("evict-away");
+    await gotoPage(d, "evict-away", newLink);
+    await d.waitForSelector(".monaco-editor", { timeout: 30_000 });
+    await waitForPreview(d, "after-refresh", "evict-away", 60_000);
+    await severNetwork(d);
+    await openAsk(a, "evict-a", "Change link", 3);
+    const checked = await a.$$eval('input[name="evict-target"]', (els) => els.findIndex((el) => el.checked));
+    if (checked !== 0) throw new Error(`[evict-a] Change link opened with choice ${checked} picked, not nobody`);
+    await a.click("#evict-propose");
+    for (const [label, page] of [["evict-b", b], ["evict-c", c]]) {
+      await page.waitForSelector("#evict-approve", { timeout: 15_000 });
+      const asked = ((await page.textContent("#evict-vote-title")) ?? "").trim();
+      if (asked !== "CHANGE THE LINK?") throw new Error(`[${label}] the vote asks "${asked}"`);
+      await page.click("#evict-approve");
+    }
+    const relinked = [];
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-c", c]]) {
+      relinked.push((await readReRootNotice(page, label, { kind: "link", removed: null })).value);
+      await closeReRootNotice(page);
+    }
+    const link2 = relinked[0];
+    if (relinked.some((l) => l !== link2)) throw new Error(`[relink] the members were shown different links: ${relinked.join(" | ")}`);
+    if (link2 === newLink || link2 === oldLink) throw new Error("[relink] the link did not change");
+    const stale2 = await rawPeer(rid, fresh.key, fresh.salt);
+    const refusal2 = await stale2.joined.then(
+      () => "joined",
+      (e) => String(e.message),
+    );
+    stale2.close();
+    if (!refusal2.includes("4001")) throw new Error(`[relink] the previous link was not refused with 4001: ${refusal2}`);
+    await typeAtEnd(c, "after-relink ");
+    await waitForPreview(a, "after-relink", "evict-a");
+    await waitForPreview(b, "after-relink", "evict-b");
+    await restoreNetwork(d);
+    await d.waitForSelector(`text=${goneText}`, { timeout: 30_000 }).catch(async () => {
+      const shown = await d.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 300));
+      throw new Error(`[evict-away] a tab away during the change did not find the room gone: ${shown}`);
+    });
+
+    for (const [label, page] of [["evict-a", a], ["evict-b", b], ["evict-c", c]]) {
+      const alarms = await page.$$eval('.banner[role="alert"]', (els) => els.map((e) => e.textContent));
+      if (alarms.some((x) => /key change|list of people|lost track/.test(x))) {
+        throw new Error(`[${label}] showed a key alarm after an honest removal: ${alarms.join(" | ")}`);
+      }
+    }
+    for (const p of [a, b, c, d, t, n]) await p.close();
+
+    // The same removal in a shared room. Everything the page says names the
+    // passphrase, never a link, and the new passphrase is generated in the
+    // dialog.
+    const sharedName = `e2e-evict-${randomBytes(3).toString("hex")}`;
+    const s1 = await makeCopyingPage("shared-a");
+    await s1.setViewportSize({ width: 1280, height: 900 });
+    await gotoPage(s1, "shared-a", `${BASE}/`);
+    await s1.click("text=Shared name");
+    await s1.waitForSelector("text=Create shared room", { timeout: 5000 });
+    const suffix = s1.locator(".checkbox-row input[type=checkbox]");
+    if (await suffix.isChecked()) await suffix.uncheck();
+    await s1.fill("#room-name", sharedName);
+    await s1.click('button:has-text("Generate")');
+    const oldPhrase = await s1.inputValue("#passphrase");
+    await s1.click('button:has-text("Create shared room")');
+    await s1.waitForURL(`${BASE}/${sharedName}`, { timeout: 60_000 });
+    await s1.waitForSelector(".monaco-editor, #pp", { timeout: 60_000 });
+    if (await s1.$("#pp")) {
+      await s1.fill("#pp", oldPhrase);
+      await s1.click('button:has-text("Enter room")');
+    }
+    await s1.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await typeAtEnd(s1, "before-shared ");
+    const s2 = await makeCopyingPage("shared-b");
+    await enterNamed(s2, "shared-b", sharedName, oldPhrase);
+    await s2.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s2, "before-shared", "shared-b");
+    const s3 = await makeCopyingPage("shared-t");
+    await enterNamed(s3, "shared-t", sharedName, oldPhrase);
+    await s3.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s3, "before-shared", "shared-t");
+
+    const bar = await s1.$$eval(".statusbar-actions button", (els) => els.map((el) => el.textContent.trim()));
+    if (!bar.includes("Change passphrase") || bar.includes("Change link")) {
+      throw new Error(`[shared-a] a shared room's bar should offer "Change passphrase": ${bar.join(", ")}`);
+    }
+    const sLabels = await openAsk(s1, "shared-a", "Remove someone", 3);
+    const sTitle = ((await s1.textContent("#evict-title")) ?? "").trim();
+    if (sTitle !== "REMOVE SOMEONE OR CHANGE THE PASSPHRASE") throw new Error(`[shared-a] the ask dialog is titled "${sTitle}"`);
+    if (sLabels[0] !== "Nobody, only the passphrase changes") throw new Error(`[shared-a] the first choice is "${sLabels[0]}"`);
+    const askText = (await s1.textContent('[role="dialog"]:has(#evict-title)')) ?? "";
+    if (/\blink\b/i.test(askText)) throw new Error(`[shared-a] a shared room's ask dialog speaks of a link: ${askText}`);
+    const s3Handle = sLabels[2];
+    const sOptions = await s1.$$('input[name="evict-target"]');
+    await sOptions[2].check();
+    await s1.click('[role="dialog"] button:has-text("Generate")');
+    const newPhrase = await s1.inputValue("#evict-passphrase");
+    if (!newPhrase || newPhrase === oldPhrase) throw new Error(`[shared-a] Generate gave no new passphrase: "${newPhrase}"`);
+    // While the passphrase is stretched into keys the dialog cannot be
+    // closed, and says why. On a fast machine that lasts well under a
+    // second, so the page watches for it itself: the moment the dialog says
+    // it is busy, it records what it shows and presses Escape and Cancel.
+    await s1.evaluate(() => {
+      const seen = (window.__busySeen = []);
+      const look = () => {
+        const dialog = document.querySelector('[role="dialog"][aria-busy="true"]');
+        if (!dialog || seen.length) return;
+        const cancel = [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
+        seen.push({
+          cancelDisabled: !!cancel?.disabled,
+          withdrawShown: !!dialog.querySelector("#evict-withdraw"),
+          says: dialog.textContent.includes("This tab is making the new keys."),
+        });
+        dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+        cancel?.click();
+      };
+      new MutationObserver(look).observe(document.body, { subtree: true, childList: true, attributes: true });
+    });
+    await s1.click("#evict-propose");
+    await s1.waitForFunction(() => window.__busySeen.length > 0, null, { timeout: 30_000 }).catch(() => {
+      throw new Error("[shared-a] the ask dialog never said it was busy making the new keys");
+    });
+    const [busy] = await s1.evaluate(() => window.__busySeen);
+    if (!busy.cancelDisabled) throw new Error("[shared-a] Cancel works while the new keys are being made");
+    if (busy.withdrawShown) throw new Error("[shared-a] the dialog offers to withdraw a request that has not gone out yet");
+    if (!busy.says) throw new Error("[shared-a] the dialog does not say it is making the new keys");
+    await s2.waitForSelector("#evict-approve", { timeout: 60_000 });
+    const sVote = ((await s2.textContent('[role="alertdialog"]')) ?? "").trim();
+    if (!sVote.includes(`REMOVE ${s3Handle}?`) || !sVote.includes("new passphrase") || /\blink\b/i.test(sVote)) {
+      throw new Error(`[shared-b] the vote prompt does not ask the right thing in passphrase words: ${sVote}`);
+    }
+    // The Escape and Cancel pressed while it was busy did not withdraw the
+    // request: it is still open and still waiting.
+    if (!(await s1.$("#evict-title"))) throw new Error("[shared-a] Escape or Cancel closed the ask dialog while the new keys were being made");
+    if ((await s2.$$("#evict-approve")).length !== 1) throw new Error("[shared-b] the request was withdrawn by a Cancel pressed while it was being made");
+    await s2.click("#evict-approve");
+
+    const sRemoved = "You were removed from this room. The passphrase you used no longer opens it.";
+    await s3.waitForSelector(`.banner[role="alert"]:has-text("${sRemoved}")`, { timeout: 20_000 });
+    const sNoticeA = await readReRootNotice(s1, "shared-a", { kind: "pass", removed: s3Handle });
+    const sNoticeB = await readReRootNotice(s2, "shared-b", { kind: "pass", removed: s3Handle });
+    for (const [label, n] of [["shared-a", sNoticeA], ["shared-b", sNoticeB]]) {
+      if (n.value !== newPhrase) throw new Error(`[${label}] the notice shows "${n.value}", not the generated passphrase`);
+      if (/\blink\b/i.test(n.text)) throw new Error(`[${label}] a shared room's notice speaks of a link: ${n.text}`);
+    }
+    await closeReRootNotice(s1);
+    await closeReRootNotice(s2);
+    await typeAtEnd(s1, "after-shared ");
+    await waitForPreview(s2, "after-shared", "shared-b");
+    await checkStranded(s3, "shared-t", { banner: sRemoved, keeps: "before-shared", way: "pass" });
+
+    // The old passphrase no longer opens the room: it gets the page an
+    // expired room gets, in passphrase words. The new one opens it, with
+    // everything in it.
+    const sLate = await makePage("shared-old-phrase");
+    evictPages.set("shared-old-phrase", sLate);
+    await enterNamed(sLate, "shared-old-phrase", sharedName, oldPhrase);
+    await sLate.waitForSelector(`text=${goneText}`, { timeout: 60_000 }).catch(async () => {
+      const shown = await sLate.evaluate(() => document.body.innerText.replace(/\s+/g, " ").slice(0, 300));
+      throw new Error(`[shared-old-phrase] the old passphrase was not refused: ${shown}`);
+    });
+    if (await sLate.$(".monaco-editor")) throw new Error("[shared-old-phrase] the old passphrase opened the room");
+    const goneSaid = await sLate.evaluate(() => document.body.innerText);
+    if (/\blink\b/i.test(goneSaid) || !goneSaid.includes("someone changed its passphrase")) {
+      throw new Error(`[shared-old-phrase] a shared room's gone page does not speak of its passphrase: ${goneSaid.replace(/\s+/g, " ")}`);
+    }
+    await sLate.close();
+    const s4 = await makePage("shared-c");
+    evictPages.set("shared-c", s4);
+    await enterNamed(s4, "shared-c", sharedName, newPhrase);
+    await s4.waitForSelector(".monaco-editor", { timeout: 60_000 });
+    await waitForPreview(s4, "before-shared", "shared-c", 150_000);
+    await waitForPreview(s4, "after-shared", "shared-c");
+
+    for (const [label, page] of [["shared-a", s1], ["shared-b", s2], ["shared-c", s4]]) {
+      const alarms = await page.$$eval('.banner[role="alert"]', (els) => els.map((e) => e.textContent));
+      if (alarms.some((x) => /key change|list of people|lost track/.test(x))) {
+        throw new Error(`[${label}] showed a key alarm after an honest removal: ${alarms.join(" | ")}`);
+      }
+    }
+    for (const p of [s1, s2, s3, s4]) await p.close();
+  } catch (e) {
+    // What every tab in these scenarios looked like when it failed, and a
+    // screenshot of each when a folder for them is given.
+    for (const [label, page] of evictPages) {
+      if (page.isClosed()) continue;
+      try {
+        const shown = await Promise.race([
+          page.evaluate(() => ({
+            url: location.pathname,
+            dialogs: [...document.querySelectorAll('[role="dialog"], [role="alertdialog"]')].map((d) => d.textContent.trim().slice(0, 160)),
+            alerts: [...document.querySelectorAll('[role="alert"], [role="status"], .banner, .toast')]
+              .map((d) => d.textContent.trim().slice(0, 160))
+              .filter(Boolean),
+            body: document.body.innerText.replace(/\s+/g, " ").slice(0, 200),
+          })),
+          new Promise((r) => setTimeout(() => r("page did not answer within 3s"), 3000)),
+        ]);
+        console.error(`${label.toUpperCase()} STATE:`, JSON.stringify(shown));
+        if (process.env.RUNA_E2E_SHOTS) await page.screenshot({ path: `${process.env.RUNA_E2E_SHOTS}/${label}.png` });
+      } catch {}
+    }
+    throw e;
+  }
+
   const landing = await makePage("landing");
   for (const width of [320, 375, 414]) {
     await landing.setViewportSize({ width, height: 780 });
@@ -577,7 +1192,7 @@ async function main() {
   // Vertical companion to the check above, and a different failure entirely:
   // content stranded ABOVE the scroll origin, which no scrolling can reach
   // because scrollTop stops at 0. .landing centres itself with
-  // justify-content:center inside #root, which is `height: 100%` — so once
+  // justify-content:center inside #root, which is `height: 100%`, so once
   // the named-room form expands past the viewport, .landing is a flex item
   // with negative free space, gets shrunk, and min-height:100dvh clamps it at
   // exactly one viewport while its content is taller. Centring then splits
@@ -586,7 +1201,7 @@ async function main() {
   //
   // Unlike the sideways guard above, this one DOES reproduce in Chromium:
   // verified by reverting the fix, which puts .masthead at -90px at 375x812.
-  // This check is load-bearing, not decorative — it is checked in the
+  // This check is load-bearing, not decorative: it is checked in the
   // expanded state on purpose, because the default state never overflows and
   // measuring only that is what let the bug through.
   for (const [width, height] of [[320, 568], [375, 667], [375, 812], [414, 896]]) {
@@ -757,7 +1372,7 @@ async function main() {
   // A 24-hour room must not accuse its own server of tampering. For an
   // absolute TTL the server reports the time *remaining*, which is necessarily
   // less than the duration the config blob records, and the client compared
-  // the two directly — so every such room raised the mismatch banner within a
+  // the two directly, so every such room raised the mismatch banner within a
   // minute of being created. A security warning that is always on is worse
   // than none.
   //
@@ -774,7 +1389,7 @@ async function main() {
     await ttlPage.waitForSelector(".statusbar", { timeout: 30_000 });
 
     // The comparison runs once, on JOIN_ACK. Joining the instant the room is
-    // made leaves elapsed at zero, where even the broken comparison is quiet —
+    // made leaves elapsed at zero, where even the broken comparison is quiet,
     // which is why a version of this check that only created and looked passed
     // against the unfixed client. The fault appears on a *later* join, which
     // is exactly how it was reported: a long session, a reconnect, then the
@@ -836,7 +1451,7 @@ async function main() {
   // The convergence check above compares the *rendered preview*, which
   // normalises whitespace: two sources whose blank lines sit in different
   // places render to identical text. A real divergence report showed exactly
-  // that shape — the same words, differently placed — so the preview could
+  // that shape, the same words, differently placed, so the preview could
   // never have caught it. Compare the editor's own lines instead.
   /// Put the caret in a page's editor, and make sure it got there.
   ///
@@ -897,7 +1512,7 @@ async function main() {
 
   // And the divergence warning must not be crying wolf. It compared the local
   // hash at that instant against hashes peers had broadcast up to a heartbeat
-  // earlier, on every update, and latched forever on the first mismatch — so
+  // earlier, on every update, and latched forever on the first mismatch, so
   // two byte-identical documents both showed it. Waited past the quiet window
   // and a heartbeat so a false positive has every chance to appear.
   await alice.waitForTimeout(13_000);
@@ -912,8 +1527,8 @@ async function main() {
 
   // Split brain: a peer edits while disconnected, the other edits meanwhile,
   // and both must reconverge on reconnect. This is the highest-risk path in
-  // the whole design — it exercises the resync request, the server's log
-  // replay and Yjs's merge at once — and it is the shape a real report will
+  // the whole design, it exercises the resync request, the server's log
+  // replay and Yjs's merge at once, and it is the shape a real report will
   // most often have, since a phone that locks or a laptop that sleeps looks
   // exactly like this.
   await severNetwork(bob);
@@ -926,7 +1541,7 @@ async function main() {
   const splitA = await editorText(alice);
   const splitB = await editorText(bob);
   if (splitA === splitB) {
-    throw new Error("[sync] peers did not actually diverge while one was offline — the test proves nothing");
+    throw new Error("[sync] peers did not actually diverge while one was offline: the test proves nothing");
   }
   await restoreNetwork(bob);
   let reA = "";
@@ -960,8 +1575,8 @@ async function main() {
 
   // A connection that dies without the browser noticing. This is the common
   // case, not the exotic one: a laptop waking, a phone moving between wifi and
-  // mobile data. The socket stays OPEN for as long as TCP takes to give up —
-  // minutes — and every edit sent into it in that time vanished, with nothing
+  // mobile data. The socket stays OPEN for as long as TCP takes to give up,
+  // minutes, and every edit sent into it in that time vanished, with nothing
   // to notice and nothing to send it again. The split-brain test above cannot
   // catch that, because closing the socket is exactly what does not happen.
   await bob.evaluate(() => {
@@ -970,7 +1585,7 @@ async function main() {
   await bob.click(".monaco-editor .view-lines");
   await bob.keyboard.type("\ntyped-into-a-dead-connection\n", { delay: 8 });
   if (await aliceSees("typed-into-a-dead-connection", 3)) {
-    throw new Error("[sync] the connection was not actually dead — the test proves nothing");
+    throw new Error("[sync] the connection was not actually dead: the test proves nothing");
   }
   if (!(await aliceSees("typed-into-a-dead-connection", 45))) {
     throw new Error("[sync] an edit typed into a silently dead connection never reached the other peer");
@@ -1011,7 +1626,7 @@ async function main() {
   // The edit is flushed within 80 ms of the last keystroke, so the join has to
   // land well after that for the edit to have gone out before it.
   if (joinLandedAt === null || joinLandedAt < typedAt + 300) {
-    throw new Error("[sync] the join landed before the typing was sent — the test proves nothing");
+    throw new Error("[sync] the join landed before the typing was sent: the test proves nothing");
   }
   if (!(await aliceSees("typed-before-the-join-landed", 30))) {
     throw new Error("[sync] an edit typed before the join was confirmed never reached the other peer");
@@ -1020,7 +1635,7 @@ async function main() {
   // The status bar counts who is actually here, not who the roster still
   // lists. A roster is a join-time snapshot patched with the events a client
   // happened to receive, so a missed PEER_LEAVE over-counts for the rest of
-  // the session — four devices in one room reported 5, 3, 3 and 3 people at
+  // the session, four devices in one room reported 5, 3, 3 and 3 people at
   // the same moment. Presence expires on its own, so the count has to come
   // back down by itself with no event to prompt it, and come back up when the
   // peer returns. Asserted as a round trip because a count that only ever
@@ -1064,7 +1679,7 @@ async function main() {
 
   // Maths must render as maths, not as flattened text. $E = mc^2$ came out
   // reading "E=mc2" on a real screen while the unit test asserting /katex/i
-  // passed the whole time — the wrapper class survives sanitising whether or
+  // passed the whole time, the wrapper class survives sanitising whether or
   // not anything inside it renders. Structure alone is still not proof, so
   // this measures the rendered geometry: an exponent has to sit higher than
   // its base and be drawn smaller. That is the property that was broken, and
@@ -1086,7 +1701,7 @@ async function main() {
   if (!mathBox) throw new Error("[alice] display math never produced MathML in the preview");
   if (!(mathBox.expTop < mathBox.baseTop)) {
     throw new Error(
-      `[alice] exponent is not raised above its base (exp top ${Math.round(mathBox.expTop)} vs base ${Math.round(mathBox.baseTop)}) — math is rendering flat`,
+      `[alice] exponent is not raised above its base (exp top ${Math.round(mathBox.expTop)} vs base ${Math.round(mathBox.baseTop)}): math is rendering flat`,
     );
   }
   if (!(mathBox.expH < mathBox.baseH)) {
@@ -1126,7 +1741,7 @@ async function main() {
   // Collapsing the shared borders by deleting each tab's right border left
   // Split and Editor outlined on three sides with a gap on the fourth, while
   // Preview looked correct because it is :last-child and kept its own right
-  // border — so eyeballing the control in its default state showed nothing
+  // border, so eyeballing the control in its default state showed nothing
   // wrong. Measured rather than looked at, in all three positions.
   for (const mode of ["Split", "Editor", "Preview"]) {
     await alice.click(`.mode-tab:has-text("${mode}")`);
@@ -1193,14 +1808,14 @@ async function main() {
   }
 
   // The dialog is a confirmation step, not a progress display. Everything
-  // gated on the IDLE state — the consensus policy selector above all — has
+  // gated on the IDLE state, the consensus policy selector above all, has
   // to be on screen when it opens. It previously was not: pressing Shred
   // proposed immediately, so the state was already VOTING by first paint and
   // the selector never rendered. The policy was silently always UNANIMOUS.
   const policySelect = await alice.$('[role="alertdialog"] #shred-policy');
   if (!policySelect) {
     throw new Error(
-      "shred modal opened without the consensus policy selector — the dialog " +
+      "shred modal opened without the consensus policy selector: the dialog " +
         "is proposing before it confirms",
     );
   }
@@ -1227,7 +1842,7 @@ async function main() {
   );
   if (stillMajority !== "MAJORITY") {
     throw new Error(
-      `policy selection did not stick — expected MAJORITY, got ${stillMajority}`,
+      `policy selection did not stick: expected MAJORITY, got ${stillMajority}`,
     );
   }
 
@@ -1266,7 +1881,7 @@ async function main() {
   // The room must fit the window exactly. It did not: the editor pane was a
   // plain block holding the markdown ribbon and an editor sized at height:100%
   // of that same block, so the two came to a ribbon's height more than the
-  // window. The document scrolled as a whole — a second scrollbar beside the
+  // window. The document scrolled as a whole, a second scrollbar beside the
   // editor's own, and the status bar and ribbon sliding off the top, which
   // looked like rows pinning themselves under the toolbar.
   //
@@ -1298,7 +1913,7 @@ async function main() {
   // link arrives looking like a blank page: two empty pane backgrounds with
   // the text off in the top-left. Reported from a Realme handset, where the
   // cause was Android's "Desktop site" toggle forcing a 980px layout viewport
-  // — a width no phone reports natively, so no phone-width check could see
+  // (a width no phone reports natively), so no phone-width check could see
   // it. The same band catches any handset turned sideways (932px at the
   // widest) and a small tablet in portrait (834px).
   for (const [width, wantSplit] of [[834, false], [932, false], [980, false], [1024, true]]) {
@@ -1338,8 +1953,8 @@ async function main() {
 
   await alice.click('[role="alertdialog"] button:has-text("Cancel")');
 
-  // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in a standalone Monaco — bold and
-  // italic are commands VS Code supplies for markdown — so in a markdown
+  // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in a standalone Monaco, bold and
+  // italic are commands VS Code supplies for markdown, so in a markdown
   // editor they failed silently, which reads as broken rather than absent.
   // Checked through the keyboard rather than by asking whether the action is
   // registered: a registered action with the wrong keybinding would satisfy
@@ -1347,7 +1962,7 @@ async function main() {
   //
   // The modifier comes from the page, not the host. Monaco decides whether
   // CtrlCmd means Cmd by looking for "Macintosh" in the user agent, and
-  // Playwright's WebKit reports a macOS user agent on every host — while
+  // Playwright's WebKit reports a macOS user agent on every host, while
   // `ControlOrMeta` is resolved from the machine running the test. On a Linux
   // runner that pressed Ctrl into an editor listening for Cmd, and the
   // shortcut looked dead in exactly the one engine where it was fine.
@@ -1434,7 +2049,7 @@ async function main() {
   // Turning Monaco's menu off everywhere left right-click useless: on
   // Monaco's rendered text the platform menu is a generic page menu with no
   // Cut or Copy, since the glyphs are divs and the real input is hidden. And
-  // in Firefox and Safari Monaco's own Paste can never be one click — it reads
+  // in Firefox and Safari Monaco's own Paste can never be one click, it reads
   // the clipboard from script, which those two answer with a Paste button of
   // their own. So Chromium keeps Monaco's menu, and Firefox and WebKit get the
   // browser's own menu, opened over a stand-in holding the selection, whose
@@ -1443,7 +2058,7 @@ async function main() {
   // A native menu cannot be driven from here, so the WebKit and Firefox half
   // proves what the menu depends on instead: that the menu event really lands
   // on the stand-in and is left to open, that the stand-in holds the
-  // selection selected — what makes the browser enable Cut and Copy — and
+  // selection selected, what makes the browser enable Cut and Copy, and
   // that the copy and paste events the menu's items produce reach the editor.
   //
   // Those events are replayed with a clipboard object the test can read. A
@@ -1481,7 +2096,7 @@ async function main() {
   if (ctx === null) throw new Error("[contextmenu] no contextmenu event reached the page");
   if (ENGINE_NAME === "chromium") {
     if (ctx.prevented !== true) {
-      throw new Error("[contextmenu] the editor has no context menu of its own — right-click falls back to a generic page menu with no Cut or Copy");
+      throw new Error("[contextmenu] the editor has no context menu of its own: right-click falls back to a generic page menu with no Cut or Copy");
     }
     const menuItems = (await alice.locator(".monaco-menu .action-label").allTextContents()).filter((t) => t.trim());
     for (const needed of ["Cut", "Copy", "Paste"]) {
@@ -1542,7 +2157,7 @@ async function main() {
 
   // A shred request must survive a reconnect. Reported from two machines: a
   // laptop that had switched tabs a couple of times proposed a shred, showed
-  // the right occupant count, and the other machine — online the entire time —
+  // the right occupant count, and the other machine, online the entire time,
   // never saw the prompt at all. Only a full page reload restored it.
   //
   // The cause was that JOIN_ACK's authoritative roster was merged into the
@@ -1571,13 +2186,13 @@ async function main() {
 
   // Scope: this now does reproduce the roster merge that caused the reported
   // failure, which it could not before. The previous note here said so
-  // honestly — a brief setOffline blip never produced a real socket close, so
+  // honestly, a brief setOffline blip never produced a real socket close, so
   // there was no second JOIN_ACK to merge a stale peer id out of, and the test
   // stayed green with the fix reverted. severNetwork() does produce one.
   // Rechecked the only way worth trusting: drop the `target.clear()` from
   // replaceRoster and this fails with a denominator of 5 for two people.
   //
-  // So the path is covered end to end — a shred proposed after a real
+  // So the path is covered end to end, a shred proposed after a real
   // interruption reaches the other side, and the bar it asks for describes the
   // people actually in the room. session.roster.test.ts still asserts the
   // merge directly; this is the same bug seen from the outside. Bob proposes
@@ -1602,7 +2217,7 @@ async function main() {
   try {
     await alice.waitForSelector('text=SHRED REQUESTED BY A PEER', { timeout: 15000 });
   } catch {
-    throw new Error("[shred] the peer was never prompted — the request was dropped in silence");
+    throw new Error("[shred] the peer was never prompted: the request was dropped in silence");
   }
   await alice.click('[role="alertdialog"] button:has-text("Reject")');
   await bob.waitForTimeout(500);
@@ -1610,7 +2225,7 @@ async function main() {
   // Export offered PDF at one fixed size and nothing else: a long document
   // became sixty-odd pages with no way to change it, and there was no way to
   // get the source back out at all. The dialog now offers both, and this
-  // checks the markdown path end to end — a download that never arrives is
+  // checks the markdown path end to end, a download that never arrives is
   // indistinguishable from a button that does nothing.
   alice.on("dialog", (d) => void d.accept());
   await alice.click('button:has-text("Export")');
@@ -1652,10 +2267,10 @@ async function main() {
     prev = goneBody;
     goneBody = goneBody.replace(/<!--[\s\S]*?-->/g, "");
   }
-  // It used to read "ROOM —— · SHREDDED —— UTC", with the dashes standing in
-  // for values no script ever supplied — the element was referenced nowhere —
+  // It used to read "ROOM, two dashes, SHREDDED, two dashes, UTC", the dashes standing in
+  // for values no script ever supplied (the element was referenced nowhere),
   // so every reader saw the placeholders themselves.
-  if (/——/.test(goneBody)) {
+  if (/\u2014\u2014/.test(goneBody)) {
     throw new Error("gone.html still shows unfilled placeholders");
   }
   // And it must stay anonymous: this page is served with Clear-Site-Data, so
@@ -1673,7 +2288,7 @@ async function main() {
   }
 
   // iOS Safari zooms the page when focus lands on a control computing under
-  // 16px, and never undoes it — so tapping a line to type left the reader
+  // 16px, and never undoes it, so tapping a line to type left the reader
   // zoomed in, and the shred dialog (position:fixed, laid out against the
   // layout viewport) then rendered cropped at both edges. Monaco's hidden
   // input was 12px and is written inline by Monaco, so no stylesheet rule
@@ -1710,7 +2325,7 @@ async function main() {
   }
 
   // A restart warns every open room before the process stops. The two peers
-  // are still in their room, so SIGTERM — what systemd sends on a redeploy —
+  // are still in their room, so SIGTERM, what systemd sends on a redeploy,
   // has to reach both as a countdown, and the server has to wait it out rather
   // than vanish with their documents.
   //
@@ -1718,7 +2333,7 @@ async function main() {
   // mid-session; now the stopping process hands each member a ticket and the
   // new one takes the room back from them. Written before the restart, this
   // marker must be readable afterwards by someone who was never in the room
-  // before — the only way it can reach them is through the new server's log,
+  // before, the only way it can reach them is through the new server's log,
   // refilled from the members' own copies.
   const marker = `kept-across-restart-${Date.now().toString(36)}`;
   // The whole document, from the preview: the editor renders only the lines
@@ -1815,6 +2430,11 @@ async function main() {
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
+  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person's own open request does not stop a request to remove them; a person who asked closes the dialog, answers another request, and their own still completes; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  a tab that joined during the vote is left out with no alarm, keeps a read-only copy and stays off`);
+  console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
+  console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
+  console.log(`  a shared room removes someone with a generated passphrase and never speaks of a link`);
   console.log(`  shared rooms: highest keeps the name out of the address; everyday takes it after joining`);
   console.log(`  two headless peers joined ${roomIdHex.slice(0, 8)}…`);
   console.log(`  typed concurrently; Alice's preview converged to include Bob's text`);
@@ -1890,8 +2510,8 @@ main().catch(async (e) => {
       console.error(`${label.toUpperCase()} STATE:`, JSON.stringify(state));
     } catch {}
   }
-  // Grouped by page. One peer's expected noise — a severed socket logs a
-  // connection error on every retry — used to fill the whole allowance and
+  // Grouped by page. One peer's expected noise, a severed socket logs a
+  // connection error on every retry, used to fill the whole allowance and
   // hide the one error from the other page that explained the failure.
   const byPage = new Map();
   for (const err of errors) {

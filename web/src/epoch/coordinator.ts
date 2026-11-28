@@ -32,7 +32,17 @@ export interface MemberView {
   joinedAtSeq: number;
 }
 
-export type KeyStatus = "ok" | "waiting" | "unreadable" | "refused" | "roster-mismatch" | "server-behind";
+export type KeyStatus =
+  | "ok"
+  | "waiting"
+  | "unreadable"
+  | "refused"
+  | "roster-mismatch"
+  | "server-behind"
+  | "left-out";
+
+/// The close and error code of a peer the room removed (amendment K).
+export const EVICTED_CODE = 4014;
 
 export interface CoordinatorDeps {
   roomId: Uint8Array;
@@ -52,6 +62,9 @@ export interface CoordinatorDeps {
   rejoin(): void;
   status(s: KeyStatus): void;
   snapshotSoon(): void;
+  /// True while a vote to remove someone or change the link is open: a
+  /// step waits, since the re-root that follows cuts the leaver out anyway.
+  stepsHeld?(): boolean;
 }
 
 const hex = (b: Uint8Array): string => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
@@ -83,6 +96,9 @@ export class EpochCoordinator {
   /// or were here to be, and a big room would otherwise get one handover per
   /// member in a single tick.
   private seen = new Set<string>();
+  /// Signing keys (hex) that a re-root cut out (amendment K). Their
+  /// departure, whenever it is reported, needs no step.
+  private cutOut = new Set<string>();
   private awaitingEpoch: number | null = null;
   /// False when the JOIN_ACK had no `root_epoch`: that server predates
   /// amendment J, never advances a room or echoes a step, so nothing is sent
@@ -123,13 +139,19 @@ export class EpochCoordinator {
     return this.d.members().some((m) => !me || !eq(m.peerId, me));
   }
 
-  memberJoined(m: MemberView): void {
+  /// `announced` is true for a PEER_JOIN: a connection that has just joined,
+  /// not one a roster refresh lists, which may be an old connection of a
+  /// removed peer the server has not dropped yet.
+  memberJoined(m: MemberView, announced = false): void {
     this.noteMember(m).catch(() => undefined);
     if (m.pubkey) {
       const key = hex(m.pubkey);
       this.tracker.returned(key);
       this.departed.delete(key);
       this.seen.add(key);
+      // A key a re-root cut out that joins again was let in with the new way
+      // in: its next departure counts like anyone's.
+      if (announced) this.cutOut.delete(key);
     }
     const me = this.d.me();
     if (me && !eq(m.peerId, me) && this.d.keyring.current.epoch > this.d.keyring.rootEpoch) {
@@ -137,9 +159,11 @@ export class EpochCoordinator {
     }
   }
 
-  memberLeft(m: MemberView): void {
+  memberLeft(m: MemberView, reason?: number): void {
     this.handovers.delete(hex(m.peerId));
     this.verifiedKx.delete(hex(m.peerId));
+    // A peer the room removed was cut out by the re-root that removed it.
+    if (reason === EVICTED_CODE || (m.pubkey && this.cutOut.has(hex(m.pubkey)))) return;
     if (this.d.highest() && m.pubkey) {
       const key = hex(m.pubkey);
       // A late PEER_LEAVE for a connection the member has already replaced:
@@ -229,7 +253,7 @@ export class EpochCoordinator {
       if (this.awaitingEpoch !== null) return;
       // Asked now, not only when the departure was noted: the level can be a
       // stale default until the sealed config has opened.
-      if (this.dueSince !== null && !this.pendingStep && this.d.highest()) {
+      if (this.dueSince !== null && !this.pendingStep && this.d.highest() && !this.d.stepsHeld?.()) {
         const rank = rankOf(this.d.members(), me);
         if (turnHasCome(rank, now - this.dueSince, ROTATOR_FALLBACK_MS)) await this.sendStep(me);
       }
@@ -295,8 +319,9 @@ export class EpochCoordinator {
         },
         this.d.identity,
       );
-      // A step landed while this one was being built: it is stale.
-      if (this.d.keyring.current.epoch !== cur.epoch) return;
+      // A step landed while this one was being built: it is stale. A vote
+      // that opened meanwhile holds it, as it would have before the build.
+      if (this.d.keyring.current.epoch !== cur.epoch || this.d.stepsHeld?.()) return;
       // Recorded before sending: the server echoes the step back, and the echo
       // must find the secret waiting.
       this.pendingStep = { to, secret, confirm: next.confirm, sentAt: this.d.now() };
@@ -319,6 +344,9 @@ export class EpochCoordinator {
     if (!kxPub) return false;
     const ring = this.d.keyring;
     const cur = ring.current;
+    // Read with the secrets, before any await: they are the secrets since
+    // this root.
+    const root = ring.rootEpoch;
     const blob = ring.secretsBlob();
     try {
       if (blob.length === 0 || blob.length / 32 > MAX_HANDOVER_SECRETS) return false;
@@ -331,7 +359,7 @@ export class EpochCoordinator {
           kind: "handover",
           from: cur.epoch,
           to: cur.epoch,
-          root: ring.rootEpoch,
+          root,
           sender: me.slice(),
           roster: await rosterDigest(this.d.members()),
           confirm: cur.confirm,
@@ -349,12 +377,39 @@ export class EpochCoordinator {
     }
   }
 
-  /// Handles one EPOCH_KEY after every earlier one has settled. Never rejects.
-  receive(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
-    const fn = (): Promise<void> => this.receiveNow(header, headerEpoch, sender, bytes);
+  /// Runs `fn` after every EPOCH_KEY and every other exclusive task queued
+  /// before it, and before any queued after it. The evict coordinator runs
+  /// all its work here, so a commit and a step are never applied at once.
+  exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const run = this.receiving.then(fn, fn);
     this.receiving = run.catch(() => undefined);
-    return run.catch(() => undefined);
+    return run;
+  }
+
+  /// Handles one EPOCH_KEY after every earlier one has settled. Never rejects.
+  receive(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
+    return this.exclusive(() => this.receiveNow(header, headerEpoch, sender, bytes)).catch(() => undefined);
+  }
+
+  /// A member's key-agreement key, once its signature has checked out.
+  async kxOf(m: MemberView): Promise<Uint8Array | null> {
+    await this.noteMember(m);
+    return this.verifiedKx.get(hex(m.peerId)) ?? null;
+  }
+
+  /// The room re-rooted (amendment K): every departure so far is cut out by
+  /// it, a step this member was building is moot, and nobody needs a
+  /// handover from the old root. `cutOut` is the removed peer's signing key.
+  reRooted(cutOut: Uint8Array | null): void {
+    this.pendingStep?.secret.fill(0);
+    this.pendingStep = null;
+    this.tracker.clear();
+    this.departed.clear();
+    this.handovers.clear();
+    this.dueSince = null;
+    this.awaitingEpoch = null;
+    if (cutOut) this.cutOut.add(hex(cutOut));
+    this.d.status("ok");
   }
 
   private async receiveNow(header: Uint8Array, headerEpoch: number, sender: Uint8Array, bytes: Uint8Array): Promise<void> {
@@ -503,5 +558,6 @@ export class EpochCoordinator {
     this.tracker.clear();
     this.departed.clear();
     this.seen.clear();
+    this.cutOut.clear();
   }
 }

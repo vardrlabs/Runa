@@ -46,3 +46,9 @@ name = "epoch_advance"
 path = "fuzz_targets/epoch_advance.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "evict_commit"
+path = "fuzz_targets/evict_commit.rs"
+test = false
+doc = false

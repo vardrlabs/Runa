@@ -4,6 +4,7 @@ import Editor, { loader } from "@monaco-editor/react";
 import * as monacoModule from "monaco-editor";
 import type { editor as MonacoEditor } from "monaco-editor";
 import { clipboardReadAsksEveryTime, openBrowserMenuOnRightClick } from "../ui/contextmenu";
+import { silenceReadOnlyMessage } from "../ui/readonlymessage";
 
 loader.config({ monaco: monacoModule });
 
@@ -12,7 +13,7 @@ self.MonacoEnvironment = {
     return new Worker(new URL("monaco-editor/esm/vs/editor/editor.worker.js", import.meta.url), { type: "module" });
   },
 };
-import { Session, type LadderPhase } from "../session";
+import { Session, keyStatusText, type LadderPhase } from "../session";
 import {
   deriveRoomKeys,
   parseFragment,
@@ -31,7 +32,19 @@ import { exportPdf, type ExportDensity } from "../export/paged";
 import { exportMarkdown } from "../export/markdown";
 import { TOOLBAR_ACTIONS, applyTool } from "../ui/toolbar";
 import { useLineSync } from "../ui/linesync";
-import { applyNamedSecurityLevel, applySecurityLevel, shareLink } from "../keyhandoff";
+import { applyNamedSecurityLevel, applySecurityLevel, replaceRoomKey, shareLink } from "../keyhandoff";
+import {
+  EvictModal,
+  EvictVotePrompt,
+  ReRootNotice,
+  evictInFlight,
+  type EvictCandidate,
+  type ReRootView,
+} from "../ui/EvictModal";
+import { EVICT_COPY, evictCopy, evictStateText, ignoredText } from "../evict/copy";
+import { EMPTY_PROMPTS, MAX_ENDED_PROMPTS, promptAnswered, promptArrived, shownPrompt, voteEnded, type PromptQueue } from "../evict/prompts";
+import type { WayKind } from "../evict/reroot";
+import type { SecurityLevel } from "../security-level";
 import { plainWebSocketAllowed } from "../transport/origin";
 
 const api = new Api("");
@@ -53,6 +66,11 @@ type Phase =
   | { kind: "purged" }
   | { kind: "unavailable" };
 
+/// Why a live tab can no longer take part in its room (amendment K): the room
+/// removed it, or changed its key without giving this tab the new one. Either
+/// way what the tab holds stays on screen, read-only, to read, copy or export.
+type Stranded = "removed" | "left-out";
+
 let extNoticeShown = false;
 let highestNoticeShown = false;
 let externalConfirmed = false;
@@ -65,6 +83,10 @@ export function Room(props: RoomProps) {
 }
 
 function JoinableRoom(props: RoomProps) {
+  // A shared room is opened with a passphrase, and its words never mention a
+  // link (amendment K).
+  const wayKind: WayKind = props.name ? "pass" : "link";
+  const words = evictCopy(wayKind);
   const [phase, setPhase] = useState<Phase>({ kind: props.name ? "passphrase" : "connecting" });
   const sessionRef = useRef<Session | null>(null);
   const [markdown, setMarkdown] = useState("");
@@ -95,6 +117,37 @@ function JoinableRoom(props: RoomProps) {
   const [restartHandover, setRestartHandover] = useState(false);
   const [clock, setClock] = useState(() => performance.now());
   const [connRefused, setConnRefused] = useState<string | null>(null);
+  const [evictOpen, setEvictOpen] = useState<null | { relink: boolean }>(null);
+  const [evictCandidates, setEvictCandidates] = useState<EvictCandidate[]>([]);
+  // Where this tab's own request stands, for the ask dialog.
+  const [evictState, setEvictState] = useState<{ state: string; reason?: string }>({ state: "IDLE" });
+  // Other people's requests waiting for an answer here, shown one at a time.
+  const [evictPrompts, setEvictPrompts] = useState<PromptQueue>(EMPTY_PROMPTS);
+  // The new way in, held only while its notice is open: Done sets this back
+  // to null, which drops the page's last reference to the string.
+  const [reRoot, setReRoot] = useState<ReRootView | null>(null);
+  const [stranded, setStranded] = useState<Stranded | null>(null);
+  // The session's events are bound once, when it is created, so what they
+  // need to know about the page is read from refs.
+  const strandedRef = useRef<Stranded | null>(null);
+  const evictOpenRef = useRef(false);
+  const shredOpenRef = useRef(false);
+  // The requests this tab was asked about, so each one's ending can be said
+  // when the ask dialog is not on screen. Bounded like the prompts' record.
+  const evictAskedRef = useRef<Set<string>>(new Set());
+  // Whether this tab's own request is out, the only one "Withdraw request"
+  // withdraws, so its ending can be said when the dialog is not on screen.
+  const evictMineRef = useRef(false);
+  // Whether a commit just ended requests this tab asked or was asked about.
+  // The notice for the new way in says so once, instead of one toast for
+  // each of them.
+  const evictOthersEndedRef = useRef(false);
+  // The last state of this tab's own request, as the session's events see it.
+  const evictStateRef = useRef("IDLE");
+  // The room's key as it stands: the link it was opened with, until a
+  // re-root replaces it (amendment K).
+  const fragmentRef = useRef(props.fragment);
+  const levelRef = useRef<SecurityLevel>("highest");
   const restartAnnouncedRef = useRef(false);
   const [showExtNotice, setShowExtNotice] = useState(() => !extNoticeShown);
   const editorRef = useRef<MonacoEditor.IStandaloneCodeEditor | null>(null);
@@ -110,8 +163,9 @@ function JoinableRoom(props: RoomProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  const strandedExportRef = useRef<HTMLButtonElement | null>(null);
   // Below the panes breakpoint the split mode renders identically to
-  // editor-only — the stylesheet hides the preview — so offering it there is
+  // editor-only (the stylesheet hides the preview), so offering it there is
   // offering a control that does nothing observable.
   const [isNarrow, setIsNarrow] = useState(
     () =>
@@ -121,6 +175,10 @@ function JoinableRoom(props: RoomProps) {
   );
 
   useAccent(temper);
+
+  useEffect(() => {
+    shredOpenRef.current = shredOpen;
+  }, [shredOpen]);
 
   useEffect(() => {
     if (restartAt === null) return;
@@ -200,6 +258,38 @@ function JoinableRoom(props: RoomProps) {
     };
   }, []);
 
+  /// The room removed this tab, or moved on without it. The editor turns
+  /// read-only rather than going away, so its text can still be selected,
+  /// copied and exported; every dialog that would act on the room closes.
+  ///
+  /// A shred request this tab made is withdrawn the way closing the shred
+  /// dialog withdraws it. A request to remove someone that is still being
+  /// prepared is withdrawn by the dialog's own wrapper once it has gone out.
+  const strand = useCallback((why: Stranded) => {
+    if (strandedRef.current === "removed") return;
+    strandedRef.current = why;
+    setStranded(why);
+    editorRef.current?.updateOptions({ readOnly: true });
+    evictOpenRef.current = false;
+    evictAskedRef.current.clear();
+    evictMineRef.current = false;
+    evictOthersEndedRef.current = false;
+    setEvictOpen(null);
+    setEvictPrompts(EMPTY_PROMPTS);
+    if (shredOpenRef.current) {
+      try {
+        sessionRef.current?.cancelShred();
+      } catch {
+        // The dialog closes either way; the request then runs to its deadline.
+      }
+    }
+    shredOpenRef.current = false;
+    setShredOpen(false);
+    setShredPrompt(null);
+    setMenuOpen(false);
+    if (why === "removed") setReRoot(null);
+  }, []);
+
   const startSession = useCallback(
     async (args: {
       roomIdHex: string;
@@ -221,6 +311,7 @@ function JoinableRoom(props: RoomProps) {
           authKey,
           contentKey,
           chainKey,
+          wayKind: args.passMaterial ? "pass" : "link",
           insecureAllowed: plainWebSocketAllowed(window.location),
           restoreRoom: (ticket) => api.restoreRoom(ticket),
         },
@@ -270,8 +361,9 @@ function JoinableRoom(props: RoomProps) {
           },
           onTtlMismatch: () => setTtlMismatch(true),
           onSecurityLevel: (level) => {
+            levelRef.current = level;
             if (props.name) applyNamedSecurityLevel(props.name, level);
-            else if (props.roomIdHex && props.fragment) applySecurityLevel(props.roomIdHex, props.fragment, level);
+            else if (props.roomIdHex && fragmentRef.current) applySecurityLevel(props.roomIdHex, fragmentRef.current, level);
             else return;
             if (level === "highest" && !highestNoticeShown) setHighestNotice(true);
           },
@@ -289,9 +381,17 @@ function JoinableRoom(props: RoomProps) {
           },
           onHistoryPressure: (m) => setHistoryPressure(m),
           onKeyStatus: (m, alarming) => setKeyStatus(m ? { text: m, alarming } : null),
+          // Either way the session found out, this tab was left out of the
+          // room's latest re-root.
+          onLeftOut: () => strand("left-out"),
           onDivergence: (d) => setDiverged(d),
           onPurge: () => setPhase({ kind: "purged" }),
-          onRoomUnavailable: () => setPhase({ kind: "unavailable" }),
+          // A tab that was removed or left out keeps its document on screen;
+          // the room ending under it changes nothing it can do.
+          onRoomUnavailable: () => {
+            if (strandedRef.current) return;
+            setPhase({ kind: "unavailable" });
+          },
           onServerRestart: (inSecs, handover) => {
             restartAnnouncedRef.current = true;
             setRestartHandover(handover);
@@ -303,6 +403,81 @@ function JoinableRoom(props: RoomProps) {
             announce("The server was updated, and this room carried over.");
           },
           onConnectionRefused: (message) => setConnRefused(message),
+          onEvictPrompt: (p) => {
+            // The prompt is raised after VOTING, once the handles are worked
+            // out, so the vote may already be over by the time it arrives:
+            // the queue drops a prompt whose vote it saw end. A prompt never
+            // closes the ask dialog; it waits behind it.
+            if (strandedRef.current) return;
+            const asked = evictAskedRef.current;
+            asked.add(p.id);
+            for (const id of asked) {
+              if (asked.size <= MAX_ENDED_PROMPTS) break;
+              asked.delete(id);
+            }
+            setEvictPrompts((q) => promptArrived(q, p));
+          },
+          // Raised once per state reached by each request, in whatever order
+          // the vote takes: a proposer that gave up on its commit can still be
+          // let in by a late echo, which arrives as onReRooted after FAILED.
+          onEvictState: (state, reason, vote) => {
+            const inFlight = evictInFlight(state);
+            // This tab's own request, or a left-out tab with nothing open,
+            // is what the ask dialog shows.
+            if (!vote || vote.mine) {
+              evictStateRef.current = state;
+              setEvictState({ state, reason });
+            }
+            if (inFlight) return;
+            if (vote && !vote.mine) setEvictPrompts((q) => voteEnded(q, vote.id));
+            // The page is stranded by onLeftOut, which follows this; the
+            // banner says what happened, so there is no toast as well.
+            if (state === "FAILED" && reason === "left-out") {
+              evictAskedRef.current.clear();
+              evictMineRef.current = false;
+              return;
+            }
+            const involved = vote ? (vote.mine ? evictMineRef.current : evictAskedRef.current.delete(vote.id)) : false;
+            if (vote?.mine) evictMineRef.current = false;
+            // A commit moved the room and ended this one. The notice for the
+            // new way in follows in a moment and says it once for all of them.
+            if (state === "FAILED" && reason === "root-moved") {
+              if (involved) evictOthersEndedRef.current = true;
+              return;
+            }
+            if (involved && !evictOpenRef.current) announce(evictStateText(state, reason, wayKind, vote?.mine));
+          },
+          onEvictIgnored: (reason) => announce(ignoredText(reason, wayKind)),
+          onReRooted: (r) => {
+            // A removed or left-out tab has stopped for good: no re-root lets
+            // it back in.
+            if (strandedRef.current) return;
+            if (r.fragment && props.roomIdHex) {
+              fragmentRef.current = r.fragment;
+              replaceRoomKey(props.roomIdHex, r.fragment, levelRef.current);
+            }
+            if (r.fingerprint) setFingerprint(r.fingerprint);
+            shredOpenRef.current = false;
+            setShredOpen(false);
+            setShredPrompt(null);
+            evictOpenRef.current = false;
+            evictAskedRef.current.clear();
+            evictMineRef.current = false;
+            const othersEnded = evictOthersEndedRef.current;
+            evictOthersEndedRef.current = false;
+            setEvictOpen(null);
+            setEvictPrompts(EMPTY_PROMPTS);
+            evictStateRef.current = "IDLE";
+            setEvictState({ state: "IDLE" });
+            setReRoot({
+              link: r.fragment && props.roomIdHex ? shareLink(props.roomIdHex, r.fragment) : null,
+              passphrase: r.passphrase,
+              fingerprint: r.fingerprint,
+              removed: r.removed,
+              othersEnded,
+            });
+          },
+          onRemoved: () => strand("removed"),
         },
       );
       sessionRef.current = session;
@@ -355,6 +530,10 @@ function JoinableRoom(props: RoomProps) {
 
   const onEditorMount = useCallback(
     async (editor: MonacoEditor.IStandaloneCodeEditor) => {
+      // Before anything can make it read-only: Monaco's own "Cannot edit"
+      // message breaks the page's Trusted Types policy, and the banner or the
+      // burn countdown already says why typing does nothing.
+      silenceReadOnlyMessage(editor);
       const model = editor.getModel();
       if (!model || !sessionRef.current) return;
       editorRef.current = editor;
@@ -387,9 +566,9 @@ function JoinableRoom(props: RoomProps) {
       }
 
 
-      // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in Monaco on their own — bold and
+      // Ctrl/Cmd+B and Ctrl/Cmd+I do nothing in Monaco on their own: bold and
       // italic are editor commands VS Code supplies for markdown, not part of
-      // the standalone editor — so in a markdown editor they simply failed,
+      // the standalone editor. So in a markdown editor they simply failed,
       // which reads as broken rather than absent. Bound to the same actions
       // the toolbar buttons use, so the two can never disagree about what
       // bold means.
@@ -428,7 +607,7 @@ function JoinableRoom(props: RoomProps) {
 
   /// Opens the dialog. Deliberately does NOT propose anything: this used to
   /// fire the request immediately, which set the state to VOTING before the
-  /// modal had rendered — leaving the policy selector and the away-peer
+  /// modal had rendered, leaving the policy selector and the away-peer
   /// warning, both of which only appear while IDLE, permanently invisible.
   /// The dialog is a confirmation step, so it has to exist before the thing
   /// it confirms.
@@ -481,8 +660,8 @@ function JoinableRoom(props: RoomProps) {
     // A shared room's address is its name, which a highest-security room keeps
     // out of the address bar; its passphrase is never part of the link.
     const link =
-      props.roomIdHex && props.fragment
-        ? shareLink(props.roomIdHex, props.fragment)
+      props.roomIdHex && fragmentRef.current
+        ? shareLink(props.roomIdHex, fragmentRef.current)
         : props.name
           ? `${window.location.origin}/${props.name}`
           : window.location.href;
@@ -492,7 +671,46 @@ function JoinableRoom(props: RoomProps) {
         ? "Copied the room's address. Send the passphrase separately, never alongside it."
         : "Copied. The part after the # is the key. Send the whole thing.",
     );
-  }, [props.roomIdHex, props.fragment, props.name]);
+  }, [props.roomIdHex, props.name]);
+
+  // A vote prompt on screen or waiting never stops this: opening the ask
+  // dialog puts every prompt aside until it closes. With this tab's own
+  // request open, it opens again on where that request stands.
+  const openEvict = useCallback(async (relink: boolean) => {
+    setMenuOpen(false);
+    if (strandedRef.current) return;
+    const candidates = (await sessionRef.current?.evictCandidates()) ?? [];
+    if (strandedRef.current) return;
+    setEvictCandidates(candidates);
+    // What an earlier vote ended in is old news; one still open is not.
+    if (!evictInFlight(evictStateRef.current)) {
+      evictStateRef.current = "IDLE";
+      setEvictState({ state: "IDLE" });
+    }
+    evictOpenRef.current = true;
+    setEvictOpen({ relink });
+  }, []);
+
+  const closeEvict = useCallback(() => {
+    evictOpenRef.current = false;
+    setEvictOpen(null);
+  }, []);
+
+  /// Where focus goes when a dialog closes and the control that opened it is
+  /// no longer on screen: the narrow layout's folded menu, or, in a stranded
+  /// tab whose room actions are gone, the banner's Export.
+  const focusFallback = useCallback(
+    (): HTMLElement | null =>
+      [menuRef.current?.querySelector<HTMLElement>(".tool-menu-toggle") ?? null, strandedExportRef.current].find(
+        (el) => el !== null && el.isConnected && el.getClientRects().length > 0,
+      ) ?? null,
+    [],
+  );
+
+  // The vote prompt on screen, if any: the oldest waiting, and none while the
+  // ask dialog is open. Closing the dialog leaves this tab's own request
+  // open, so a person who asked can still answer everyone else.
+  const shown = shownPrompt(evictPrompts, evictOpen !== null);
 
   if (phase.kind === "missing-key") return <MissingKey />;
 
@@ -544,9 +762,24 @@ function JoinableRoom(props: RoomProps) {
             problem, not a problem with your link.
           </p>
           <p style={{ marginBottom: 0 }}>
-            Whoever runs this server needs to put HTTPS in front of it — see
+            Whoever runs this server needs to put HTTPS in front of it. See
             <code className="mono"> Deploying to the internet </code> in the
             README. <code className="mono">localhost</code> is exempt.
+          </p>
+        </div>
+      </main>
+    );
+  }
+
+  if (stranded === "removed" && phase.kind !== "live") {
+    return (
+      <main className="landing">
+        <h1 className="mono">RÚNA</h1>
+        <p className="micro-label tag">{EVICT_COPY.removedTitle}</p>
+        <div className="panel">
+          <p>{words.removedBody}</p>
+          <p style={{ marginBottom: 0 }}>
+            <a href="/">← New room</a>
           </p>
         </div>
       </main>
@@ -561,10 +794,10 @@ function JoinableRoom(props: RoomProps) {
         <div className="panel">
           <p>
             {restartAnnouncedRef.current && restartHandover
-              ? "The server restarted for an update, and this room could not be brought back to the new version. Rooms live only in memory — there is no copy to recover, which is the point."
+              ? "The server restarted for an update, and this room could not be brought back to the new version. Rooms live only in memory, so there is no copy to recover, which is the point."
               : restartAnnouncedRef.current
-              ? "The server restarted for an update, and this room ended with it. Rooms live only in memory — there is no copy to recover, which is the point."
-              : "It was shredded, it expired, or the server restarted. Rooms live only in memory — there is no copy to recover, which is the point."}
+              ? "The server restarted for an update, and this room ended with it. Rooms live only in memory, so there is no copy to recover, which is the point."
+              : words.gone}
           </p>
           <p style={{ marginBottom: 0 }}>
             <a href="/">← New room</a>
@@ -596,7 +829,7 @@ function JoinableRoom(props: RoomProps) {
       <main className="landing">
         <h1 className="mono">RÚNA</h1>
         <div className="panel">
-          <p>Wrong passphrase, or this room no longer exists.</p>
+          <p>{words.authFailed}</p>
           <a href="/">← Back</a>
         </div>
       </main>
@@ -618,7 +851,7 @@ function JoinableRoom(props: RoomProps) {
 
   const panesClass = mode === "split" ? "panes" : mode === "editor" ? "panes editor-only" : "panes preview-only";
   // On a narrow screen split *is* editor-only on screen, so that is the tab
-  // that should read as active — otherwise the highlight points at a mode the
+  // that should read as active. Otherwise the highlight points at a mode the
   // reader cannot distinguish from the one they are looking at.
   const shownMode: ViewMode = isNarrow && mode === "split" ? "editor" : mode;
 
@@ -626,7 +859,24 @@ function JoinableRoom(props: RoomProps) {
 
   return (
     <div className="room-shell">
-      {showLadderBanner && (
+      {stranded && (
+        <div className="banner" role="alert">
+          <span>
+            {stranded === "removed" && (
+              <>
+                <span className="micro-label">{EVICT_COPY.removedTitle}</span>{" "}
+                {words.removedBody}{" "}
+              </>
+            )}
+            {stranded === "left-out" && <>{evictStateText("FAILED", "left-out", wayKind)} </>}
+            {STRANDED_KEEP}
+          </span>
+          <button ref={strandedExportRef} onClick={() => setExportOpen(true)}>
+            Export
+          </button>
+        </div>
+      )}
+      {showLadderBanner && !stranded && (
         <div className="banner" role="status">
           <span className="mono">
             {ladder.kind === "burn"
@@ -684,7 +934,10 @@ function JoinableRoom(props: RoomProps) {
           <button onClick={() => setHistoryPressure(null)}>Dismiss</button>
         </div>
       )}
-      {keyStatus && (
+      {/* A stranded tab's banner already says it was left out, so that one
+          status is not repeated. Every other status, the alarming ones
+          above all, still shows. */}
+      {keyStatus && !(stranded && keyStatus.text === keyStatusText(wayKind)["left-out"]) && (
         <div className="banner" role={keyStatus.alarming ? "alert" : "status"}>
           <span className={keyStatus.alarming ? "error-text" : undefined}>{keyStatus.text}</span>
         </div>
@@ -699,8 +952,8 @@ function JoinableRoom(props: RoomProps) {
         <div className="banner" role="note">
           <span>
             {props.name
-              ? "Highest security: this room's name stays out of the address bar and browser history, and the passphrase is never stored. Refreshing or closing the tab leaves the room — to come back, type its name into Join a room. If your browser offers to save the passphrase, decline."
-              : "Highest security: this tab holds the key in memory only. Refreshing or closing it forgets the key — to come back, paste the link into Join a room. Copy link first if you need it."}
+              ? "Highest security: this room's name stays out of the address bar and browser history, and the passphrase is never stored. Refreshing or closing the tab leaves the room. To come back, type its name into Join a room. If your browser offers to save the passphrase, decline."
+              : "Highest security: this tab holds the key in memory only. Refreshing or closing it forgets the key. To come back, paste the link into Join a room. Copy link first if you need it."}
           </span>
           <button
             onClick={() => {
@@ -720,7 +973,7 @@ function JoinableRoom(props: RoomProps) {
         {fingerprint && (
           <>
             <span className="sep micro-label" aria-hidden="true" />
-            <span className="micro-label mono" style={{ letterSpacing: "0.08em" }} title="Room fingerprint — compare out of band">
+            <span className="micro-label mono" style={{ letterSpacing: "0.08em" }} title="Room fingerprint: compare it out of band">
               {fingerprint}
             </span>
           </>
@@ -736,7 +989,7 @@ function JoinableRoom(props: RoomProps) {
           <span
             className="micro-label mono"
             style={{ color: "var(--text-faint)" }}
-            title="Recently here, not connected now — a locked phone looks the same as a closed tab"
+            title="Recently here, not connected now. A locked phone looks the same as a closed tab"
           >
             · {awayNames.length} AWAY
           </span>
@@ -752,11 +1005,13 @@ function JoinableRoom(props: RoomProps) {
             happens to fill, which put Shred alone on a fourth row. */}
         <div className="statusbar-actions">
         <QuorumDial peers={[]} />
-        <button onClick={copyLink}>Copy link</button>
-        {/* Layout, Steady and Export fold behind ⋯ on a narrow screen. Copy
-            link and Shred stay out because they are the two anyone reaches for
-            under pressure, and burying Shred behind a menu would be the wrong
-            thing to make slower. On a wide screen `display: contents` drops
+        {!stranded && <button onClick={copyLink}>Copy link</button>}
+        {/* Layout, Steady, Export, Remove someone and Change link (Change
+            passphrase in a shared room) fold behind ⋯ on a narrow screen.
+            Copy link and Shred stay out because they are the two anyone
+            reaches for under pressure, and burying Shred behind a menu would
+            be the wrong thing to make slower. A stranded tab shows only
+            Layout and Export here. On a wide screen `display: contents` drops
             the wrapper entirely, so these lay out inline exactly as before and
             there is only ever one set of buttons to keep in sync. */}
         <div className={`tool-menu${menuOpen ? " is-open" : ""}`} ref={menuRef}>
@@ -790,6 +1045,7 @@ function JoinableRoom(props: RoomProps) {
                 </button>
               ))}
             </div>
+            {!stranded && (
             <button
               aria-pressed={steady}
               title="Constant-rate transmission: closes the typing-cadence channel at a bandwidth cost"
@@ -802,6 +1058,7 @@ function JoinableRoom(props: RoomProps) {
               Steady
               {steady && <span className="toggle-dot" aria-hidden="true" />}
             </button>
+            )}
             <button
               onClick={() => {
                 setMenuOpen(false);
@@ -810,11 +1067,19 @@ function JoinableRoom(props: RoomProps) {
             >
               Export
             </button>
+            {!stranded && (
+              <>
+                <button onClick={() => void openEvict(false)}>{EVICT_COPY.removeButton}</button>
+                <button onClick={() => void openEvict(true)}>{words.relinkButton}</button>
+              </>
+            )}
           </div>
         </div>
-        <button className="danger" onClick={startShred}>
-          Shred
-        </button>
+        {!stranded && (
+          <button className="danger" onClick={startShred}>
+            Shred
+          </button>
+        )}
         </div>
       </div>
 
@@ -840,6 +1105,7 @@ function JoinableRoom(props: RoomProps) {
                 title={a.title}
                 className="mono"
                 style={{ padding: "2px 8px", fontSize: 12 }}
+                disabled={!!stranded}
                 onClick={() => editorRef.current && applyTool(editorRef.current, a)}
               >
                 {a.label}
@@ -859,7 +1125,7 @@ function JoinableRoom(props: RoomProps) {
           >
             <Editor
               defaultLanguage="markdown"
-              options={MONACO_OPTIONS}
+              options={stranded || ladder.kind === "burn" ? MONACO_READ_ONLY_OPTIONS : MONACO_OPTIONS}
               onMount={(editor) => void onEditorMount(editor)}
               theme="vs-dark"
             />
@@ -883,7 +1149,7 @@ function JoinableRoom(props: RoomProps) {
         >
           <div
             className="preview-body"
-            // Sanitised output only — pipeline.ts runs rehype-sanitize LAST.
+            // Sanitised output only: pipeline.ts runs rehype-sanitize LAST.
             dangerouslySetInnerHTML={{ __html: html }}
           />
         </div>
@@ -906,12 +1172,79 @@ function JoinableRoom(props: RoomProps) {
         }
         state={shredLabel}
         onCancel={() => {
+          shredOpenRef.current = false;
           setShredOpen(false);
           sessionRef.current?.cancelShred();
           setTemper("SECURE");
         }}
         onConfirm={confirmShred}
       />
+      {evictOpen && (
+        <EvictModal
+          candidates={evictCandidates}
+          relink={evictOpen.relink}
+          wayKind={wayKind}
+          state={evictState.state}
+          stateReason={evictState.reason}
+          returnFocus={focusFallback}
+          onPropose={async (target, passphrase) => {
+            const session = sessionRef.current;
+            if (!session) return "not-joined";
+            const code = await session.proposeEviction(target, passphrase);
+            // The coordinator reports VOTING before the call returns, and
+            // this tab has at most one request of its own open, so an open
+            // vote of its own now is this one. In a room with nobody else to
+            // agree it can already be over, and then there is nothing to
+            // withdraw.
+            if (code === null && evictInFlight(evictStateRef.current)) {
+              // The dialog cannot be cancelled while this runs, but the page
+              // can close it: the tab was stranded, or the room's way in
+              // changed. A request nobody is watching any more is withdrawn.
+              if (!evictOpenRef.current) {
+                void session.cancelEviction().catch(() => undefined);
+                return code;
+              }
+              evictMineRef.current = true;
+            }
+            return code;
+          }}
+          onClose={closeEvict}
+          onWithdraw={() => {
+            // Withdraws this tab's own request; a vote someone else opened
+            // carries on. The dialog closes, and the request's ending is said.
+            if (evictMineRef.current && evictInFlight(evictStateRef.current)) {
+              void sessionRef.current?.cancelEviction().catch(() => undefined);
+            }
+            closeEvict();
+          }}
+        />
+      )}
+      {shown && (
+        <EvictVotePrompt
+          key={shown.id}
+          by={shown.by}
+          who={shown.who}
+          wayKind={wayKind}
+          returnFocus={focusFallback}
+          onDecide={(choice) => {
+            setEvictPrompts((q) => promptAnswered(q, shown.id));
+            void sessionRef.current?.respondToEviction(shown.id, choice);
+          }}
+          onAsk={(relink) => void openEvict(relink)}
+        />
+      )}
+      {reRoot && (
+        <ReRootNotice
+          view={reRoot}
+          wayKind={wayKind}
+          returnFocus={focusFallback}
+          onCopy={(text) => {
+            void navigator.clipboard.writeText(text);
+            announce(reRoot.link ? EVICT_COPY.copied : EVICT_COPY.copiedPassphrase);
+          }}
+          onDone={() => setReRoot(null)}
+        />
+      )}
       {exportOpen && (
         <ExportDialog
           onClose={() => setExportOpen(false)}
@@ -1025,6 +1358,10 @@ function ShredVotePrompt({ onDecide }: { onDecide(choice: "APPROVE" | "REJECT"):
   );
 }
 
+/// What a removed or left-out tab can still do with what it holds.
+const STRANDED_KEEP =
+  "This tab keeps what it already had, read-only, so you can still read it, copy it or export it.";
+
 const LIMIT_COPY =
   "This destroys the shared copy and the keys. It cannot reach copies other people already made.";
 
@@ -1102,7 +1439,7 @@ function ToastRegion() {
 }
 
 // iOS Safari zooms the page whenever focus lands on a control whose computed
-// font-size is under 16px, and it does not undo that on blur — the shred
+// font-size is under 16px, and it does not undo that on blur. The shred
 // dialog already moves focus to its Cancel button and the page stays zoomed
 // regardless. A zoomed page then crops the dialog, which is position:fixed and
 // so lays out against the layout viewport while the reader is looking at a
@@ -1115,12 +1452,12 @@ function ToastRegion() {
 // what is rendered. Setting the option instead keeps them in step.
 //
 // Keyed on pointer rather than width, because this is a property of touch
-// input and not of how wide the window happens to be — a phone in landscape is
+// input and not of how wide the window happens to be: a phone in landscape is
 // past every width breakpoint here and still zooms. 16px is also simply easier
 // to read on a phone than 12px.
 //
 // There is no supported way to reset page zoom once it has happened. The usual
-// trick — swapping in a maximum-scale viewport — would take pinch-zoom away
+// trick, swapping in a maximum-scale viewport, would take pinch-zoom away
 // from everyone permanently to paper over one dialog, so removing the trigger
 // is the whole fix.
 const COARSE_POINTER =
@@ -1152,7 +1489,7 @@ export const MONACO_OPTIONS = {
   // enclosing foldable block to the top of the editor.
   //
   // Markdown has no folding provider in the standalone editor, so Monaco falls
-  // back to folding by indentation — which in prose means lists, fenced code
+  // back to folding by indentation, which in prose means lists, fenced code
   // and pasted terminal output, none of which are containers for what follows
   // them. So it pinned arbitrary lines: a row of dashes, a sentence that
   // happened to precede an indented paragraph. It also costs real height,
@@ -1162,17 +1499,17 @@ export const MONACO_OPTIONS = {
   // Markdown does have real headings. They are not what this uses.
   stickyScroll: { enabled: false },
   // Without this Monaco never observes container resizes, so its cached
-  // dimensions go stale and pointer coordinates map to the wrong glyph —
+  // dimensions go stale and pointer coordinates map to the wrong glyph:
   // drag-selection and touch-selection silently stop working while
   // keyboard selection (ctrl/cmd+A) still behaves.
   automaticLayout: true,
   // Monaco's own menu, kept. Right-click is worth having, and with this off the
-  // platform menu on Monaco's rendered text is a generic page menu — no Cut, no
-  // Copy — because the visible glyphs are divs and the real input is hidden.
+  // platform menu on Monaco's rendered text is a generic page menu, with no Cut and no
+  // Copy, because the visible glyphs are divs and the real input is hidden.
   //
   // In Firefox and Safari the right-click never reaches it, though. Its Paste
   // reads the clipboard from script, which those two answer with a Paste button
-  // of their own that has to be clicked too — the "second Paste" reported from
+  // of their own that has to be clicked too: the "second Paste" reported from
   // both. There, right-click opens the browser's menu over a stand-in instead,
   // and its Paste is one click. See ui/contextmenu.ts.
   contextmenu: true,
@@ -1182,6 +1519,10 @@ export const MONACO_OPTIONS = {
   accessibilitySupport: "auto",
   spellcheck: false,
 } as const;
+
+/// The same editor, for a tab the room has removed or moved on without: its
+/// text can still be selected and copied, but not changed.
+const MONACO_READ_ONLY_OPTIONS = { ...MONACO_OPTIONS, readOnly: true } as const;
 
 function b64ToBytes(s: string): Uint8Array {
   const bin = atob(s);

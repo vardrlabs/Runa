@@ -68,7 +68,10 @@ export interface JoinAck {
 export interface SocketEvents {
   onJoinAck(ack: JoinAck): void;
   onDocUpdate(sender: Uint8Array, envelope: Uint8Array): void;
-  onSnapshot(sender: Uint8Array, covers: bigint, envelope: Uint8Array): void;
+  /// `epoch` is the epoch of the frame the snapshot came in, the one it was
+  /// sealed under, so a re-root can tell a snapshot under its new root from
+  /// one sealed under the old root and delivered late (amendment K).
+  onSnapshot(sender: Uint8Array, covers: bigint, envelope: Uint8Array, epoch: number): void;
   onAwareness(sender: Uint8Array, plaintext: Uint8Array): void;
   onShredFrame(frameType: number, sender: Uint8Array, plaintext: Uint8Array): void;
   onPeerJoin(entry: RosterEntry): void;
@@ -82,8 +85,12 @@ export interface SocketEvents {
   onEpochStale(epoch: number): void;
   /// An EPOCH_KEY, unopened: the coordinator verifies and applies it.
   onEpochKey?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
+  /// EVICT_REQUEST, EVICT_VOTE or EVICT_CANCEL, opened (amendment K).
+  onEvictFrame?(frameType: number, sender: Uint8Array, plaintext: Uint8Array): void;
+  /// An EVICT_COMMIT, unopened: the evict coordinator checks and applies it.
+  onEvictCommit?(header: Uint8Array, headerEpoch: number, sender: Uint8Array, body: Uint8Array): void;
   onDisconnected(): void;
-  /// This many of our document frames are now in the room log — or, against
+  /// This many of our document frames are now in the room log, or, against
   /// a server without acks, have been sent. The snapshot index is estimated
   /// from it.
   onUpdatesStored?(count: number): void;
@@ -158,12 +165,12 @@ const ACK_TIMEOUT_MS = 10_000;
 
 /// How often a connection is pinged. Acks only cover a connection something
 /// is being sent on, so one that died while nobody typed was noticed at the
-/// next keystroke — and until then the page said it was connected while
+/// next keystroke, and until then the page said it was connected while
 /// everyone else's edits went nowhere.
 const HEARTBEAT_MS = 15_000;
 
 /// Split updates this client has finished assembling, remembered so that a
-/// part arriving again afterwards — a resend of one whose ack was lost — is
+/// part arriving again afterwards (a resend of one whose ack was lost) is
 /// recognised instead of starting an assembly that can never complete.
 const COMPLETED_PARTS_REMEMBERED = 256;
 
@@ -174,7 +181,7 @@ const COMPACT_WHILE_OFFLINE_AT = 256;
 const REASSEMBLY_MAX_BYTES = 64 * 1024 * 1024;
 const REASSEMBLY_MAX_GROUPS = 32;
 /// A message whose parts stop arriving is abandoned after this long. Parts
-/// can be orphaned legitimately — a sender whose connection died mid-message,
+/// can be orphaned legitimately: a sender whose connection died mid-message,
 /// or a snapshot that compacted away the first parts of one already applied.
 const REASSEMBLY_STALE_MS = 120_000;
 
@@ -321,6 +328,19 @@ export class RunaSocket {
   /// succeeds. Kept past that, a room shredded after coming back could be
   /// brought back again by a second restart inside the ticket's lifetime.
   private restartTicket: { ticket: string; at: number } | null = null;
+  /// The room removed this member (amendment K). Said once, whether the
+  /// ERROR or the close arrives first.
+  private removed = false;
+  /// When this socket started sending under the keyring's current root, if
+  /// it got there by a re-root (amendment K). Once the overlap after it has
+  /// passed, a live update under an older root is not read.
+  private rootSince: number | null = null;
+  /// The log's length when this connection joined, from JOIN_ACK: a sync
+  /// response holds entries below it, and nothing relayed live does.
+  private joinLogLen = 0;
+  /// The sync response this connection asked for: the next log index it can
+  /// hold and the index it ends before. Its entries come in index order.
+  private replay: { next: number; end: number } | null = null;
 
   constructor(private opts: SocketOptions) {
     this.maxBackoffMs = opts.maxBackoffMs ?? 15_000;
@@ -356,6 +376,7 @@ export class RunaSocket {
     this.cipher = new FrameCipher(keys.contentKey, this.joined ? this.peerId : this.opts.identity.publicKeyRaw);
     this.epoch = epoch;
     this.switchedAt = performance.now();
+    if (epoch === this.opts.keyring.rootEpoch) this.rootSince = this.switchedAt;
     if (epoch >= this.roomEpoch) {
       this.roomEpoch = epoch;
       this.awaitingKeys = false;
@@ -363,10 +384,12 @@ export class RunaSocket {
     void this.pump();
   }
 
-  epochKeyHeader(epoch: number): Uint8Array {
+  /// The header of a frame this member signs rather than seals: EPOCH_KEY
+  /// and EVICT_COMMIT.
+  frameHeader(frameType: number, epoch: number): Uint8Array {
     return encodeHeader({
       version: PROTOCOL_VERSION,
-      frameType: FT.EPOCH_KEY,
+      frameType,
       roomId: this.opts.roomId,
       epoch,
       nonceSess: new Uint8Array(4),
@@ -374,16 +397,50 @@ export class RunaSocket {
     });
   }
 
+  epochKeyHeader(epoch: number): Uint8Array {
+    return this.frameHeader(FT.EPOCH_KEY, epoch);
+  }
+
   /// Returns whether it went out.
-  sendEpochKey(header: Uint8Array, body: Uint8Array): boolean {
+  sendSigned(header: Uint8Array, body: Uint8Array): boolean {
     if (!this.joined) return false;
     return this.rawSend(concatBytes(header, body));
+  }
+
+  sendEpochKey(header: Uint8Array, body: Uint8Array): boolean {
+    return this.sendSigned(header, body);
+  }
+
+  /// The room's link changed (amendment K): every later JOIN presents this.
+  replaceAuthKey(next: Uint8Array): void {
+    if (next !== this.opts.authKey) this.opts.authKey.fill(0);
+    this.opts.authKey = next;
   }
 
   /// Drop this connection and join again, to be handed the room's keys as a
   /// newcomer. For a member that saw the room move to an epoch it cannot follow.
   reconnectNow(): void {
+    // A removed tab stays stopped, and its page was already told it is
+    // disconnected.
+    if (this.removed) return;
     this.abandonConnection();
+  }
+
+  /// A live DOC_UPDATE under a root the room has left, once the overlap after
+  /// the re-root has passed (amendment K). The person a re-root removed still
+  /// holds the old root's keys, and a server that will not enforce the
+  /// removal could relay what they write. Entries inside a sync response are
+  /// read under whatever key they were written with, as before.
+  private oldRootUpdate(frameEpoch: number, index: number | null): boolean {
+    if (frameEpoch >= this.opts.keyring.rootEpoch || this.rootSince === null) return false;
+    const overlap = this.opts.epochOverlapMs ?? EPOCH_OVERLAP_MS;
+    if (performance.now() - this.rootSince < overlap) return false;
+    const r = this.replay;
+    if (r && index !== null && index >= r.next && index < r.end) {
+      r.next = index + 1;
+      return false;
+    }
+    return true;
   }
 
   private isStale(frameEpoch: number): boolean {
@@ -415,6 +472,17 @@ export class RunaSocket {
       if (this.ws === ws) this.connectionLost();
       const code = (ev as CloseEvent | undefined)?.code;
       if (code === 4007 || code === 4008) this.events.onRefused?.(code);
+      // Removed from the room: the ERROR before this close says so, but a
+      // close that arrives alone means the same.
+      if (code === 4014) {
+        this.closedByUs = true;
+        if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+        if (!this.removed) {
+          this.removed = true;
+          this.events.onError(4014);
+        }
+      }
       this.events.onDisconnected();
       if (!this.closedByUs) this.scheduleReconnect();
     };
@@ -425,7 +493,7 @@ export class RunaSocket {
     if (this.closedByUs || this.reconnectTimer) return;
     const jitterBytes = new Uint32Array(1);
     crypto.getRandomValues(jitterBytes);
-    // `% 0` is NaN, and setTimeout(NaN) fires immediately — a hot reconnect
+    // `% 0` is NaN, and setTimeout(NaN) fires immediately: a hot reconnect
     // loop for any backoff under ~4 ms.
     const spread = Math.max(1, Math.floor(this.backoffMs * 0.3));
     const jitter = jitterBytes[0] % spread;
@@ -442,6 +510,7 @@ export class RunaSocket {
   /// they are resent on the next connection.
   private connectionLost(): void {
     this.joined = false;
+    this.replay = null;
     this.generation += 1;
     this.inflight = [];
     this.stopLiveness();
@@ -499,6 +568,8 @@ export class RunaSocket {
   /// that found it missing stopped the retries, and nothing queued was
   /// discarded (amendment I).
   resume(): void {
+    // A removed tab stays stopped.
+    if (this.removed) return;
     const old = this.ws;
     if (old) {
       // The refused connection, closed or about to be. Its handlers must not
@@ -537,7 +608,7 @@ export class RunaSocket {
     this.inflight = [];
   }
 
-  /// Stop retrying without tearing down keys — used when the server says the
+  /// Stop retrying without tearing down keys, used when the server says the
   /// room is gone, where reconnecting can only ever fail again.
   stopReconnecting(): void {
     this.closedByUs = true;
@@ -572,7 +643,7 @@ export class RunaSocket {
   /// Best-effort by nature: the cipher object keeps its own reference, and
   /// nulling that would leave every send path dereferencing null. What
   /// actually ends the key's life is the navigation to the tombstone that
-  /// follows immediately — the keys are non-extractable `CryptoKey` handles,
+  /// follows immediately: the keys are non-extractable `CryptoKey` handles,
   /// so they cannot leave the tab in the first place, and tearing down the
   /// realm takes them with it.
   dropKeys(): void {
@@ -629,7 +700,10 @@ export class RunaSocket {
       header.frameType === FT.AWARENESS ||
       header.frameType === FT.SHRED_REQUEST ||
       header.frameType === FT.SHRED_VOTE ||
-      header.frameType === FT.SHRED_CANCEL;
+      header.frameType === FT.SHRED_CANCEL ||
+      header.frameType === FT.EVICT_REQUEST ||
+      header.frameType === FT.EVICT_VOTE ||
+      header.frameType === FT.EVICT_CANCEL;
     if (!isServerEvent && liveOnly && this.opts.keyring.has(header.epoch) && this.isStale(header.epoch)) {
       this.events.onEpochStale(header.epoch);
       return;
@@ -647,9 +721,17 @@ export class RunaSocket {
       }
       this.joined = true;
       this.restartTicket = null;
+      this.replay = null;
+      this.joinLogLen = typeof ack.log_len === "number" && Number.isSafeInteger(ack.log_len) && ack.log_len >= 0 ? ack.log_len : 0;
       // Ahead of this member: a member must hand it the key. Behind: the
       // server has lost track of the room's rotations, and sending under an
       // older key would hand new writing to whoever left. Either way, hold.
+      // A keyring nothing has moved holds the root its link opens, which is
+      // the epoch the room names as its root (amendment K). Nothing has been
+      // sealed under it yet, so relabelling it here changes no frame.
+      if (typeof ack.root_epoch === "number" && this.opts.keyring.relabelRoot(ack.root_epoch)) {
+        this.epoch = this.opts.keyring.current.epoch;
+      }
       this.roomEpoch = typeof ack.epoch === "number" ? ack.epoch : 0;
       // Compared with the epoch the cipher sends under, not the keyring's: a
       // keyring that advanced before adoptEpoch ran must not send under a key
@@ -729,12 +811,17 @@ export class RunaSocket {
         this.abandonConnection();
         return;
       }
-      // 4001 covers "wrong key" and "no such room" — both are terminal. Left
+      // 4001 covers "wrong key" and "no such room": both are terminal. Left
       // to reconnect, a purged room turned every open tab into a client that
       // hammered the server every 15 seconds indefinitely.
-      if (code === 4001 || code === 4010 || code === 4011) {
+      if (code === 4001 || code === 4010 || code === 4011 || code === 4014) {
         this.closedByUs = true;
         if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+        this.reconnectTimer = null;
+      }
+      if (code === 4014) {
+        if (this.removed) return;
+        this.removed = true;
       }
       this.events.onError(code);
       return;
@@ -810,6 +897,10 @@ export class RunaSocket {
       this.events.onEpochKey?.(bytes.slice(0, HEADER_LEN), header.epoch, senderId, env.body);
       return;
     }
+    if (header.frameType === FT.EVICT_COMMIT) {
+      this.events.onEvictCommit?.(bytes.slice(0, HEADER_LEN), header.epoch, senderId, env.body);
+      return;
+    }
     // An epoch this member holds no key for is read from the log later, once
     // a member hands the key over; it is not counted as taken meanwhile.
     const key = this.opts.keyring.keyFor(header.epoch);
@@ -828,6 +919,7 @@ export class RunaSocket {
           index = Number(i);
           body = body.slice(8);
         }
+        if (this.oldRootUpdate(header.epoch, index)) return;
         let taken: number[];
         try {
           const pt = await decryptEnvelope(key, bytes.slice(0, HEADER_LEN), senderId, body);
@@ -854,7 +946,7 @@ export class RunaSocket {
             env.body.slice(8),
             snapshotCoversOf(env.body),
           );
-          this.events.onSnapshot(senderId, covers, pt);
+          this.events.onSnapshot(senderId, covers, pt, header.epoch);
         } catch {
           return;
         }
@@ -885,6 +977,17 @@ export class RunaSocket {
             env.body,
           );
           this.events.onShredFrame(header.frameType, senderId, pt);
+        } catch {
+          return;
+        }
+        return;
+      }
+      case FT.EVICT_REQUEST:
+      case FT.EVICT_VOTE:
+      case FT.EVICT_CANCEL: {
+        try {
+          const pt = await decryptEnvelope(key, bytes.slice(0, HEADER_LEN), senderId, env.body);
+          this.events.onEvictFrame?.(header.frameType, senderId, pt);
         } catch {
           return;
         }
@@ -1008,7 +1111,7 @@ export class RunaSocket {
 
   /// Nothing encrypted may leave before JOIN_ACK. Until then the cipher is
   /// labelled with this client's public key instead of the peer id receivers
-  /// will check it against, so every receiver rejects the frame — while the
+  /// will check it against, so every receiver rejects the frame, while the
   /// server, which cannot tell, stores a document update in the log for good
   /// and would compact history under a snapshot nobody can read.
   private canSendDocuments(): boolean {
@@ -1016,7 +1119,7 @@ export class RunaSocket {
   }
 
   /// Queue an update for the room. It is sent once the connection is joined,
-  /// and kept — across reconnects — until the server says it stored it.
+  /// and kept, across reconnects, until the server says it stored it.
   async sendUpdate(plaintext: Uint8Array): Promise<void> {
     if (this.closedByUs) return;
     this.outbox.push({ wrapped: plaintext, parts: null, acked: 0, sent: 0, refused: false });
@@ -1178,6 +1281,14 @@ export class RunaSocket {
     this.rawSend(concatBytes(header, envelope));
   }
 
+  /// Returns whether it went out.
+  async sendEvictFrame(frameType: number, plaintext: Uint8Array): Promise<boolean> {
+    if (!this.canSendDocuments()) return false;
+    const header = this.ownHeader(frameType);
+    const envelope = await this.cipher.encrypt(header, plaintext);
+    return this.rawSend(concatBytes(header, envelope));
+  }
+
   /// Throws when nothing was sent, so the caller does not move its sync index
   /// past history the server still holds.
   async sendSnapshot(plaintext: Uint8Array, covers: bigint): Promise<void> {
@@ -1202,6 +1313,9 @@ export class RunaSocket {
   }
 
   sendSyncRequest(fromIndex: number): void {
+    // Without indexes nothing tells a sync response from a live update; such a
+    // server predates re-roots.
+    if (this.indexed) this.replay = { next: Math.max(0, fromIndex), end: this.joinLogLen };
     this.rawSend(
       buildJsonFrame(FT.DOC_SYNC_REQ, this.opts.roomId, this.epoch, { from_index: fromIndex }),
     );

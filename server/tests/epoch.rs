@@ -605,3 +605,71 @@ async fn racing_steps_reach_every_peer_in_the_order_the_server_decided() {
         );
     }
 }
+
+/// A connection the room removes (amendment K) leaves the room's list at the
+/// commit, before its writer has sent anything. The writer still sends the
+/// ERROR that was queued for it and closes with 4014, and the others are told
+/// it left.
+#[tokio::test]
+async fn an_evicted_connection_gets_its_error_and_4014_after_the_room_lets_it_go() {
+    let state = runa_server::AppState::new(cfg_with(30_000, 0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = build_router(state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+            .await
+            .unwrap();
+    });
+    let s = format!("http://{addr}");
+    let k = create(&s).await;
+    let a_key = rand32();
+    let t_key = rand32();
+    let (mut a, a_ack) = join_with(&s, &k, json!({"pubkey": B64.encode(a_key)})).await;
+    let (mut t, t_ack) = join_with(&s, &k, json!({"pubkey": B64.encode(t_key)})).await;
+    next_ft(&mut a, 0x07).await;
+    let id16 = |v: &Value| -> [u8; 16] { B64.decode(v["peer_id"].as_str().unwrap()).unwrap().try_into().unwrap() };
+    let (a_id, t_id) = (id16(&a_ack), id16(&t_ack));
+
+    let room_id: [u8; 16] = hex::decode(&k.hex).unwrap().try_into().unwrap();
+    let room = state.rooms.get(&room_id).unwrap();
+    assert_eq!(room.peer_count(), 2);
+    room.note_evict_request(a_id);
+    let rr = runa_server::runar::room::ReRoot {
+        at_epoch: 0,
+        root: 0,
+        target: Some(runa_server::runar::evict::Target {
+            peer_id: t_id,
+            key_digest: runa_server::runar::evict::key_digest(&t_key),
+        }),
+        voters: vec![(a_id, a_key.to_vec())],
+        verifier: Sha256::digest(rand32()).into(),
+        salt: rand16(),
+        config_blob: None,
+    };
+    let mut evicted = vec![0x52u8, 0x55, 0x01, 0x30];
+    evicted.extend_from_slice(&room_id);
+    evicted.extend_from_slice(&[0u8; 12]);
+    evicted.extend_from_slice(br#"{"code":4014}"#);
+    let commit = {
+        let mut f = vec![0x52u8, 0x55, 0x01, 0x23];
+        f.extend_from_slice(&room_id);
+        f.extend_from_slice(&[0u8; 12]);
+        f.extend_from_slice(&[0xC0u8; 8]);
+        runa_server::bytes::Bytes::from(f)
+    };
+    let kx_less = runa_server::bytes::Bytes::from_static(b"unused");
+    let at = room
+        .commit_eviction(&rr, std::time::Instant::now(), &commit, a_id, &evicted.into(), &kx_less)
+        .unwrap();
+    assert_eq!(at, 1);
+    assert_eq!(room.peer_count(), 1, "the evicted connection is still in the room's list");
+
+    let err = next_ft(&mut t, 0x30).await;
+    assert_eq!(json_body(&err)["code"], 4014);
+    assert_eq!(close_code(&mut t).await, 4014);
+
+    let leave = next_ft(&mut a, 0x08).await;
+    assert_eq!(json_body(&leave)["peer_id"], B64.encode(t_id));
+    assert_eq!(json_body(&leave)["reason"], 4014);
+}

@@ -10,11 +10,13 @@ axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 bytes = "1"
 dashmap = "6"
+ed25519-dalek = "2"
 futures-util = "0.3"
 getrandom = "0.3"
 hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "std"] }
 rlimit = "0.10"
 secrecy = "0.10"
 serde = { version = "1", features = ["derive"] }
