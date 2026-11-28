@@ -77,11 +77,18 @@ fn ping(room_hex: &str, pad: usize) -> Message {
     Message::Binary(f.into())
 }
 
+/// A room's verifier, as the page computes it: SHA-256 of the room's auth
+/// key. That key is 32 random bytes here and the output of a key derivation
+/// in the page, never a passphrase, so a fast hash is the right one.
+fn verifier(auth: &[u8; 32]) -> [u8; 32] {
+    Sha256::digest(auth).into()
+}
+
 /// Creates a room and joins one peer that asked for PONGs.
 async fn joined_peer(server: &str) -> (Ws, String) {
-    let auth_key: [u8; 32] = rand_bytes();
+    let auth: [u8; 32] = rand_bytes();
     let salt: [u8; 16] = rand_bytes();
-    let verifier: [u8; 32] = Sha256::digest(auth_key).into();
+    let verifier = verifier(&auth);
     let resp = reqwest::Client::new()
         .post(format!("{server}/api/rooms/unlisted"))
         .json(&json!({
@@ -102,7 +109,7 @@ async fn joined_peer(server: &str) -> (Ws, String) {
     let mut join = header(&room, FT_JOIN);
     let pubkey: [u8; 32] = rand_bytes();
     let body = json!({
-        "auth_key": B64.encode(auth_key),
+        "auth_key": B64.encode(auth),
         "pubkey": B64.encode(pubkey),
         "heartbeat": true,
     });
