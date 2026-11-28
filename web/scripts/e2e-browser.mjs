@@ -2430,7 +2430,7 @@ async function main() {
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
-  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person whose own request is open is removed anyway; a person who asked closes the dialog, answers another request, and their own still completes; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person's own open request does not stop a request to remove them; a person who asked closes the dialog, answers another request, and their own still completes; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
   console.log(`  a tab that joined during the vote is left out with no alarm, keeps a read-only copy and stays off`);
   console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
   console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
