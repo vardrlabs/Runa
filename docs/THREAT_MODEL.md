@@ -308,8 +308,9 @@ What that buys, exactly:
   asks. That second identity is a member, its approval is needed, and it can
   refuse or leave. Neither identity can then be removed without the other's
   approval, and eight identities can each keep a request open and fill every
-  place a member holds. A copy of another member's public key works the same
-  way, and it looks like that member's second tab. So removal by unanimous vote
+  place a member holds. A copy of another member's public key can refuse or
+  leave the same way, though it cannot open a request because it cannot sign
+  one, and it looks like that member's second tab. So removal by unanimous vote
   works against someone who hasn't prepared a second identity, and it doesn't
   work against a member who is determined to stay. What a removal guarantees
   once it lands is unchanged: the removed person's old link or passphrase no
