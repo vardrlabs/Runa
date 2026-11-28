@@ -205,13 +205,15 @@ mod tests {
         // The per-connection limiters hold one key in a table of one. Halving
         // a full table of one keeps nothing, so every call used to find an
         // empty table and a full bucket, and the limit never refused.
-        let rl: RateLimiter<()> = RateLimiter::new(3, Duration::from_millis(300), 1);
+        // One token a second, so a slow machine has most of a second of slack
+        // before a second token could appear.
+        let rl: RateLimiter<()> = RateLimiter::new(3, Duration::from_secs(3), 1);
         assert!(rl.check(&()));
         assert!(rl.check(&()));
         assert!(rl.check(&()));
         assert!(!rl.check(&()), "a spent bucket in a table of one must refuse");
         assert!(!rl.check_n(&(), 1), "and keep refusing until it refills");
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(1100));
         assert!(rl.check(&()), "one token back after a third of the window");
         assert!(!rl.check(&()), "and only one");
     }
