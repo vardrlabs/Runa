@@ -214,8 +214,8 @@ const VOTE_CHECKS_BURST: u32 = 4 * evict::MAX_VOTES as u32;
 /// would refuse.
 fn vote_budget() -> RateLimiter<()> {
     let window = Duration::from_secs(u64::from(VOTE_CHECKS_BURST / VOTE_CHECKS_PER_SEC));
-    // One key, for this connection, in a table of two.
-    RateLimiter::new(VOTE_CHECKS_BURST, window, 2)
+    // One key, for this connection, in a table of one.
+    RateLimiter::new(VOTE_CHECKS_BURST, window, 1)
 }
 
 struct ConnLimits {
