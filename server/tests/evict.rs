@@ -824,7 +824,11 @@ async fn nothing_a_removed_connection_sends_after_the_commit_is_relayed() {
 
 /// The commit arm's own refusals (review I-3): the config blob limit, an
 /// implausible verifier, and a voter who is not connected.
-async fn commit_with_config(len: usize) -> (String, Keys, Member, Commit) {
+/// The two other members come back with the rest, so their connections stay
+/// open until the test ends. Dropped here, they could leave before the server
+/// read the commit, and it would then be refused for a voter that had gone,
+/// whatever the size of the config.
+async fn commit_with_config(len: usize) -> (String, Keys, Member, Commit, (Member, Member)) {
     let s = spawn(cfg()).await;
     let k = create(&s).await;
     let mut a = join(&s, &k, Signer::ed()).await;
@@ -834,18 +838,18 @@ async fn commit_with_config(len: usize) -> (String, Keys, Member, Commit) {
     c.config = vec![0x5A; len];
     let body = c.body(&k.id, &[(&a.key, a.id), (&b.key, b.id)], false);
     propose_and_commit(&k, &mut a, 0, &body).await;
-    (s, k, a, c)
+    (s, k, a, c, (b, t))
 }
 
 #[tokio::test]
 async fn a_config_blob_one_byte_over_the_limit_is_refused() {
-    let (s, k, mut a, _) = commit_with_config(4097).await;
+    let (s, k, mut a, _, _others) = commit_with_config(4097).await;
     assert_refused(&s, &k, &mut a).await;
 }
 
 #[tokio::test]
 async fn a_config_blob_at_the_limit_is_accepted() {
-    let (s, k, mut a, c) = commit_with_config(4096).await;
+    let (s, k, mut a, c, _others) = commit_with_config(4096).await;
     next_ft(&mut a.ws, 0x23).await;
     let ack = try_join(&s, &k.hex, c.new_auth).await.unwrap();
     assert_eq!(ack["root_epoch"], 1);
