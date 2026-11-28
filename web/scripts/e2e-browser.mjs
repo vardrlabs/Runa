@@ -832,6 +832,27 @@ async function main() {
     if ((await a.$$eval('[aria-modal="true"]', (els) => els.length)) !== 1) throw new Error("[evict-a] two dialogs at once after asking");
     await b.click("#evict-approve");
     await b.waitForSelector(`#evict-vote-title:has-text("REMOVE ${tHandle}?")`, { timeout: 15_000 });
+    // Alice's own request is open, and she can still answer the third tab's.
+    // Close leaves her request open, the prompt she put aside comes back,
+    // and she refuses the link change.
+    if (!(await a.$("#evict-withdraw"))) throw new Error("[evict-a] the ask dialog offers no way to withdraw an open request");
+    const closeLabel = ((await a.textContent("#evict-close")) ?? "").trim();
+    if (closeLabel !== "Close") throw new Error(`[evict-a] the ask dialog's close control says "${closeLabel}"`);
+    await a.click("#evict-close");
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    await a.waitForSelector('#evict-vote-title:has-text("CHANGE THE LINK?")', { timeout: 5000 });
+    await a.click("#evict-reject");
+    await t.waitForSelector('[role="dialog"]:has-text("Someone refused, so nothing changed.")', { timeout: 15_000 });
+    // The bar opens the dialog again on where her request stands, and Escape
+    // closes it without withdrawing anything.
+    await a.waitForTimeout(500);
+    if (await a.$("#evict-approve")) throw new Error("[evict-a] a prompt is still shown after Alice answered it");
+    await a.click('.statusbar-actions button:has-text("Remove someone")');
+    await a.waitForSelector('[role="dialog"]:has-text("The request is waiting for everyone else to agree.")', { timeout: 5000 });
+    if (!(await a.$("#evict-withdraw"))) throw new Error("[evict-a] the reopened dialog offers no way to withdraw the open request");
+    await a.keyboard.press("Escape");
+    await a.waitForSelector("#evict-title", { state: "detached", timeout: 5000 });
+    if (!(await b.$(`#evict-vote-title:has-text("REMOVE ${tHandle}?")`))) throw new Error("[evict-b] Alice's request ended when she closed her dialog");
     // Someone opens the old link between the request and Bob's answer: they
     // never saw the request, so nobody wraps the new link for them, and the
     // commit leaves them out.
@@ -851,8 +872,7 @@ async function main() {
     const fresh = parseLink(newLink, "evict-a");
     await closeReRootNotice(a);
     await closeReRootNotice(b);
-    // The third tab's link change ended with the old link: Alice's prompt for
-    // it, put aside while she asked, is gone, and nothing else waits.
+    // The third tab's link change was refused, and nothing else waits.
     await a.waitForTimeout(1000);
     for (const [label, page] of [["evict-a", a], ["evict-b", b]]) {
       if (await page.$("#evict-approve")) throw new Error(`[${label}] a prompt for a request that ended came back after the re-root`);
@@ -1052,6 +1072,7 @@ async function main() {
         const cancel = [...dialog.querySelectorAll("button")].find((b) => b.textContent.trim() === "Cancel");
         seen.push({
           cancelDisabled: !!cancel?.disabled,
+          withdrawShown: !!dialog.querySelector("#evict-withdraw"),
           says: dialog.textContent.includes("This tab is making the new keys."),
         });
         dialog.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
@@ -1065,6 +1086,7 @@ async function main() {
     });
     const [busy] = await s1.evaluate(() => window.__busySeen);
     if (!busy.cancelDisabled) throw new Error("[shared-a] Cancel works while the new keys are being made");
+    if (busy.withdrawShown) throw new Error("[shared-a] the dialog offers to withdraw a request that has not gone out yet");
     if (!busy.says) throw new Error("[shared-a] the dialog does not say it is making the new keys");
     await s2.waitForSelector("#evict-approve", { timeout: 60_000 });
     const sVote = ((await s2.textContent('[role="alertdialog"]')) ?? "").trim();
@@ -2408,7 +2430,7 @@ async function main() {
   console.log(`  the key never stays in the address: Join, a clicked link, and room creation`);
   console.log(`  highest security: not saved, forgotten on refresh, Copy link still whole`);
   console.log(`  key rotation: a departed peer's key opens nothing written after it; a newcomer is handed the keys and reads the history`);
-  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person whose own request is open is removed anyway; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
+  console.log(`  removing someone: a refusal changes nothing; a vote prompt waits behind the ask dialog and never stops asking; a person whose own request is open is removed anyway; a person who asked closes the dialog, answers another request, and their own still completes; on agreement the two who stay get one new link and keep writing, the removed tab keeps a read-only copy and stays off`);
   console.log(`  a tab that joined during the vote is left out with no alarm, keeps a read-only copy and stays off`);
   console.log(`  the old link and the removed tab's saved key find the room gone; its old key opens nothing written after; a newcomer on the new link reads it all; a refresh comes back in`);
   console.log(`  changing the link with nobody removed; a tab away during the change finds the room gone`);
