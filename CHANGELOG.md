@@ -74,6 +74,23 @@ section, so this file is not documentation of the release, it is part of it.
 
 ### Security
 
+- **The limits on how fast one connection may send never limited.** Each
+  connection is meant to be held to 100 frames and 1 MiB a second, with a burst
+  of twice that, and closed with 4002 when it goes past. From 0.2.0 through
+  0.5.4 that never happened. The limiter keeps a table of buckets and, when the
+  table is full, keeps the most-throttled half. A connection's own table holds
+  one bucket, and half of one is none, so every frame after the first threw the
+  bucket away and started a full one. On the 0.5.4 build I sent one connection
+  5,000 frames in 26 milliseconds and then 10 MiB in 11, and the server answered
+  every frame. So one connection could send as fast as the server could read.
+  That costs the server CPU and bandwidth, and someone inside a room could
+  flood the others until the server dropped them for a full queue. Nothing in
+  a room was exposed, and the other limits held: the size of a frame, 64
+  connections from one address, and the caps on a room's history. The limiter
+  now never drops a bucket to make room for the key that owns it, and always
+  keeps at least one. Before turning the limits on I checked them against what
+  the page sends, and it already holds its edits to half of what the server
+  allows.
 - **url 2.5.9, clear of an advisory published in November 2026.**
   RUSTSEC-2026-0592 is a stack overflow in `Url::origin()`: a `blob:` URL
   nested thousands of times makes it call itself until the process aborts.

@@ -671,7 +671,9 @@ with anything else needs.
 | `RUNA_MAX_ROOMS` | `512` | Live rooms. Creation returns `503 AT_CAPACITY` past this |
 | `RUNA_MAX_LOG` | `33554432` | Bytes of history in one room, before snapshot compaction |
 | `RUNA_MAX_PEERS` | `32` | Connections per room |
-| `RUNA_MAX_FRAME` | `262144` | Bytes in one WebSocket message |
+| `RUNA_MAX_FRAME` | `1048576` | Bytes in one WebSocket message |
+| `RUNA_FRAME_RATE` | `100` | Frames one connection may send in a second, with a burst of twice that. A connection that goes past it is closed with 4002. Never below 25, which is what the page needs for cursor movement and typing |
+| `RUNA_BYTE_RATE` | `1048576` | Bytes one connection may send in a second, with a burst of twice that. Raised to at least half of `RUNA_MAX_FRAME`, so that one full frame always fits in the burst, and never below 4096 |
 | `RUNA_MAX_CONFIG_BLOB` | `4096` | Bytes of encrypted room config held for the room's life |
 | `RUNA_MAX_CONNECTIONS` | `1024` | Concurrent sockets, process-wide. The per-IP limit bounds one address; this bounds the sum |
 | `RUNA_MAX_CONNS_PER_IP` | `64` | Concurrent sockets one address may hold, at most a quarter of `RUNA_MAX_CONNECTIONS`. Offices and mobile carriers put many people behind one address |

@@ -183,15 +183,33 @@ impl Config {
         c.restart_key = std::env::var("RUNA_RESTART_KEY")
             .ok()
             .and_then(|v| crate::runar::ticket::RestartKey::from_hex(&v));
+        c.settle();
+        c
+    }
+
+    /// Bring the limits into a range the server and the page can both live
+    /// with, whatever the environment asked for.
+    fn settle(&mut self) {
+        let c = self;
         // A zero rate would brick the endpoint it guards rather than throttle
         // it, and the frame limiter multiplies by two, so keep both in range.
         c.frames_per_conn_per_sec = c.frames_per_conn_per_sec.clamp(1, u32::MAX / 2);
         c.bytes_per_conn_per_sec = c.bytes_per_conn_per_sec.clamp(1, u64::from(u32::MAX) / 2);
         c.max_frame_bytes = c.max_frame_bytes.clamp(1024, 8 * 1024 * 1024);
+        // A connection may send a burst of twice its byte rate. The page sends
+        // anything that fits in one frame as one frame, so a frame larger than
+        // the burst could never be sent: the connection would be closed, the
+        // page would send the same frame again, and the edit would never be
+        // stored. The page also paces itself to no less than 4096 bytes a
+        // second, whatever it is told.
+        c.bytes_per_conn_per_sec =
+            c.bytes_per_conn_per_sec.max(4096).max((c.max_frame_bytes as u64).div_ceil(2));
+        // The page does not pace cursor movement or cover traffic, and the two
+        // together are about eleven frames a second before any typing.
+        c.frames_per_conn_per_sec = c.frames_per_conn_per_sec.max(25);
         c.max_peers_per_room = c.max_peers_per_room.max(1);
         // A queue smaller than one frame could never accept anything.
         c.max_queued_bytes_per_conn = c.max_queued_bytes_per_conn.max(c.max_frame_bytes * 2);
-        c
     }
 }
 
@@ -212,6 +230,33 @@ fn onion_url(v: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_rate_limits_are_kept_where_the_page_can_live_with_them() {
+        // A frame larger than the byte burst could never be sent, and a frame
+        // rate under what cursor movement alone produces would close every
+        // typist's connection.
+        let mut c = super::Config {
+            frames_per_conn_per_sec: 1,
+            bytes_per_conn_per_sec: 1,
+            max_frame_bytes: 8 * 1024 * 1024,
+            ..super::Config::default()
+        };
+        c.settle();
+        assert_eq!(c.frames_per_conn_per_sec, 25);
+        assert_eq!(c.bytes_per_conn_per_sec, 4 * 1024 * 1024, "half the largest frame, so one frame fits the burst");
+        let mut small = super::Config {
+            bytes_per_conn_per_sec: 1,
+            max_frame_bytes: 1024,
+            ..super::Config::default()
+        };
+        small.settle();
+        assert_eq!(small.bytes_per_conn_per_sec, 4096, "the page paces to no less than this");
+        let mut usual = super::Config::default();
+        let (frames, bytes) = (usual.frames_per_conn_per_sec, usual.bytes_per_conn_per_sec);
+        usual.settle();
+        assert_eq!((usual.frames_per_conn_per_sec, usual.bytes_per_conn_per_sec), (frames, bytes), "the defaults are left alone");
+    }
+
     #[test]
     fn only_a_v3_onion_address_is_advertised() {
         let good = format!("http://{}.onion", "a".repeat(52) + "2345");

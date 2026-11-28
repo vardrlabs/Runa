@@ -32,7 +32,11 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
 
     pub fn check_n(&self, key: &K, n: u32) -> bool {
         let mut buckets = self.buckets.lock().unwrap();
-        if buckets.len() >= self.max_tracked {
+        // Room is only needed for a key the table does not hold yet. Making
+        // room for a key that is already there could evict that very key and
+        // hand it a full bucket, and with a table of one it did exactly that
+        // on every call, so the per-connection limits never refused.
+        if buckets.len() >= self.max_tracked && !buckets.contains_key(key) {
             self.evict(&mut buckets);
         }
         let now = Instant::now();
@@ -115,8 +119,11 @@ impl<K: Eq + Hash + Clone> RateLimiter<K> {
             return;
         }
         // Still full of genuinely throttled keys. Halve the table, keeping the
-        // most-throttled, so this scan cannot recur on the next call.
-        let keep = self.max_tracked / 2;
+        // most-throttled, so this scan cannot recur on the next call. Half of
+        // a table of one is nothing, and a newcomer must never empty the
+        // table of a throttled key, so the most-throttled bucket always
+        // stays. A table of one can then briefly hold two.
+        let keep = (self.max_tracked / 2).max(1);
         let mut ranked: Vec<(K, f64)> =
             buckets.iter().map(|(k, b)| (k.clone(), self.projected(b, now))).collect();
         ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -191,6 +198,52 @@ mod tests {
             rl.check(&k);
         }
         assert!(!rl.check(&1), "an evicted bucket would refill and let this through");
+    }
+
+    #[test]
+    fn a_table_of_one_limits_its_key_and_refills() {
+        // The per-connection limiters hold one key in a table of one. Halving
+        // a full table of one keeps nothing, so every call used to find an
+        // empty table and a full bucket, and the limit never refused.
+        // One token a second, so a slow machine has most of a second of slack
+        // before a second token could appear.
+        let rl: RateLimiter<()> = RateLimiter::new(3, Duration::from_secs(3), 1);
+        assert!(rl.check(&()));
+        assert!(rl.check(&()));
+        assert!(rl.check(&()));
+        assert!(!rl.check(&()), "a spent bucket in a table of one must refuse");
+        assert!(!rl.check_n(&(), 1), "and keep refusing until it refills");
+        std::thread::sleep(Duration::from_millis(1100));
+        assert!(rl.check(&()), "one token back after a third of the window");
+        assert!(!rl.check(&()), "and only one");
+    }
+
+    #[test]
+    fn a_tracked_key_is_never_evicted_to_make_room_for_itself() {
+        // A full table whose every bucket is throttled. A call for a key it
+        // already holds needs no room, so it must not run eviction, which
+        // would drop the keys outside the most-throttled half, this one among
+        // them, and hand it a full bucket.
+        let rl: RateLimiter<u64> = RateLimiter::new(4, Duration::from_secs(600), 4);
+        for k in 0..4u64 {
+            assert!(rl.check_n(&k, 1 + k as u32));
+        }
+        // Key 0 is the least throttled: 3 tokens left. The old code halved
+        // the table here, keeping keys 3 and 2, and recreated key 0 full.
+        assert!(rl.check_n(&0, 3));
+        assert!(!rl.check(&0), "key 0 spent its bucket and must be refused");
+        assert_eq!(rl.buckets.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_new_key_never_empties_a_table_of_one() {
+        // With room for one bucket, a second key must not take the throttled
+        // key's place, or anybody could reset it by showing up.
+        let rl: RateLimiter<u64> = RateLimiter::new(1, Duration::from_secs(600), 1);
+        assert!(rl.check(&1));
+        assert!(!rl.check(&1));
+        assert!(rl.check(&2));
+        assert!(!rl.check(&1), "the throttled key must survive a newcomer");
     }
 
     #[test]
